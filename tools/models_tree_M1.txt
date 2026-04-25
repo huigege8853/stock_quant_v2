@@ -1,0 +1,60 @@
+./
+├── .env.example
+├── docker-compose.yml
+├── pyproject.toml
+├── alembic.ini
+├── alembic/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       ├── m1_0001_meta_base.py
+│       ├── m1_0002_meta_security_master.py
+│       ├── m1_0003_ops_runtime.py
+│       ├── m1_0004_meta_versioning.py
+│       └── m1_0005_core_market_data.py
+└── src/
+    └── stock_quant_v2/
+        ├── __init__.py
+        ├── config/
+        │   ├── __init__.py
+        │   └── settings.py
+        ├── db/
+        │   ├── __init__.py
+        │   ├── naming.py
+        │   ├── base.py
+        │   ├── mixins.py
+        │   ├── session.py
+        │   └── models/
+        │       ├── __init__.py
+        │       ├── meta/
+        │       │   ├── __init__.py
+        │       │   ├── market.py
+        │       │   ├── exchange.py
+        │       │   ├── instrument.py
+        │       │   ├── symbol_mapping.py
+        │       │   ├── trading_calendar.py
+        │       │   ├── data_vendor.py
+        │       │   ├── dataset.py
+        │       │   ├── definition_version.py
+        │       │   └── data_version.py
+        │       ├── ops/
+        │       │   ├── __init__.py
+        │       │   ├── run.py
+        │       │   ├── run_step.py
+        │       │   ├── event_log.py
+        │       │   └── lock.py
+        │       ├── core/
+        │       │   ├── __init__.py
+        │       │   ├── daily_bar.py
+        │       │   ├── adjust_factor.py
+        │       │   ├── price_limit_daily.py
+        │       │   └── instrument_status_daily.py
+        │       ├── raw/
+        │       │   └── __init__.py
+        │       ├── staging/
+        │       │   └── __init__.py
+        │       └── analytics/
+        │           └── __init__.py
+        └── scripts/
+            ├── __init__.py
+            └── db_upgrade.py

@@ -1,0 +1,369 @@
+{
+  "stage": "M5.6_BACKTRADER_ADAPTER_CONTRACT_SKELETON",
+  "execution_enabled": false,
+  "run_id": 61,
+  "backtest_request_id": 2,
+  "start_date": "2024-04-01",
+  "end_date": "2024-12-31",
+  "engine_code": "backtrader",
+  "source_signal_run_id": 53,
+  "screen_request_id": 3,
+  "execution_assumption_profile_id": 1,
+  "benchmark_definition_id": null,
+  "data_feed_plan": {
+    "adapter": "BacktraderDataFeedAdapter",
+    "execution_enabled": false,
+    "table_name": "core_daily_bar",
+    "table_exists": true,
+    "status": "READY_FOR_ADAPTER",
+    "start_date": "2024-04-01",
+    "end_date": "2024-12-31",
+    "requested_instrument_count": 30,
+    "covered_instrument_count": 30,
+    "bar_rows": 5520,
+    "trade_day_count": 184,
+    "min_trade_date": "2024-04-01",
+    "max_trade_date": "2024-12-31",
+    "available_required_cols": [
+      "close",
+      "high",
+      "instrument_id",
+      "low",
+      "open",
+      "trade_date",
+      "volume"
+    ],
+    "missing_required_cols": [],
+    "note": "M5.6 plan only; no backtrader feed object created"
+  },
+  "strategy_bridge_plan": {
+    "bridge": "BacktraderStrategyBridge",
+    "execution_enabled": false,
+    "source_signal_run_id": 53,
+    "screen_request_id": 3,
+    "portfolio_construction_mode": "EQUAL_WEIGHT_TOP_N",
+    "portfolio_construction_payload": {
+      "top_n": 30,
+      "cash_buffer_pct": null,
+      "max_weight_per_instrument": null
+    },
+    "selected_count": 30,
+    "instrument_count": 30,
+    "instrument_ids": [
+      1617,
+      1627,
+      1903,
+      2004,
+      2009,
+      2012,
+      2181,
+      2214,
+      2602,
+      2669,
+      3024,
+      3032,
+      3074,
+      3076,
+      3174,
+      3213,
+      3365,
+      4256,
+      4456,
+      4542,
+      4603,
+      4714,
+      4744,
+      5191,
+      5241,
+      5346,
+      7850,
+      7851,
+      7856,
+      7987
+    ],
+    "target_preview": [
+      {
+        "instrument_id": 4603,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.84932365",
+        "rank_in_batch": 1,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5346,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.83946688",
+        "rank_in_batch": 2,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3032,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.83346927",
+        "rank_in_batch": 3,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5191,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.82598966",
+        "rank_in_batch": 4,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3174,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.81695842",
+        "rank_in_batch": 5,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1627,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.80679332",
+        "rank_in_batch": 6,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2012,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.80591804",
+        "rank_in_batch": 7,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4714,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.80371991",
+        "rank_in_batch": 8,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2181,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.80270539",
+        "rank_in_batch": 9,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3074,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.80209867",
+        "rank_in_batch": 10,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4256,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79813010",
+        "rank_in_batch": 11,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5241,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79710563",
+        "rank_in_batch": 12,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4456,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79678735",
+        "rank_in_batch": 13,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4744,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79594689",
+        "rank_in_batch": 14,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3024,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79560374",
+        "rank_in_batch": 15,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2602,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79516610",
+        "rank_in_batch": 16,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 7850,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79396260",
+        "rank_in_batch": 17,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 7851,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79396260",
+        "rank_in_batch": 18,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2009,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79279889",
+        "rank_in_batch": 19,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2669,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79267953",
+        "rank_in_batch": 20,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2004,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79175453",
+        "rank_in_batch": 21,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3365,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79105829",
+        "rank_in_batch": 22,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1617,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79074995",
+        "rank_in_batch": 23,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3213,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.79036204",
+        "rank_in_batch": 24,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2214,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78996419",
+        "rank_in_batch": 25,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 7987,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78607519",
+        "rank_in_batch": 26,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 7856,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78579670",
+        "rank_in_batch": 27,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3076,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78519992",
+        "rank_in_batch": 28,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1903,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78480207",
+        "rank_in_batch": 29,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4542,
+        "effective_date": "2024-04-01",
+        "signal_action": "select",
+        "raw_score": "0.78414561",
+        "rank_in_batch": 30,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      }
+    ],
+    "note": "M5.6 plan only; target_weight_preview is not M6 target_position"
+  },
+  "analyzer_bridge_plan": {
+    "bridge": "BacktraderAnalyzerBridge",
+    "execution_enabled": false,
+    "backtest_request_id": 2,
+    "run_id": 61,
+    "planned_metric_targets": [
+      "total_return",
+      "annual_return",
+      "benchmark_return",
+      "excess_return",
+      "max_drawdown",
+      "sharpe_ratio",
+      "volatility",
+      "win_rate",
+      "turnover_avg"
+    ],
+    "planned_series_targets": [
+      "portfolio_equity",
+      "portfolio_return_daily",
+      "benchmark_equity",
+      "benchmark_return_daily",
+      "drawdown",
+      "cash",
+      "turnover",
+      "holding_count"
+    ],
+    "planned_artifact_targets": [
+      "backtest_execution_plan_json",
+      "backtest_metrics_json",
+      "backtest_equity_curve_csv",
+      "backtest_trade_log_csv",
+      "backtest_report_html"
+    ],
+    "input_summary": {
+      "bar_rows": 5520,
+      "trade_day_count": 184,
+      "selected_count": 30,
+      "instrument_count": 30
+    },
+    "note": "M5.6 plan only; analyzer output contract is reserved"
+  }
+}

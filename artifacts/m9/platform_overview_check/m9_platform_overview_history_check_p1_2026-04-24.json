@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-04-24T05:43:32.893726+00:00",
+  "requested_report_date": "2026-04-24",
+  "status": "PASS",
+  "latest_available_date": "2026-04-24",
+  "previous_complete_date": "2026-04-23",
+  "minimum_required_complete_days": 2,
+  "available_dates": [
+    "2026-04-23",
+    "2026-04-24"
+  ],
+  "complete_dates": [
+    "2026-04-23",
+    "2026-04-24"
+  ],
+  "inventories": [
+    {
+      "report_date": "2026-04-23",
+      "files": {
+        "json": "m9_platform_overview_p1_2026-04-23.json",
+        "markdown": "m9_platform_overview_p1_2026-04-23.md",
+        "action_items_csv": "m9_platform_overview_p1_2026-04-23_action_items.csv",
+        "sections_csv": "m9_platform_overview_p1_2026-04-23_sections.csv",
+        "sources_csv": "m9_platform_overview_p1_2026-04-23_sources.csv"
+      }
+    },
+    {
+      "report_date": "2026-04-24",
+      "files": {
+        "json": "m9_platform_overview_p1_2026-04-24.json",
+        "markdown": "m9_platform_overview_p1_2026-04-24.md",
+        "action_items_csv": "m9_platform_overview_p1_2026-04-24_action_items.csv",
+        "sections_csv": "m9_platform_overview_p1_2026-04-24_sections.csv",
+        "sources_csv": "m9_platform_overview_p1_2026-04-24_sources.csv"
+      }
+    }
+  ],
+  "risks": [],
+  "next_steps": [
+    "当前已识别 previous_complete_date=2026-04-23，后续可验证 13_与上一报告日对比 是否从 WARN 收敛为 OK。"
+  ],
+  "summary": "requested_report_date=2026-04-24。 latest_available_date=2026-04-24。 complete_dates_count=2。 previous_complete_date=2026-04-23。 当前历史产物保留要求已满足。"
+}

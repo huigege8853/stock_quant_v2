@@ -1,0 +1,255 @@
+{
+  "module": "M8.12",
+  "query": "export_scheduler_registration_pack",
+  "portfolio_id": 1,
+  "profile_code": null,
+  "exported_at": "2026-04-23T15:46:34.592974",
+  "registration_check": {
+    "module": "M8.12",
+    "query": "scheduler_registration_check",
+    "portfolio_id": 1,
+    "profile_code": null,
+    "project_root": "E:\\02_python\\Projet_stock_quant_v2\\stock_quant_v2",
+    "scheduler_dir": "artifacts\\m8\\scheduler",
+    "task_name": "stock_quant_v2_m8_daily_ops",
+    "checked_at": "2026-04-23T15:46:28.305088",
+    "files": [
+      {
+        "name": "powershell",
+        "path": "artifacts\\m8\\scheduler\\stock_quant_v2_m8_daily_ops.ps1",
+        "required": true,
+        "exists": true,
+        "status": "PASS",
+        "message": "available"
+      },
+      {
+        "name": "xml",
+        "path": "artifacts\\m8\\scheduler\\stock_quant_v2_m8_daily_ops.xml",
+        "required": true,
+        "exists": true,
+        "status": "PASS",
+        "message": "available"
+      },
+      {
+        "name": "readme",
+        "path": "artifacts\\m8\\scheduler\\stock_quant_v2_m8_daily_ops_README.md",
+        "required": true,
+        "exists": true,
+        "status": "PASS",
+        "message": "available"
+      }
+    ],
+    "template_checks": [
+      {
+        "check_code": "PS1_HAS_DAILY_OPS_ENTRYPOINT",
+        "target": "powershell",
+        "status": "PASS",
+        "message": "PS1 should call m8_daily_ops_entrypoint"
+      },
+      {
+        "check_code": "PS1_HAS_FAIL_ON_WARN_FALSE",
+        "target": "powershell",
+        "status": "PASS",
+        "message": "PS1 should keep M8_FAIL_ON_WARN=false for strict profile"
+      },
+      {
+        "check_code": "PS1_HAS_PORTFOLIO_ID",
+        "target": "powershell",
+        "status": "PASS",
+        "message": "PS1 should set M8_PORTFOLIO_ID"
+      },
+      {
+        "check_code": "PS1_HAS_PROFILE_CODE",
+        "target": "powershell",
+        "status": "PASS",
+        "message": "PS1 should set or clear M8_RISK_PROFILE_CODE"
+      },
+      {
+        "check_code": "XML_HAS_POWERSHELL_COMMAND",
+        "target": "xml",
+        "status": "PASS",
+        "message": "XML should call powershell.exe"
+      },
+      {
+        "check_code": "XML_HAS_PS1_PATH",
+        "target": "xml",
+        "status": "PASS",
+        "message": "XML should reference generated PS1 file"
+      },
+      {
+        "check_code": "XML_DISABLED_BY_DEFAULT",
+        "target": "xml",
+        "status": "PASS",
+        "message": "XML should be disabled by default before manual approval"
+      },
+      {
+        "check_code": "README_EXISTS_AND_HAS_REGISTER_COMMAND",
+        "target": "readme",
+        "status": "PASS",
+        "message": "README should include manual registration command"
+      }
+    ],
+    "scheduler_health_status": "PASS",
+    "scheduler_exit_code": 0,
+    "startup_status": "FAIL",
+    "alert_status": "WARN",
+    "highest_alert_level": "WARN",
+    "checks": {
+      "scheduler_files_pass": true,
+      "template_checks_pass": true,
+      "scheduler_health_pass": true,
+      "scheduler_exit_code_zero": true,
+      "startup_not_fail": false,
+      "alert_no_critical": true
+    },
+    "warnings": [
+      {
+        "warning_code": "ALERT_WARN",
+        "message": "alert_check returned WARN but highest level is not CRITICAL.",
+        "highest_level": "WARN",
+        "alert_counts": {
+          "CRITICAL": 0,
+          "WARN": 2,
+          "INFO": 1
+        }
+      }
+    ],
+    "failures": [
+      {
+        "check_code": "startup_not_fail",
+        "message": "scheduler registration check failed"
+      }
+    ],
+    "manual_commands": [
+      {
+        "step_no": 10,
+        "title": "手动测试 PS1",
+        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"artifacts\\m8\\scheduler\\stock_quant_v2_m8_daily_ops.ps1\"",
+        "required": true
+      },
+      {
+        "step_no": 20,
+        "title": "注册 Windows Task Scheduler 任务",
+        "command": "schtasks /Create /TN \"stock_quant_v2_m8_daily_ops\" /XML \"artifacts\\m8\\scheduler\\stock_quant_v2_m8_daily_ops.xml\"",
+        "required": false
+      },
+      {
+        "step_no": 30,
+        "title": "人工检查后启用任务",
+        "command": "schtasks /Change /TN \"stock_quant_v2_m8_daily_ops\" /ENABLE",
+        "required": false
+      },
+      {
+        "step_no": 40,
+        "title": "人工禁用任务",
+        "command": "schtasks /Change /TN \"stock_quant_v2_m8_daily_ops\" /DISABLE",
+        "required": false
+      },
+      {
+        "step_no": 50,
+        "title": "人工删除任务",
+        "command": "schtasks /Delete /TN \"stock_quant_v2_m8_daily_ops\" /F",
+        "required": false
+      }
+    ],
+    "overall_status": "FAIL"
+  },
+  "enhanced_final_check": {
+    "module": "M8.12",
+    "query": "enhanced_final_check",
+    "portfolio_id": 1,
+    "profile_code": null,
+    "checked_at": "2026-04-23T15:46:34.592974",
+    "ops_kpi_status": "PASS",
+    "startup_status": "FAIL",
+    "registration_status": "FAIL",
+    "alert_status": "WARN",
+    "highest_alert_level": "WARN",
+    "scheduler_exit_code": 0,
+    "api_route_count": 0,
+    "run_status_counts": [
+      {
+        "status": "FAILED",
+        "cnt": 16
+      },
+      {
+        "status": "STALE",
+        "cnt": 20
+      },
+      {
+        "status": "SUCCESS",
+        "cnt": 162
+      }
+    ],
+    "kpi": {
+      "portfolio_id": 1,
+      "profile_code": null,
+      "snapshot_date": "2026-04-23",
+      "total_equity": "10001624.13334439",
+      "holding_count": 30,
+      "order_count": 28,
+      "fill_count": 28,
+      "position_count": 30,
+      "snapshot_count": 1,
+      "risk_decision_count": 180,
+      "risk_pass_count": 120,
+      "risk_warn_count": 60,
+      "risk_reject_count": 0,
+      "risk_adjust_count": 0,
+      "target_quantity_delta": "0E-8",
+      "target_amount_delta": "0E-8",
+      "scheduler_exit_code": 0,
+      "scheduler_status": "PASS",
+      "hygiene_status": "PASS",
+      "running_count": 0,
+      "stale_count": 20,
+      "failed_count": 16,
+      "success_count": 162
+    },
+    "checks": {
+      "ops_kpi_not_fail": true,
+      "startup_not_fail": false,
+      "registration_not_fail": false,
+      "alert_no_critical": true,
+      "scheduler_exit_code_zero": true,
+      "running_zero": true,
+      "api_app_pass": false,
+      "route_count_positive": false,
+      "risk_decision_count_ok": false,
+      "risk_reject_expected": false
+    },
+    "warnings": [
+      {
+        "warning_code": "ALERT_WARN",
+        "message": "alert returned WARN; inspect details."
+      }
+    ],
+    "failures": [
+      {
+        "check_code": "startup_not_fail",
+        "message": "M8 enhanced final check failed"
+      },
+      {
+        "check_code": "registration_not_fail",
+        "message": "M8 enhanced final check failed"
+      },
+      {
+        "check_code": "api_app_pass",
+        "message": "M8 enhanced final check failed"
+      },
+      {
+        "check_code": "route_count_positive",
+        "message": "M8 enhanced final check failed"
+      },
+      {
+        "check_code": "risk_decision_count_ok",
+        "message": "M8 enhanced final check failed"
+      },
+      {
+        "check_code": "risk_reject_expected",
+        "message": "M8 enhanced final check failed"
+      }
+    ],
+    "overall_status": "FAIL"
+  }
+}

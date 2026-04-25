@@ -1,0 +1,30 @@
+./
+├── src/
+│   └── stock_quant_v2/
+│       ├── platform_overview_domain/
+│       │   ├── __init__.py
+│       │   ├── dto/
+│       │   │   ├── __init__.py
+│       │   │   └── overview_models.py
+│       │   ├── readers/
+│       │   │   ├── __init__.py
+│       │   │   └── platform_overview_artifact_reader.py
+│       │   ├── services/
+│       │   │   ├── __init__.py
+│       │   │   └── platform_overview_report_builder.py
+│       │   └── tasks/
+│       │       ├── __init__.py
+│       │       └── build_platform_overview_report.py
+│       └── scripts/
+│           └── bootstrap_m9_1_1_platform_overview_p0.py
+└── docs/
+    └── modules/
+        └── m9/
+            ├── 01_scope.md
+            ├── 02_decisions.md
+            ├── 03_schema.md
+            ├── 04_flow.md
+            ├── 05_api_or_contract.md
+            ├── 06_acceptance.md
+            ├── 07_next_chat_brief.md
+            └── 08_open_items.md

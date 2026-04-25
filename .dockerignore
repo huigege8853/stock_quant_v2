@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+artifacts
+logs
+strategy_release_cache
+stock_quant_v2.db
+tests
+tmp

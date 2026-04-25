@@ -1,0 +1,55 @@
+version: "3.3"
+
+services:
+  stock-quant-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: stock-quant-runtime:2026.04.24-r3
+    container_name: stock-quant-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      APP_TIMEZONE: Asia/Shanghai
+      PYTHONPATH: /app/src
+    working_dir: /app
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+      - ./strategy_release_cache:/app/strategy_release_cache
+    command: ["/bin/bash", "-lc", "sleep infinity"]
+    networks:
+      - stock_quant_net
+
+  stock-quant-scheduler:
+    image: stock-quant-runtime:2026.04.24-r3
+    container_name: stock-quant-scheduler
+    restart: unless-stopped
+    depends_on:
+      - stock-quant-app
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      APP_TIMEZONE: Asia/Shanghai
+      PYTHONPATH: /app/src
+    working_dir: /app
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./logs:/app/logs
+      - ./strategy_release_cache:/app/strategy_release_cache
+      - ./deploy/supercronic/supercronic.crontab:/app/deploy/supercronic/supercronic.crontab:ro
+    command:
+      [
+        "/usr/local/bin/supercronic",
+        "-passthrough-logs",
+        "/app/deploy/supercronic/supercronic.crontab"
+      ]
+    networks:
+      - stock_quant_net
+
+networks:
+  stock_quant_net:
+    external: true

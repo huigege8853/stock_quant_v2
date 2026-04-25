@@ -1,0 +1,128 @@
+./
+├── alembic/
+│   └── versions/
+│       ├── m2_0001_raw_data_tables.py
+│       ├── m2_0002_staging_data_tables.py
+│       ├── m2_0003_ops_data_sync_tables.py
+│       ├── m2_0004_core_theme_tables.py
+│       └── m2_0005_core_daily_bar_extend.py
+└── src/
+    └── stock_quant_v2/
+        ├── data_domain/
+        │   ├── __init__.py
+        │   ├── enums.py
+        │   ├── constants.py
+        │   ├── dto/
+        │   │   ├── __init__.py
+        │   │   ├── instrument.py
+        │   │   ├── trading_calendar.py
+        │   │   ├── daily_bar.py
+        │   │   ├── fundamental_snapshot.py
+        │   │   ├── tag.py
+        │   │   ├── market_index.py
+        │   │   └── market_breadth.py
+        │   ├── providers/
+        │   │   ├── __init__.py
+        │   │   ├── base.py
+        │   │   ├── registry.py
+        │   │   ├── request_models.py
+        │   │   ├── tushare/
+        │   │   │   ├── __init__.py
+        │   │   │   ├── client.py
+        │   │   │   ├── instrument_provider.py
+        │   │   │   ├── trading_calendar_provider.py
+        │   │   │   ├── daily_bar_provider.py
+        │   │   │   ├── fundamental_snapshot_provider.py
+        │   │   │   └── market_index_provider.py
+        │   │   ├── akshare/
+        │   │   │   ├── __init__.py
+        │   │   │   ├── client.py
+        │   │   │   ├── instrument_provider.py
+        │   │   │   ├── tag_provider.py
+        │   │   │   ├── market_breadth_provider.py
+        │   │   │   └── market_index_provider.py
+        │   │   └── sina/
+        │   │       ├── __init__.py
+        │   │       ├── client.py
+        │   │       ├── daily_bar_provider.py
+        │   │       └── market_index_bar_provider.py
+        │   ├── mappers/
+        │   │   ├── __init__.py
+        │   │   ├── instrument_mapper.py
+        │   │   ├── trading_calendar_mapper.py
+        │   │   ├── daily_bar_mapper.py
+        │   │   ├── fundamental_snapshot_mapper.py
+        │   │   ├── tag_mapper.py
+        │   │   ├── market_index_mapper.py
+        │   │   └── market_breadth_mapper.py
+        │   ├── repositories/
+        │   │   ├── __init__.py
+        │   │   ├── raw_repository.py
+        │   │   ├── staging_repository.py
+        │   │   ├── core_repository.py
+        │   │   ├── sync_run_repository.py
+        │   │   └── instrument_lookup_repository.py
+        │   ├── services/
+        │   │   ├── __init__.py
+        │   │   ├── batch_planner.py
+        │   │   ├── checkpoint_service.py
+        │   │   ├── ingestion_service.py
+        │   │   ├── standardization_service.py
+        │   │   ├── quality_service.py
+        │   │   ├── lineage_service.py
+        │   │   ├── reconciliation_service.py
+        │   │   └── sync_orchestrator.py
+        │   └── tasks/
+        │       ├── __init__.py
+        │       ├── sync_instrument.py
+        │       ├── sync_trading_calendar.py
+        │       ├── sync_daily_bar.py
+        │       ├── sync_fundamental_snapshot.py
+        │       ├── sync_market_index.py
+        │       ├── sync_market_breadth.py
+        │       ├── repair_daily_bar.py
+        │       └── bootstrap_first_chain.py
+        ├── db/
+        │   └── models/
+        │       ├── raw/
+        │       │   ├── __init__.py
+        │       │   ├── instrument_raw.py
+        │       │   ├── trading_calendar_raw.py
+        │       │   ├── daily_bar_raw.py
+        │       │   ├── fundamental_snapshot_raw.py
+        │       │   ├── tag_raw.py
+        │       │   ├── market_index_raw.py
+        │       │   └── market_breadth_raw.py
+        │       ├── staging/
+        │       │   ├── __init__.py
+        │       │   ├── instrument_staging.py
+        │       │   ├── trading_calendar_staging.py
+        │       │   ├── daily_bar_staging.py
+        │       │   ├── fundamental_snapshot_staging.py
+        │       │   ├── tag_staging.py
+        │       │   ├── market_index_staging.py
+        │       │   └── market_breadth_staging.py
+        │       ├── core/
+        │       │   ├── __init__.py
+        │       │   ├── daily_bar.py
+        │       │   ├── fundamental_snapshot.py
+        │       │   ├── tag.py
+        │       │   ├── instrument_tag.py
+        │       │   ├── market_index.py
+        │       │   ├── market_index_bar.py
+        │       │   └── market_breadth.py
+        │       └── ops/
+        │           ├── __init__.py
+        │           ├── run.py
+        │           ├── run_step.py
+        │           ├── event_log.py
+        │           ├── lock.py
+        │           ├── data_sync_run.py
+        │           ├── data_batch.py
+        │           ├── data_quality_issue.py
+        │           └── data_lineage.py
+        └── scripts/
+            ├── __init__.py
+            ├── bootstrap_instrument_calendar.py
+            ├── bootstrap_daily_bar_first_chain.py
+            └── repair_missing_daily_bar.py

@@ -1,0 +1,13 @@
+{
+  "trading_days": 184,
+  "initial_cash": "10000000.00000000",
+  "start_value": "10000000.00000000",
+  "final_equity": "9749133.62932400",
+  "total_return": "-0.02508664",
+  "annual_return": "-0.03419767",
+  "max_drawdown": "-0.25480463",
+  "sharpe_ratio": "-0.06033385",
+  "volatility": "0.25128005",
+  "order_count": 90,
+  "trade_count": 30
+}

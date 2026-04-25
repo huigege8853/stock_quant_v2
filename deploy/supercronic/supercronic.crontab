@@ -1,0 +1,5 @@
+# 工作日 18:30 执行 daily runtime
+30 18 * * 1-5 cd /app && ./scripts/run_daily_runtime.sh >> /app/logs/daily_runtime.log 2>&1
+
+# 每天凌晨 04:00 清理 14 天前日志
+0 4 * * * find /app/logs -type f -name "*.log" -mtime +14 -delete

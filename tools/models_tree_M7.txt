@@ -1,0 +1,30 @@
+./
+├── src/
+│   └── stock_quant_v2/
+│       ├── trading_domain/
+│       │   ├── services/
+│       │   │   ├── paper_position_carry_service.py
+│       │   │   ├── paper_rebalance_service.py
+│       │   │   ├── paper_realized_pnl_service.py
+│       │   │   └── paper_multiday_orchestrator.py
+│       │   └── tasks/
+│       │       ├── carry_forward_positions.py
+│       │       ├── run_paper_trading_daily.py
+│       │       └── run_paper_trading_date_range.py
+│       └── scripts/
+│           ├── bootstrap_m7_paper_trading_daily_chain.py
+│           ├── bootstrap_m7_paper_trading_multiday_chain.py
+│           └── check_m7_paper_trading_quality.py
+├── sql/
+│   └── m7_1_acceptance.sql
+└── docs/
+    └── modules/
+        └── m7/
+            ├── 01_scope.md
+            ├── 02_decisions.md
+            ├── 03_schema.md
+            ├── 04_flow.md
+            ├── 05_api_or_contract.md
+            ├── 06_acceptance.md
+            ├── 07_next_chat_brief.md
+            └── 08_open_items.md

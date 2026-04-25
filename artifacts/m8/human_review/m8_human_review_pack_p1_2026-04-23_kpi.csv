@@ -1,0 +1,2 @@
+﻿portfolio_id,profile_code,snapshot_date,total_equity,holding_count,order_count,fill_count,position_count,snapshot_count,risk_decision_count,risk_pass_count,risk_warn_count,risk_reject_count,risk_adjust_count,target_quantity_delta,target_amount_delta,scheduler_exit_code,scheduler_status,hygiene_status,running_count,stale_count,failed_count,success_count
+1,,2026-04-23,10001624.13334439,30,28,28,30,1,180,120,60,0,0,0E-8,0E-8,0,PASS,PASS,0,20,16,162

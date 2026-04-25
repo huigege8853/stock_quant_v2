@@ -1,0 +1,7 @@
+﻿module,purpose,status,message
+sqlalchemy,database ORM,PASS,import ok
+psycopg,PostgreSQL driver,PASS,import ok
+fastapi,API framework,FAIL,No module named 'fastapi'
+uvicorn,ASGI server,FAIL,No module named 'uvicorn'
+openpyxl,Excel export,PASS,import ok
+pydantic_settings,settings support,PASS,import ok

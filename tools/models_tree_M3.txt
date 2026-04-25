@@ -1,0 +1,146 @@
+./
+├── .env
+├── .env.example
+├── .gitignore
+├── alembic/
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│       ├── m1_0001_meta_base.py
+│       ├── m1_0002_meta_security_master.py
+│       ├── m1_0003_ops_runtime.py
+│       ├── m1_0004_meta_versioning.py
+│       ├── m1_0005_core_market_data.py
+│       ├── m2_0001_raw_data_tables.py
+│       ├── m2_0002_staging_data_tables.py
+│       ├── m2_0003_ops_data_sync_tables.py
+│       ├── m2_0004_core_theme_tables.py
+│       ├── m2_0005_core_daily_bar_extend.py
+│       ├── m2_0006_market_index_raw_staging.py
+│       ├── m2_0007_core_mb_p1.py
+│       ├── m2_0008_adj_factor_tbls.py
+│       ├── m2_0009_fund_snap_p1.py
+│       ├── m3_0001_analytics_definitions.py
+│       └── m3_0002_analytics_snapshots.py
+├── docs/
+│   ├── prd/
+│   ├── modules/
+│   │   └── m3/
+│   │       ├── 01_scope.md
+│   │       ├── 02_decisions.md
+│   │       ├── 03_schema.md
+│   │       ├── 04_flow.md
+│   │       ├── 05_api_or_contract.md
+│   │       ├── 06_acceptance.md
+│   │       ├── 07_next_chat_brief.md
+│   │       └── 08_open_items.md
+│   └── runbooks/
+│       ├── m3_indicator_first_chain_runbook.md
+│       └── m3_indicator_first_chain_troubleshooting.md
+├── sql/
+│   ├── m2_phase1_acceptance.sql
+│   ├── m2_2_acceptance.sql
+│   └── m3_1_acceptance.sql
+├── src/
+│   └── stock_quant_v2/
+│       ├── config/
+│       │   ├── settings.py
+│       │   └── __init__.py
+│       ├── analytics_domain/
+│       │   ├── constants.py
+│       │   ├── enums.py
+│       │   ├── __init__.py
+│       │   ├── dto/
+│       │   │   ├── indicator_definition.py
+│       │   │   ├── factor_definition.py
+│       │   │   ├── feature_definition.py
+│       │   │   ├── feature_set_definition.py
+│       │   │   ├── label_definition.py
+│       │   │   └── __init__.py
+│       │   ├── calculators/
+│       │   │   ├── base.py
+│       │   │   ├── primitive_metrics.py
+│       │   │   ├── indicators_trend.py
+│       │   │   ├── indicators_volatility.py
+│       │   │   ├── factors_momentum.py
+│       │   │   ├── factors_tradability.py
+│       │   │   ├── labels_forward_return.py
+│       │   │   └── __init__.py
+│       │   ├── repositories/
+│       │   │   ├── analytics_definition_repository.py
+│       │   │   ├── indicator_snapshot_repository.py
+│       │   │   ├── factor_snapshot_repository.py
+│       │   │   ├── feature_snapshot_repository.py
+│       │   │   ├── label_snapshot_repository.py
+│       │   │   └── __init__.py
+│       │   ├── services/
+│       │   │   ├── analytics_universe_service.py
+│       │   │   ├── leakage_guard_service.py
+│       │   │   ├── warmup_service.py
+│       │   │   ├── indicator_compute_service.py
+│       │   │   ├── factor_compute_service.py
+│       │   │   ├── feature_build_service.py
+│       │   │   ├── label_build_service.py
+│       │   │   └── __init__.py
+│       │   └── tasks/
+│       │       ├── seed_indicator_definitions.py
+│       │       ├── seed_factor_definitions.py
+│       │       ├── seed_feature_definitions.py
+│       │       ├── seed_label_definitions.py
+│       │       ├── compute_indicator_snapshot.py
+│       │       ├── compute_factor_snapshot.py
+│       │       ├── build_feature_snapshot.py
+│       │       ├── build_label_snapshot.py
+│       │       └── __init__.py
+│       ├── data_domain/
+│       │   ├── constants.py
+│       │   ├── dto/
+│       │   ├── enums.py
+│       │   ├── mappers/
+│       │   ├── providers/
+│       │   ├── repositories/
+│       │   ├── services/
+│       │   ├── tasks/
+│       │   └── __init__.py
+│       ├── db/
+│       │   ├── base.py
+│       │   ├── mixins.py
+│       │   ├── naming.py
+│       │   ├── session.py
+│       │   ├── __init__.py
+│       │   └── models/
+│       │       ├── analytics/
+│       │       │   ├── indicator_definition.py
+│       │       │   ├── factor_definition.py
+│       │       │   ├── feature_definition.py
+│       │       │   ├── feature_set_definition.py
+│       │       │   ├── label_definition.py
+│       │       │   ├── instrument_indicator_snapshot.py
+│       │       │   ├── instrument_factor_snapshot.py
+│       │       │   ├── feature_snapshot.py
+│       │       │   ├── label_snapshot.py
+│       │       │   └── __init__.py
+│       │       ├── core/
+│       │       ├── meta/
+│       │       ├── ops/
+│       │       ├── raw/
+│       │       ├── staging/
+│       │       └── __init__.py
+│       ├── scripts/
+│       │   ├── bootstrap_meta.py
+│       │   ├── bootstrap_meta_data_domain.py
+│       │   ├── bootstrap_m3_indicator_chain.py
+│       │   └── __init__.py
+│       └── __init__.py
+├── tests/
+│   ├── analytics/
+│   │   ├── test_indicator_compute_service.py
+│   │   ├── test_factor_compute_service.py
+│   │   ├── test_feature_build_service.py
+│   │   ├── test_label_build_service.py
+│   │   ├── test_leakage_guard_service.py
+│   │   └── test_warmup_service.py
+│   ├── services/
+│   └── tasks/
+├── README.md
+└── pyproject.toml

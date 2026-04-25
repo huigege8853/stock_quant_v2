@@ -1,0 +1,4 @@
+﻿priority,area,action,reason,related_run_ids,related_sources
+P0,alert,复核告警来源中的 CRITICAL/WARN 项。,M8 alert artifacts 已存在，M9 首版应把高风险对象优先推给人工复核。,,artifacts/m8/alert/m8_alert_report_p1_2026-04-23.json|artifacts/m8/alert/m8_alert_report_p1_2026-04-23.md|artifacts/m8/alert/m8_alert_report_p1_2026-04-23_alerts.csv
+P0,risk,核对 risk reject / adjust / WARN 对目标仓位和 paper 链路的影响。,风控章节属于当前必须解释的主线。,166|215,artifacts/m8/risk/m8_risk_report_p1_src155_adj215.json|artifacts/m8/risk/m8_risk_report_p1_src155_adj215.md|artifacts/m8/risk/m8_risk_report_p1_src155_adj215_decisions.csv|artifacts/m8/risk/m8_risk_report_p1_src160_adj166.json|artifacts/m8/risk/m8_risk_report_p1_src160_adj166.md
+P0,acceptance,先把 M8 验收材料收敛到 acceptance master / registry / manifest。,M9.1.1 应优先读取 M8 权威收敛入口，避免从零散验收文档中拼接结论。,,

@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-04-24T05:17:03.147283+00:00",
+  "requested_report_date": "2026-04-23",
+  "status": "WARN",
+  "latest_available_date": "2026-04-23",
+  "previous_complete_date": null,
+  "minimum_required_complete_days": 2,
+  "available_dates": [
+    "2026-04-23"
+  ],
+  "complete_dates": [
+    "2026-04-23"
+  ],
+  "inventories": [
+    {
+      "report_date": "2026-04-23",
+      "files": {
+        "json": "m9_platform_overview_p1_2026-04-23.json",
+        "markdown": "m9_platform_overview_p1_2026-04-23.md",
+        "action_items_csv": "m9_platform_overview_p1_2026-04-23_action_items.csv",
+        "sections_csv": "m9_platform_overview_p1_2026-04-23_sections.csv",
+        "sources_csv": "m9_platform_overview_p1_2026-04-23_sources.csv"
+      }
+    }
+  ],
+  "risks": [
+    "完整 platform overview 报告日数量仅有 1 个，低于要求的 2 个。"
+  ],
+  "next_steps": [
+    "至少保留最近两个完整报告日的 platform overview 产物。"
+  ],
+  "summary": "requested_report_date=2026-04-23。 latest_available_date=2026-04-23。 complete_dates_count=1。 尚未识别到可用于 day-over-day comparison 的 previous_complete_date。 当前历史产物保留仍不足以稳定支持 day-over-day comparison，至少需要 2 个完整报告日。"
+}
