@@ -1,0 +1,7 @@
+﻿name,path,required,exists,writable,status,message
+project_root,E:\02_python\Projet_stock_quant_v2\stock_quant_v2,True,True,True,PASS,ok
+src,E:\02_python\Projet_stock_quant_v2\stock_quant_v2\src,True,True,True,PASS,ok
+artifacts,E:\02_python\Projet_stock_quant_v2\stock_quant_v2\artifacts,False,True,True,PASS,ok
+artifacts_m8,E:\02_python\Projet_stock_quant_v2\stock_quant_v2\artifacts\m8,False,True,True,PASS,ok
+docs_runbooks,E:\02_python\Projet_stock_quant_v2\stock_quant_v2\docs\runbooks,False,True,True,PASS,ok
+docs_modules_m8,E:\02_python\Projet_stock_quant_v2\stock_quant_v2\docs\modules\m8,False,True,True,PASS,ok

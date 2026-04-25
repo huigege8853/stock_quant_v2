@@ -1,0 +1,95 @@
+{
+  "module": "M8.1",
+  "query": "paper_chain",
+  "portfolio_id": 1,
+  "runs": {
+    "target_run_id": 160,
+    "order_run_id": 146,
+    "fill_run_id": 147,
+    "position_run_id": 153,
+    "snapshot_run_id": 154
+  },
+  "target": {
+    "target_count": 30,
+    "rejected_target_count": 0,
+    "risk_status_count": 30,
+    "min_as_of_date": "2026-04-21",
+    "max_as_of_date": "2026-04-21",
+    "min_effective_date": "2026-04-22",
+    "max_effective_date": "2026-04-22",
+    "target_weight_total": "0.9999999990",
+    "target_quantity_total": "605400.00000000",
+    "target_amount_total": "9794717.00000000"
+  },
+  "order": {
+    "order_count": 28,
+    "buy_order_count": 10,
+    "sell_order_count": 18,
+    "min_order_date": "2026-04-22",
+    "max_order_date": "2026-04-22",
+    "min_effective_date": "2026-04-22",
+    "max_effective_date": "2026-04-22",
+    "order_quantity_total": "157800.00000000",
+    "estimated_gross_amount_total": "1686785.00000000",
+    "estimated_fee_total": "0E-8",
+    "estimated_net_amount_total": "1686785.00000000"
+  },
+  "fill": {
+    "fill_count": 28,
+    "min_fill_date": "2026-04-22",
+    "max_fill_date": "2026-04-22",
+    "fill_quantity_total": "157800.00000000",
+    "gross_amount_total": "1686785.00000000",
+    "total_fee_amount_total": "0E-8",
+    "net_amount_total": "1686958.71940000",
+    "cash_delta_total": "-1310028.60320000",
+    "slippage_amount_total": "0E-8"
+  },
+  "position": {
+    "position_count": 30,
+    "open_position_count": 30,
+    "closed_position_count": 0,
+    "min_position_date": "2026-04-23",
+    "max_position_date": "2026-04-23",
+    "quantity_total": "605400.00000000",
+    "available_quantity_total": "605400.00000000",
+    "cost_amount_total": "9777675.67995099",
+    "market_value_total": "9982096.00000000",
+    "unrealized_pnl_total": "23225.06369091",
+    "realized_pnl_total": "5077.52739750",
+    "total_pnl_total": "22423.47881041"
+  },
+  "snapshot": {
+    "snapshot_count": 1,
+    "min_snapshot_date": "2026-04-23",
+    "max_snapshot_date": "2026-04-23",
+    "cash_balance_total": "237814.13334439",
+    "market_value_total": "9763810.00000000",
+    "total_equity_total": "10001624.13334439",
+    "gross_exposure_total": "9989383.00000000",
+    "net_exposure_total": "9989383.00000000",
+    "holding_count": 30,
+    "daily_pnl_total": "35092.00960389",
+    "cumulative_pnl_total": "35092.00960389"
+  },
+  "checks": {
+    "target_exists": true,
+    "order_checked": true,
+    "fill_checked": true,
+    "position_checked": true,
+    "snapshot_checked": true,
+    "order_exists": true,
+    "fill_exists": true,
+    "position_exists": true,
+    "snapshot_exists": true
+  },
+  "overall_status": "PASS",
+  "exported_at": "2026-04-23T15:46:15.304630",
+  "detail_counts": {
+    "target_rows": 30,
+    "order_rows": 28,
+    "fill_rows": 28,
+    "position_rows": 30,
+    "snapshot_rows": 1
+  }
+}

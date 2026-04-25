@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  postgres_v1:
+    image: postgres:16
+    container_name: postgres_v1
+    environment:
+      POSTGRES_DB: ${POSTGRES_V1_DB}
+      POSTGRES_USER: ${POSTGRES_V1_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_V1_PASSWORD}
+      TZ: ${APP_TIMEZONE}
+    ports:
+      - "54321:5432"
+    volumes:
+      - pgdata_v1:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_V1_USER} -d ${POSTGRES_V1_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres_v2:
+    image: postgres:16
+    container_name: postgres_v2
+    environment:
+      POSTGRES_DB: ${POSTGRES_V2_DB}
+      POSTGRES_USER: ${POSTGRES_V2_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_V2_PASSWORD}
+      TZ: ${APP_TIMEZONE}
+    ports:
+      - "54322:5432"
+    volumes:
+      - pgdata_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_V2_USER} -d ${POSTGRES_V2_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata_v1:
+  pgdata_v2:

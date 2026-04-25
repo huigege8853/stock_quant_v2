@@ -1,0 +1,369 @@
+{
+  "stage": "M5.6_BACKTRADER_ADAPTER_CONTRACT_SKELETON",
+  "execution_enabled": false,
+  "run_id": 86,
+  "backtest_request_id": 4,
+  "start_date": "2026-04-20",
+  "end_date": "2026-04-30",
+  "engine_code": "backtrader",
+  "source_signal_run_id": 81,
+  "screen_request_id": 3,
+  "execution_assumption_profile_id": 1,
+  "benchmark_definition_id": null,
+  "data_feed_plan": {
+    "adapter": "BacktraderDataFeedAdapter",
+    "execution_enabled": false,
+    "table_name": "core_daily_bar",
+    "table_exists": true,
+    "status": "NEEDS_REVIEW",
+    "start_date": "2026-04-20",
+    "end_date": "2026-04-30",
+    "requested_instrument_count": 30,
+    "covered_instrument_count": 0,
+    "bar_rows": 0,
+    "trade_day_count": 0,
+    "min_trade_date": null,
+    "max_trade_date": null,
+    "available_required_cols": [
+      "close",
+      "high",
+      "instrument_id",
+      "low",
+      "open",
+      "trade_date",
+      "volume"
+    ],
+    "missing_required_cols": [],
+    "note": "M5.6 plan only; no backtrader feed object created"
+  },
+  "strategy_bridge_plan": {
+    "bridge": "BacktraderStrategyBridge",
+    "execution_enabled": false,
+    "source_signal_run_id": 81,
+    "screen_request_id": 3,
+    "portfolio_construction_mode": "EQUAL_WEIGHT_TOP_N",
+    "portfolio_construction_payload": {
+      "top_n": 30,
+      "cash_buffer_pct": null,
+      "max_weight_per_instrument": null
+    },
+    "selected_count": 30,
+    "instrument_count": 30,
+    "instrument_ids": [
+      717,
+      819,
+      1415,
+      1508,
+      1637,
+      1988,
+      2173,
+      2182,
+      2327,
+      2391,
+      2464,
+      2703,
+      2784,
+      3048,
+      3062,
+      3192,
+      3300,
+      3981,
+      4115,
+      4175,
+      4289,
+      4379,
+      4435,
+      4461,
+      4929,
+      5237,
+      5649,
+      5678,
+      5716,
+      5801
+    ],
+    "target_preview": [
+      {
+        "instrument_id": 5237,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.83704453",
+        "rank_in_batch": 1,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4115,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.83097166",
+        "rank_in_batch": 2,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5716,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.81820898",
+        "rank_in_batch": 3,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1415,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.81787160",
+        "rank_in_batch": 4,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3048,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.80805861",
+        "rank_in_batch": 5,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3192,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.80546559",
+        "rank_in_batch": 6,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4289,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.80407750",
+        "rank_in_batch": 7,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2391,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.80292076",
+        "rank_in_batch": 8,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2173,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.80000000",
+        "rank_in_batch": 9,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 819,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79904569",
+        "rank_in_batch": 10,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2784,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79632736",
+        "rank_in_batch": 11,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4929,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79233661",
+        "rank_in_batch": 12,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3981,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79067862",
+        "rank_in_batch": 13,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2182,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79062078",
+        "rank_in_batch": 14,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5678,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.79040871",
+        "rank_in_batch": 15,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4175,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78943513",
+        "rank_in_batch": 16,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4461,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78883748",
+        "rank_in_batch": 17,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1637,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78823019",
+        "rank_in_batch": 18,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3062,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78796029",
+        "rank_in_batch": 19,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4435,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78701562",
+        "rank_in_batch": 20,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5649,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78458647",
+        "rank_in_batch": 21,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 4379,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78354540",
+        "rank_in_batch": 22,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1508,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.78326586",
+        "rank_in_batch": 23,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2464,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77864854",
+        "rank_in_batch": 24,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2703,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77856179",
+        "rank_in_batch": 25,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 2327,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77539040",
+        "rank_in_batch": 26,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 1988,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77255639",
+        "rank_in_batch": 27,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 3300,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77250819",
+        "rank_in_batch": 28,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 5801,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77228649",
+        "rank_in_batch": 29,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      },
+      {
+        "instrument_id": 717,
+        "effective_date": "2026-04-20",
+        "signal_action": "select",
+        "raw_score": "0.77226721",
+        "rank_in_batch": 30,
+        "target_weight_preview": "0.03333333333333333333333333333"
+      }
+    ],
+    "note": "M5.6 plan only; target_weight_preview is not M6 target_position"
+  },
+  "analyzer_bridge_plan": {
+    "bridge": "BacktraderAnalyzerBridge",
+    "execution_enabled": false,
+    "backtest_request_id": 4,
+    "run_id": 86,
+    "planned_metric_targets": [
+      "total_return",
+      "annual_return",
+      "benchmark_return",
+      "excess_return",
+      "max_drawdown",
+      "sharpe_ratio",
+      "volatility",
+      "win_rate",
+      "turnover_avg"
+    ],
+    "planned_series_targets": [
+      "portfolio_equity",
+      "portfolio_return_daily",
+      "benchmark_equity",
+      "benchmark_return_daily",
+      "drawdown",
+      "cash",
+      "turnover",
+      "holding_count"
+    ],
+    "planned_artifact_targets": [
+      "backtest_execution_plan_json",
+      "backtest_metrics_json",
+      "backtest_equity_curve_csv",
+      "backtest_trade_log_csv",
+      "backtest_report_html"
+    ],
+    "input_summary": {
+      "bar_rows": 0,
+      "trade_day_count": 0,
+      "selected_count": 30,
+      "instrument_count": 30
+    },
+    "note": "M5.6 plan only; analyzer output contract is reserved"
+  }
+}

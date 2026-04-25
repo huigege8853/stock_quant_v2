@@ -1,0 +1,84 @@
+./
+├── alembic/
+│   └── versions/
+│       ├── m6_0001_trading_paper_core.py
+│       └── m6_0002_trading_paper_snapshot_ledger.py
+├── src/
+│   └── stock_quant_v2/
+│       ├── db/
+│       │   └── models/
+│       │       └── trading/
+│       │           ├── __init__.py
+│       │           ├── paper_account.py
+│       │           ├── paper_portfolio.py
+│       │           ├── paper_target_position.py
+│       │           ├── paper_order.py
+│       │           ├── paper_fill.py
+│       │           ├── paper_position.py
+│       │           ├── paper_portfolio_snapshot.py
+│       │           └── paper_trade_ledger.py
+│       ├── trading_domain/
+│       │   ├── __init__.py
+│       │   ├── constants.py
+│       │   ├── enums.py
+│       │   ├── dto/
+│       │   │   ├── __init__.py
+│       │   │   ├── paper_account.py
+│       │   │   ├── paper_portfolio.py
+│       │   │   ├── target_position.py
+│       │   │   ├── paper_order.py
+│       │   │   ├── paper_fill.py
+│       │   │   ├── paper_position.py
+│       │   │   ├── portfolio_snapshot.py
+│       │   │   └── paper_trading_chain.py
+│       │   ├── repositories/
+│       │   │   ├── __init__.py
+│       │   │   ├── paper_account_repository.py
+│       │   │   ├── paper_portfolio_repository.py
+│       │   │   ├── target_position_repository.py
+│       │   │   ├── paper_order_repository.py
+│       │   │   ├── paper_fill_repository.py
+│       │   │   ├── paper_position_repository.py
+│       │   │   ├── portfolio_snapshot_repository.py
+│       │   │   └── trade_ledger_repository.py
+│       │   ├── services/
+│       │   │   ├── __init__.py
+│       │   │   ├── paper_account_service.py
+│       │   │   ├── paper_portfolio_service.py
+│       │   │   ├── signal_to_target_service.py
+│       │   │   ├── paper_order_service.py
+│       │   │   ├── paper_fill_service.py
+│       │   │   ├── paper_position_service.py
+│       │   │   ├── portfolio_valuation_service.py
+│       │   │   ├── paper_trade_ledger_service.py
+│       │   │   └── paper_trading_orchestrator.py
+│       │   └── tasks/
+│       │       ├── __init__.py
+│       │       ├── seed_paper_trading_account.py
+│       │       ├── build_target_positions.py
+│       │       ├── generate_paper_orders.py
+│       │       ├── simulate_paper_fills.py
+│       │       ├── update_paper_positions.py
+│       │       ├── build_portfolio_snapshot.py
+│       │       └── run_paper_trading_first_chain.py
+│       └── scripts/
+│           ├── bootstrap_m6_paper_account.py
+│           ├── bootstrap_m6_target_position_chain.py
+│           ├── bootstrap_m6_paper_order_chain.py
+│           ├── bootstrap_m6_paper_fill_chain.py
+│           ├── bootstrap_m6_paper_position_snapshot_chain.py
+│           ├── bootstrap_m6_paper_trading_first_chain.py
+│           └── check_m6_paper_trading_quality.py
+├── sql/
+│   └── m6_1_acceptance.sql
+└── docs/
+    └── modules/
+        └── m6/
+            ├── 01_scope.md
+            ├── 02_decisions.md
+            ├── 03_schema.md
+            ├── 04_flow.md
+            ├── 05_api_or_contract.md
+            ├── 06_acceptance.md
+            ├── 07_next_chat_brief.md
+            └── 08_open_items.md

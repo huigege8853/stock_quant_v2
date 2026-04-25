@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+PROVIDER_STATUS = {
+    "daily_bar": {
+        "baostock": "READY",
+        "sina": "READY_LIGHT",
+        "akshare": "PLACEHOLDER",
+        "pytdx": "PLACEHOLDER",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "trading_calendar": {
+        "baostock": "READY",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "akshare": "PLACEHOLDER",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "adjust_factor": {
+        "baostock": "READY",
+        "akshare": "PLACEHOLDER",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "market_index": {
+        "baostock": "PLACEHOLDER",
+        "sina": "READY_LIGHT",
+        "akshare": "PLACEHOLDER",
+        "pytdx": "PLACEHOLDER",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "market_index_bar": {
+        "baostock": "PLACEHOLDER",
+        "sina": "READY",
+        "akshare": "PLACEHOLDER",
+        "pytdx": "PLACEHOLDER",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "fundamental_snapshot": {
+        "akshare": "PLACEHOLDER",
+        "baostock": "PLACEHOLDER",
+        "sina": "PLACEHOLDER",
+        "pytdx": "PLACEHOLDER",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+    "instrument": {
+        "akshare": "READY_LIGHT",
+        "tushare": "RESERVED_LOW_PRIORITY_PERMISSION_GATED",
+        "baostock": "PLACEHOLDER",
+        "paid": "PAID_RESERVED",
+        "skip": "SYSTEM_FALLBACK",
+    },
+}

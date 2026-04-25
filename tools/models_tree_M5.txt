@@ -1,0 +1,82 @@
+./
+├── alembic/
+│   └── versions/
+│       ├── m5_0001_research_core.py
+│       └── m5_0002_ops_run_result_snapshots.py
+├── docs/
+│   └── modules/
+│       └── m5/
+│           ├── 01_scope.md
+│           ├── 02_decisions.md
+│           ├── 03_schema.md
+│           ├── 04_flow.md
+│           ├── 05_api_or_contract.md
+│           ├── 06_acceptance.md
+│           ├── 07_next_chat_brief.md
+│           └── 08_open_items.md
+├── sql/
+│   └── m5_1_acceptance.sql
+├── src/
+│   └── stock_quant_v2/
+│       ├── db/
+│       │   └── models/
+│       │       ├── research/
+│       │       │   ├── __init__.py
+│       │       │   ├── execution_assumption_profile.py
+│       │       │   ├── benchmark_definition.py
+│       │       │   ├── screen_request.py
+│       │       │   ├── screen_result.py
+│       │       │   ├── backtest_request.py
+│       │       │   └── backtest_result.py
+│       │       └── ops/
+│       │           ├── run_metric_snapshot.py
+│       │           ├── run_artifact.py
+│       │           └── run_series_snapshot.py
+│       ├── research_domain/
+│       │   ├── __init__.py
+│       │   ├── constants.py
+│       │   ├── enums.py
+│       │   ├── dto/
+│       │   │   ├── __init__.py
+│       │   │   ├── execution_assumption.py
+│       │   │   ├── benchmark.py
+│       │   │   ├── screen.py
+│       │   │   ├── backtest.py
+│       │   │   └── run_result.py
+│       │   ├── repositories/
+│       │   │   ├── __init__.py
+│       │   │   ├── execution_assumption_repository.py
+│       │   │   ├── benchmark_repository.py
+│       │   │   ├── screen_repository.py
+│       │   │   ├── backtest_repository.py
+│       │   │   └── run_result_repository.py
+│       │   ├── services/
+│       │   │   ├── __init__.py
+│       │   │   ├── execution_assumption_service.py
+│       │   │   ├── benchmark_service.py
+│       │   │   ├── signal_resolver_service.py
+│       │   │   ├── screen_service.py
+│       │   │   ├── backtest_request_service.py
+│       │   │   └── run_result_writer_service.py
+│       │   ├── adapters/
+│       │   │   ├── __init__.py
+│       │   │   ├── backtrader_datafeed_adapter.py
+│       │   │   ├── backtrader_strategy_bridge.py
+│       │   │   └── backtrader_analyzer_bridge.py
+│       │   └── tasks/
+│       │       ├── __init__.py
+│       │       ├── seed_research_definitions.py
+│       │       ├── run_screen.py
+│       │       └── run_backtest.py
+│       └── scripts/
+│           ├── bootstrap_m5_research_definitions.py
+│           ├── bootstrap_m5_screen_chain.py
+│           └── bootstrap_m5_backtest_chain.py
+└── tests/
+    └── research/
+        ├── test_execution_assumption_service.py
+        ├── test_benchmark_service.py
+        ├── test_signal_resolver_service.py
+        ├── test_screen_service.py
+        ├── test_backtest_request_contract.py
+        └── test_run_result_writer_service.py

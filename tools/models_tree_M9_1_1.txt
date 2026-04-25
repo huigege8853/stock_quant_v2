@@ -1,0 +1,13 @@
+./
+└── src/
+    └── stock_quant_v2/
+        ├── platform_overview_domain/
+        │   ├── readers/
+        │   │   └── platform_overview_artifact_reader.py        # 完整替换
+        │   ├── services/
+        │   │   ├── platform_overview_report_builder.py         # 完整替换
+        │   │   └── upstream_summary_builder.py                 # 新增
+        │   └── tasks/
+        │       └── build_upstream_readiness_summaries.py       # 新增
+        └── scripts/
+            └── bootstrap_m9_1_1_upstream_summaries_p1.py       # 新增
