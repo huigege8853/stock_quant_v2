@@ -1,2 +1,0 @@
-﻿id,run_id,portfolio_id,snapshot_date,cash_balance,market_value,total_equity,gross_exposure,net_exposure,holding_count,daily_pnl,cumulative_pnl,daily_return,cumulative_return,turnover_amount,turnover_rate
-20,154,1,2026-04-23,237814.13334439,9763810.00000000,10001624.13334439,9989383.00000000,9989383.00000000,30,35092.00960389,35092.00960389,0.0035092010,0.0035092010,9951206.11650000,0.9916407450

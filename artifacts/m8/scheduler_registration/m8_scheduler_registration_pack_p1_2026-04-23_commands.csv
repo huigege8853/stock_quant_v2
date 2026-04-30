@@ -1,6 +1,0 @@
-﻿step_no,title,command,required
-10,手动测试 PS1,"powershell -NoProfile -ExecutionPolicy Bypass -File ""artifacts\m8\scheduler\stock_quant_v2_m8_daily_ops.ps1""",True
-20,注册 Windows Task Scheduler 任务,"schtasks /Create /TN ""stock_quant_v2_m8_daily_ops"" /XML ""artifacts\m8\scheduler\stock_quant_v2_m8_daily_ops.xml""",False
-30,人工检查后启用任务,"schtasks /Change /TN ""stock_quant_v2_m8_daily_ops"" /ENABLE",False
-40,人工禁用任务,"schtasks /Change /TN ""stock_quant_v2_m8_daily_ops"" /DISABLE",False
-50,人工删除任务,"schtasks /Delete /TN ""stock_quant_v2_m8_daily_ops"" /F",False

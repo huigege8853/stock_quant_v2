@@ -1,4 +1,0 @@
-﻿level,alert_code,title,message,source,payload
-WARN,FAILED_RUNS_EXIST,FAILED ops_run exists,FAILED count = 16,ops_run,"{""failed_count"": 16}"
-INFO,STALE_RUNS_EXIST,STALE ops_run exists,STALE count = 20,ops_run,"{""stale_count"": 20}"
-WARN,RISK_WARN_EXISTS,Risk warn exists,risk_warn_count = 60,risk_decision,"{""risk_warn_count"": 60}"

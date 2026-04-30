@@ -1,6 +1,0 @@
-﻿name,required,purpose,present,alias_used,masked_value,status,message
-V2_SQLALCHEMY_URL,True,database connection,False,,,WARN,"explicit database env var is missing, but SessionLocal database connection passed; likely loaded from project settings or .env"
-M8_PORTFOLIO_ID,False,default M8 portfolio id,True,,***,PASS,available
-M8_RISK_PROFILE_CODE,False,default M8 risk profile code,False,,,WARN,optional env var not set
-M8_REPORT_OUTPUT_DIR,False,daily ops report output dir,False,,,WARN,optional env var not set
-M8_EXCEL_OUTPUT_DIR,False,Excel output dir,False,,,WARN,optional env var not set
