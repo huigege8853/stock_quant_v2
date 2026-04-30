@@ -319,6 +319,7 @@ class SignalToTargetService:
             ["effective_date"],
         )
 
+        # 1) Exact target-date match first.
         rows = self._query_strategy_signals(
             source_signal_run_id=source_signal_run_id,
             as_of_date=as_of_date,
@@ -349,19 +350,111 @@ class SignalToTargetService:
         if rows:
             return rows
 
-        rows = self._query_strategy_signals(
+        # 2) If the target execution date has no new signal, explicitly carry the
+        # latest signal date <= target date for this run. This replaces the old
+        # broad run_id-only fallback and avoids silently using future or unrelated
+        # signal rows.
+        resolved_dates = self._resolve_latest_signal_dates_for_run(
             source_signal_run_id=source_signal_run_id,
-            as_of_date=as_of_date,
             effective_date=effective_date,
-            limit=limit,
-            score_col=score_col,
-            reason_col=reason_col,
             as_of_col=as_of_col,
             effective_col=effective_col,
-            filter_reason=False,
-            filter_dates=False,
         )
-        return rows
+        if resolved_dates is not None:
+            source_as_of_date, source_effective_date = resolved_dates
+
+            rows = self._query_strategy_signals(
+                source_signal_run_id=source_signal_run_id,
+                as_of_date=source_as_of_date,
+                effective_date=source_effective_date,
+                limit=limit,
+                score_col=score_col,
+                reason_col=reason_col,
+                as_of_col=as_of_col,
+                effective_col=effective_col,
+                filter_reason=True,
+                filter_dates=True,
+            )
+            if rows:
+                return rows
+
+            rows = self._query_strategy_signals(
+                source_signal_run_id=source_signal_run_id,
+                as_of_date=source_as_of_date,
+                effective_date=source_effective_date,
+                limit=limit,
+                score_col=score_col,
+                reason_col=reason_col,
+                as_of_col=as_of_col,
+                effective_col=effective_col,
+                filter_reason=False,
+                filter_dates=True,
+            )
+            if rows:
+                return rows
+
+        # 3) Legacy compatibility only for very old schemas without usable date
+        # columns. Modern strategy_signal has as_of_date/effective_date, so normal
+        # production flow should not reach this branch.
+        if not as_of_col and not effective_col:
+            return self._query_strategy_signals(
+                source_signal_run_id=source_signal_run_id,
+                as_of_date=as_of_date,
+                effective_date=effective_date,
+                limit=limit,
+                score_col=score_col,
+                reason_col=reason_col,
+                as_of_col=as_of_col,
+                effective_col=effective_col,
+                filter_reason=False,
+                filter_dates=False,
+            )
+
+        return []
+
+    def _resolve_latest_signal_dates_for_run(
+        self,
+        *,
+        source_signal_run_id: int,
+        effective_date: date,
+        as_of_col: str | None,
+        effective_col: str | None,
+    ) -> tuple[date, date] | None:
+        if effective_col is None:
+            return None
+
+        select_as_of = f"{as_of_col} as source_as_of_date" if as_of_col else "null as source_as_of_date"
+        group_as_of = f", {as_of_col}" if as_of_col else ""
+        order_as_of = f", {as_of_col} desc" if as_of_col else ""
+
+        row = self.session.execute(
+            text(
+                f"""
+                select
+                    {select_as_of},
+                    {effective_col} as source_effective_date,
+                    count(*) as row_count
+                from strategy_signal
+                where run_id = :run_id
+                  and instrument_id is not null
+                  and {effective_col} <= :effective_date
+                group by {effective_col}{group_as_of}
+                order by {effective_col} desc{order_as_of}
+                limit 1
+                """
+            ),
+            {
+                "run_id": source_signal_run_id,
+                "effective_date": effective_date,
+            },
+        ).mappings().first()
+
+        if row is None:
+            return None
+
+        source_effective_date = row["source_effective_date"]
+        source_as_of_date = row["source_as_of_date"] or source_effective_date
+        return source_as_of_date, source_effective_date
 
     def _query_strategy_signals(
         self,

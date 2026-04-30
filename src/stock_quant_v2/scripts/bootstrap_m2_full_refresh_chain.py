@@ -84,6 +84,27 @@ def _run_module(module_name: str, extra_env: dict[str, str] | None = None) -> in
     return int(completed.returncode)
 
 
+def _normalize_bool_env(value: str | None, *, default: bool) -> str:
+    """Return child-script friendly lowercase boolean text.
+
+    The M2 child scripts consume environment variables as strings.  Keep this
+    helper local so bootstrap_m2_full_refresh_chain can preserve the old default
+    behavior while allowing runtime override from PowerShell / shell env vars.
+    """
+
+    if value is None or str(value).strip() == "":
+        return "true" if default else "false"
+
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return "true"
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return "false"
+
+    # Fail closed: an unrecognized value should not silently enable resume.
+    return "true" if default else "false"
+
+
 class DatabaseInspector:
     def __init__(self, db_url: str) -> None:
         self.engine = create_engine(db_url)
@@ -134,22 +155,59 @@ class DatabaseInspector:
         return None
 
 
+def _symbol_range_extra_env(topic: SymbolRangeTopic, latest_trading_day: date) -> dict[str, str]:
+    base_env: dict[str, str] = {
+        "BOOTSTRAP_DAILY_BAR_START_DATE": topic.full_start_date.isoformat(),
+        "BOOTSTRAP_DAILY_BAR_END_DATE": latest_trading_day.isoformat(),
+    }
+
+    if topic.name == "daily_bar":
+        # Preserve old default behavior: full refresh starts from chunk_1 unless
+        # DAILY_BAR_RESUME_ENABLED is explicitly enabled by the caller.
+        daily_bar_resume_enabled = _normalize_bool_env(
+            os.environ.get("DAILY_BAR_RESUME_ENABLED"),
+            default=False,
+        )
+        base_env["DAILY_BAR_RESUME_ENABLED"] = daily_bar_resume_enabled
+        return base_env
+
+    if topic.name == "adjust_factor":
+        # Preserve old defaults while allowing env override.
+        adjust_factor_resume_enabled = _normalize_bool_env(
+            os.environ.get("ADJUST_FACTOR_RESUME_ENABLED"),
+            default=False,
+        )
+        adjust_factor_force_rerun = _normalize_bool_env(
+            os.environ.get("ADJUST_FACTOR_FORCE_RERUN"),
+            default=True,
+        )
+        base_env.update(
+            {
+                "ADJUST_FACTOR_RESUME_ENABLED": adjust_factor_resume_enabled,
+                "ADJUST_FACTOR_FORCE_RERUN": adjust_factor_force_rerun,
+            }
+        )
+        return base_env
+
+    return base_env
+
+
 def _run_symbol_range_full(topic: SymbolRangeTopic, latest_trading_day: date) -> int:
+    extra_env = _symbol_range_extra_env(topic, latest_trading_day=latest_trading_day)
+    resolved_flags = ", ".join(
+        f"{key}={value}"
+        for key, value in sorted(extra_env.items())
+        if key.endswith("_RESUME_ENABLED") or key.endswith("_FORCE_RERUN")
+    )
     print(
         f"[M2-FULL][{topic.name}] symbol-range full refresh: "
         f"{topic.full_start_date.isoformat()} -> {latest_trading_day.isoformat()} "
         f"| module={topic.bootstrap_module}"
     )
-    return _run_module(
-        topic.bootstrap_module,
-        extra_env={
-            "BOOTSTRAP_DAILY_BAR_START_DATE": topic.full_start_date.isoformat(),
-            "BOOTSTRAP_DAILY_BAR_END_DATE": latest_trading_day.isoformat(),
-            "DAILY_BAR_RESUME_ENABLED": "false",
-            "ADJUST_FACTOR_RESUME_ENABLED": "false",
-            "ADJUST_FACTOR_FORCE_RERUN": "true",
-        },
-    )
+    if resolved_flags:
+        print(f"[M2-FULL][{topic.name}] resolved flags: {resolved_flags}")
+
+    return _run_module(topic.bootstrap_module, extra_env=extra_env)
 
 
 def _run_date_chain_full(topic: DateChainTopic, latest_trading_day: date) -> int:

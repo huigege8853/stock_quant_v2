@@ -2,10 +2,21 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
 
 # Virtual env
 .venv/
 venv/
+env/
+ENV/
 
 # IDE
 .idea/
@@ -15,18 +26,61 @@ venv/
 build/
 dist/
 *.egg-info/
+.eggs/
+pip-wheel-metadata/
 
 # Env files
 .env
 .env.*
+!.env.example
+!.env.template
 
 # OS / logs
 *.log
 .DS_Store
+Thumbs.db
+
+# Database / local storage
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# Runtime / temp
+tmp/
+temp/
+.cache/
+*.tmp
+*.bak
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Archives / handoff packages
+*.zip
+*.rar
+*.7z
+
+# Generated project artifacts
+artifacts/
+exports/
+reports/
+
+# Generated data files
+data/
+raw_data/
+staging_data/
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# Keep small fixtures/examples if needed
+!tests/fixtures/**/*.csv
+!docs/examples/**/*.csv
 
 # Alembic / cache
 alembic/__pycache__/
 src/**/__pycache__/
-
-#db
-*.db

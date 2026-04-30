@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -18,11 +18,21 @@ from stock_quant_v2.analytics_domain.constants import LABEL_CODES, LABEL_VERSION
 from stock_quant_v2.analytics_domain.repositories.label_snapshot_repository import LabelSnapshotRepository
 
 
+MAX_LABEL_HORIZON_DAYS = 10
+REQUIRED_LABEL_CODES = [
+    LABEL_CODES["LABEL_FWD_RET_5D"],
+    LABEL_CODES["LABEL_FWD_RET_10D"],
+    LABEL_CODES["LABEL_UP_5D_GE_3PCT"],
+    LABEL_CODES["LABEL_DOWN_5D_LE_M3PCT"],
+]
+
+
 @dataclass
 class LabelBuildResult:
     anchor_date: date
     deleted_rows: int
     inserted_rows: int
+    horizon_end_date: date | None
 
 
 class LabelBuildService:
@@ -38,9 +48,17 @@ class LabelBuildService:
     ) -> LabelBuildResult:
         instrument_ids = self._load_anchor_instruments(anchor_date=anchor_date)
         if not instrument_ids:
-            return LabelBuildResult(anchor_date=anchor_date, deleted_rows=0, inserted_rows=0)
+            return LabelBuildResult(anchor_date=anchor_date, deleted_rows=0, inserted_rows=0, horizon_end_date=None)
 
-        price_history = self._load_price_history(anchor_date=anchor_date, instrument_ids=instrument_ids)
+        horizon_end_date = self._resolve_horizon_end_date(anchor_date=anchor_date, horizon_days=MAX_LABEL_HORIZON_DAYS)
+        if horizon_end_date is None:
+            horizon_end_date = anchor_date
+
+        price_history = self._load_price_window(
+            anchor_date=anchor_date,
+            horizon_end_date=horizon_end_date,
+            instrument_ids=instrument_ids,
+        )
 
         rows_to_insert: list[dict[str, Any]] = []
         for instrument_id in instrument_ids:
@@ -60,12 +78,7 @@ class LabelBuildService:
 
         deleted_rows = self.snapshot_repo.delete_by_anchor_date_and_codes(
             anchor_date=anchor_date,
-            label_codes=[
-                LABEL_CODES["LABEL_FWD_RET_5D"],
-                LABEL_CODES["LABEL_FWD_RET_10D"],
-                LABEL_CODES["LABEL_UP_5D_GE_3PCT"],
-                LABEL_CODES["LABEL_DOWN_5D_LE_M3PCT"],
-            ],
+            label_codes=REQUIRED_LABEL_CODES,
         )
         self.snapshot_repo.bulk_insert(rows_to_insert)
 
@@ -73,6 +86,7 @@ class LabelBuildService:
             anchor_date=anchor_date,
             deleted_rows=deleted_rows,
             inserted_rows=len(rows_to_insert),
+            horizon_end_date=horizon_end_date,
         )
 
     def _load_anchor_instruments(self, anchor_date: date) -> list[int]:
@@ -88,7 +102,34 @@ class LabelBuildService:
         rows = self.session.execute(sql, {"anchor_date": anchor_date}).mappings().all()
         return [int(row["instrument_id"]) for row in rows]
 
-    def _load_price_history(self, anchor_date: date, instrument_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    def _resolve_horizon_end_date(self, anchor_date: date, horizon_days: int) -> date | None:
+        sql = text(
+            """
+            WITH trade_days AS (
+                SELECT DISTINCT trade_date
+                FROM core_daily_bar
+                WHERE price_adjust_type = 'RAW'
+                  AND trade_date >= :anchor_date
+            ), ranked AS (
+                SELECT trade_date
+                FROM trade_days
+                ORDER BY trade_date ASC
+                LIMIT :required_rows
+            )
+            SELECT MAX(trade_date) AS horizon_end_date
+            FROM ranked
+            """
+        )
+        value = self.session.execute(
+            sql,
+            {
+                "anchor_date": anchor_date,
+                "required_rows": horizon_days + 1,
+            },
+        ).scalar_one_or_none()
+        return self._coerce_to_date(value)
+
+    def _load_price_window(self, anchor_date: date, horizon_end_date: date, instrument_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
         sql = (
             text(
                 """
@@ -102,7 +143,7 @@ class LabelBuildService:
                     ON af.instrument_id = db.instrument_id
                    AND af.trade_date = db.trade_date
                 WHERE db.instrument_id IN :instrument_ids
-                  AND db.trade_date >= :anchor_date
+                  AND db.trade_date BETWEEN :anchor_date AND :horizon_end_date
                   AND db.price_adjust_type = 'RAW'
                 ORDER BY db.instrument_id, db.trade_date
                 """
@@ -114,6 +155,7 @@ class LabelBuildService:
             {
                 "instrument_ids": instrument_ids,
                 "anchor_date": anchor_date,
+                "horizon_end_date": horizon_end_date,
             },
         ).mappings().all()
 
@@ -160,7 +202,6 @@ class LabelBuildService:
         down_5d_le_m3pct = calc_binary_down_label(fwd_ret_5d, Decimal("-0.03"))
 
         rows: list[dict[str, Any]] = []
-
         rows.append(
             self._build_snapshot_row(
                 anchor_date=anchor_date,
@@ -213,7 +254,6 @@ class LabelBuildService:
                 data_version_id=data_version_id,
             )
         )
-
         return rows
 
     @staticmethod
@@ -254,3 +294,15 @@ class LabelBuildService:
             "leakage_checked": True,
             "run_id": run_id,
         }
+
+    @staticmethod
+    def _coerce_to_date(value: Any | None) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, str):
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        return None

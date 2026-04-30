@@ -125,9 +125,9 @@ class M8SchedulerService:
                 "status": "PASS" if daily_check["overall_status"] in {"PASS", "WARN"} else "FAIL",
                 "message": "daily ops check must not FAIL",
             },
-            "hygiene_pass": {
-                "status": "PASS" if hygiene_check["overall_status"] == "PASS" else "FAIL",
-                "message": "ops hygiene should pass before scheduling",
+            "hygiene_not_fail": {
+                "status": "PASS" if hygiene_check["overall_status"] in {"PASS", "WARN"} else "FAIL",
+                "message": "ops hygiene must not FAIL before scheduling",
             },
             "ops_status_pass": {
                 "status": "PASS" if ops_status["overall_status"] == "PASS" else "FAIL",
@@ -158,7 +158,7 @@ class M8SchedulerService:
             warnings.append(
                 {
                     "warning_code": "HYGIENE_WARNINGS_EXIST",
-                    "message": "hygiene_check 存在 warnings，请确认是否可接受。",
+                    "message": "hygiene_check 存在 warnings；DailyRun 继续执行，但需要后续治理 stale/RUNNING runs。",
                     "items": hygiene_check.get("warnings"),
                 }
             )

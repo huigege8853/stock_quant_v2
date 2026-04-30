@@ -3,17 +3,22 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
+import stock_quant_v2.db.models.analytics  # noqa: F401
 import stock_quant_v2.db.models.meta.instrument  # noqa: F401
 import stock_quant_v2.db.models.ops.run  # noqa: F401
-import stock_quant_v2.db.models.analytics  # noqa: F401
+from dotenv import load_dotenv
 
 from stock_quant_v2.analytics_domain.tasks.build_feature_snapshot import run as run_build_feature_snapshot
 from stock_quant_v2.analytics_domain.tasks.seed_feature_definitions import run as run_seed_feature_definitions
 from stock_quant_v2.data_domain.repositories.run_repository import RunRepository
 from stock_quant_v2.db.session import SessionLocal
-from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _should_skip_seed() -> bool:
+    return os.getenv("M3_SKIP_SEED", "false").strip().lower() in {"1", "true", "yes", "y"}
+
 
 def main() -> None:
     trade_date_str = os.getenv("M3_FEATURE_TRADE_DATE")
@@ -25,7 +30,8 @@ def main() -> None:
     with SessionLocal() as session:
         run_repo = RunRepository()
 
-        run_seed_feature_definitions(session=session)
+        if not _should_skip_seed():
+            run_seed_feature_definitions(session=session)
 
         run = run_repo.create_run(
             session=session,
@@ -37,6 +43,7 @@ def main() -> None:
                 "trade_date": trade_date.isoformat(),
                 "module": "M3",
                 "task": "build_feature_snapshot",
+                "skip_seed": _should_skip_seed(),
                 "feature_set_code": "fs_daily_alpha_v1",
             },
         )

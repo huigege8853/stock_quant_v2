@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.app
-    image: stock-quant-runtime:2026.04.24-r3
+    image: stock-quant-runtime:v1.0.0
     container_name: stock-quant-app
     restart: unless-stopped
     env_file:
@@ -24,7 +24,7 @@ services:
       - stock_quant_net
 
   stock-quant-scheduler:
-    image: stock-quant-runtime:2026.04.24-r3
+    image: stock-quant-runtime:v1.0.0
     container_name: stock-quant-scheduler
     restart: unless-stopped
     depends_on:

@@ -37,7 +37,7 @@ class ArtifactDiscoveryConfig:
         return [
             self.repo_root / "artifacts" / "m3",
             self.repo_root / "artifacts" / "m4",
-            self.repo_root / "artifacts" / "m5" / "backtest",
+            self.repo_root / "artifacts" / "m5",
             self.repo_root / "artifacts" / "m8",
             self.repo_root / "artifacts" / "m9",
             self.repo_root / "docs" / "modules" / "m3",
@@ -149,7 +149,7 @@ class PlatformOverviewArtifactReader:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload, dict):
             keys = list(payload.keys())[:12]
-            if payload.get("summary_type") in {"m3_readiness", "m4_strategy_signal"}:
+            if payload.get("summary_type") in {"m3_readiness", "m4_strategy_signal", "m5_backtest_execution"}:
                 return self._bridge_json_summary(payload), keys
             if "summary" in payload and isinstance(payload["summary"], str):
                 return payload["summary"], keys

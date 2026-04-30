@@ -3,19 +3,22 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-# 关键：显式加载已有模型，确保 Base.metadata 里能解析外键依赖
+# 显式加载已有模型，确保 Base.metadata 里能解析外键依赖
+import stock_quant_v2.db.models.analytics  # noqa: F401
 import stock_quant_v2.db.models.meta.instrument  # noqa: F401
 import stock_quant_v2.db.models.ops.run  # noqa: F401
-import stock_quant_v2.db.models.analytics  # noqa: F401
+from dotenv import load_dotenv
 
 from stock_quant_v2.analytics_domain.tasks.compute_indicator_snapshot import run as run_compute_indicator_snapshot
 from stock_quant_v2.analytics_domain.tasks.seed_indicator_definitions import run as run_seed_indicator_definitions
 from stock_quant_v2.data_domain.repositories.run_repository import RunRepository
 from stock_quant_v2.db.session import SessionLocal
 
-from dotenv import load_dotenv
-
 load_dotenv()
+
+
+def _should_skip_seed() -> bool:
+    return os.getenv("M3_SKIP_SEED", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def main() -> None:
@@ -28,7 +31,8 @@ def main() -> None:
     with SessionLocal() as session:
         run_repo = RunRepository()
 
-        run_seed_indicator_definitions(session=session)
+        if not _should_skip_seed():
+            run_seed_indicator_definitions(session=session)
 
         run = run_repo.create_run(
             session=session,
@@ -40,6 +44,7 @@ def main() -> None:
                 "trade_date": trade_date.isoformat(),
                 "module": "M3",
                 "task": "compute_indicator_snapshot",
+                "skip_seed": _should_skip_seed(),
                 "indicator_scope": [
                     "adj_close",
                     "ret_1d",

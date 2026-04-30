@@ -11,10 +11,16 @@ from sqlalchemy.orm import Session
 
 
 class BacktestQualityCheckService:
-    """M5.9 回测结果质量检查。
+    """M5.10 backtest result quality check.
 
-    只读检查，不修改数据库和 artifact。
+    Read-only check. It validates that M5 has moved from skeleton result to real
+    execution artifacts, metrics and series. SNAPSHOT_STATIC_BASKET_P1 is allowed
+    as a non-blocking warning because it is the explicit P1 execution scope.
     """
+
+    SUCCESS_STATUSES = {"SUCCESS", "SUCCESS_WITH_WARN"}
+    P1_EXECUTION_MODE = "SNAPSHOT_STATIC_BASKET_P1"
+    HISTORICAL_REPLAY_MODE = "HISTORICAL_SIGNAL_REPLAY_P1"
 
     def __init__(self, session: Session):
         self.session = session
@@ -38,6 +44,9 @@ class BacktestQualityCheckService:
             artifact_code="backtest_equity_curve_csv",
         )
 
+        execution_mode = self._resolve_execution_mode(result=result, artifacts=artifacts)
+        warnings = self._build_warnings(result=result, execution_mode=execution_mode)
+
         trade_log_check = self._check_trade_log(
             result=result,
             trade_log_rows=trade_log_rows,
@@ -53,8 +62,9 @@ class BacktestQualityCheckService:
         artifact_check = self._check_artifacts(artifacts=artifacts)
         metric_check = self._check_metrics(metric_summary=metric_summary)
 
+        result_status_check = result["result_status"] in self.SUCCESS_STATUSES
         checks = {
-            "result_status_check": result["result_status"] == "SUCCESS",
+            "result_status_check": result_status_check,
             "trade_log_check": trade_log_check["status"] == "PASS",
             "equity_curve_check": equity_curve_check["status"] == "PASS",
             "series_check": series_check["status"] == "PASS",
@@ -62,12 +72,19 @@ class BacktestQualityCheckService:
             "metric_check": metric_check["status"] == "PASS",
         }
 
-        overall_status = "PASS" if all(checks.values()) else "FAIL"
+        if not all(checks.values()):
+            overall_status = "FAIL"
+        elif warnings:
+            overall_status = "PASS_WITH_WARN"
+        else:
+            overall_status = "PASS"
 
         return {
             "run_id": run_id,
             "backtest_request_id": result["backtest_request_id"],
             "overall_status": overall_status,
+            "execution_mode": execution_mode,
+            "warnings": warnings,
             "checks": checks,
             "result": result,
             "trade_log_check": trade_log_check,
@@ -78,7 +95,9 @@ class BacktestQualityCheckService:
             "notes": [
                 "order_count includes Submitted / Accepted / Completed notifications.",
                 "trade_count counts Completed orders only.",
-                "M5.9 is read-only quality check; no database rows are modified.",
+                "M5.10 / M5.11 quality check is read-only; no database rows are modified.",
+                "SNAPSHOT_STATIC_BASKET_P1 is accepted as a warning for M5.10 fallback.",
+                "HISTORICAL_SIGNAL_REPLAY_P1 is the M5.11 P1 multi-date replay mode.",
             ],
         }
 
@@ -211,6 +230,52 @@ class BacktestQualityCheckService:
         with path.open("r", encoding="utf-8", newline="") as f:
             return list(csv.DictReader(f))
 
+    def _resolve_execution_mode(
+        self,
+        *,
+        result: dict[str, Any],
+        artifacts: dict[str, dict[str, Any]],
+    ) -> str | None:
+        summary = result.get("result_summary")
+        if isinstance(summary, dict):
+            mode = summary.get("execution_mode")
+            if mode:
+                return str(mode)
+
+        for artifact in artifacts.values():
+            metadata = artifact.get("artifact_metadata")
+            if isinstance(metadata, dict) and metadata.get("execution_mode"):
+                return str(metadata["execution_mode"])
+        return None
+
+    def _build_warnings(
+        self,
+        *,
+        result: dict[str, Any],
+        execution_mode: str | None,
+    ) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        summary = result.get("result_summary")
+        warning_codes: list[str] = []
+        if isinstance(summary, dict):
+            raw_codes = summary.get("quality_warning_codes") or []
+            if isinstance(raw_codes, list):
+                warning_codes = [str(item) for item in raw_codes]
+
+        if execution_mode == self.P1_EXECUTION_MODE or self.P1_EXECUTION_MODE in warning_codes:
+            warnings.append(
+                {
+                    "code": "SNAPSHOT_STATIC_BASKET_P1",
+                    "severity": "WARN",
+                    "message": (
+                        "M5.10 P1 uses the latest selected signal basket as a static basket. "
+                        "Historical signal replay remains M5.11 backlog."
+                    ),
+                }
+            )
+
+        return warnings
+
     def _check_trade_log(
         self,
         *,
@@ -286,7 +351,10 @@ class BacktestQualityCheckService:
             reasons.append("last equity is null")
 
         if result_final_equity is not None and last_equity is not None:
-            if self._round8(result_final_equity) != self._round8(last_equity):
+            # Deterministic M5.11 replay writes final_equity through DB numeric
+            # serialization while the CSV artifact preserves Python decimal/float
+            # precision. Treat sub-cent rounding noise as equal.
+            if not self._decimal_close(result_final_equity, last_equity):
                 status = "FAIL"
                 reasons.append("last equity does not match final_equity")
 
@@ -328,7 +396,6 @@ class BacktestQualityCheckService:
             reasons.append(f"missing series: {missing}")
 
         trading_days = int(result["trading_days"] or 0)
-
         per_series = {}
         total_rows = 0
 
@@ -379,6 +446,7 @@ class BacktestQualityCheckService:
             "backtest_equity_curve_csv",
             "backtest_trade_log_csv",
         }
+        optional_artifacts = {"backtest_rebalance_log_csv"}
 
         status = "PASS"
         reasons = []
@@ -389,7 +457,7 @@ class BacktestQualityCheckService:
             reasons.append(f"missing artifacts: {missing}")
 
         existing = {}
-        for code in sorted(required_artifacts):
+        for code in sorted(required_artifacts.union(optional_artifacts)):
             artifact = artifacts.get(code)
             if artifact is None:
                 continue
@@ -397,7 +465,7 @@ class BacktestQualityCheckService:
             uri = artifact.get("uri")
             path_exists = bool(uri and Path(uri).exists())
 
-            if not path_exists:
+            if code in required_artifacts and not path_exists:
                 status = "FAIL"
                 reasons.append(f"artifact path not found: {code}")
 
@@ -452,3 +520,11 @@ class BacktestQualityCheckService:
     @staticmethod
     def _round8(value: Any) -> Decimal:
         return Decimal(str(value)).quantize(Decimal("0.00000001"))
+
+# Helper appended by M5.11 hotfix 6; attached to class for compatibility.
+def _m5_decimal_close(left: Any, right: Any, *, tolerance: Decimal = Decimal("0.000001")) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(Decimal(str(left)) - Decimal(str(right))) <= tolerance
+
+BacktestQualityCheckService._decimal_close = staticmethod(_m5_decimal_close)

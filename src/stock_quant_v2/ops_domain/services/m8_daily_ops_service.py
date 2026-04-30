@@ -37,6 +37,7 @@ class M8DailyOpsService:
         target_diff = None
         snapshot = None
         daily_report = None
+        m5_backtest = self._query_m5_backtest_summary()
 
         if self._has_all(
             trading_chain,
@@ -133,6 +134,7 @@ class M8DailyOpsService:
             "profile_code": profile_code,
             "checked_at": datetime.utcnow().isoformat(),
             "latest_runs": latest,
+            "m5_backtest": m5_backtest,
             "paper_chain": self._compact_paper_chain(paper_chain),
             "risk_decision": self._compact_risk_decision(risk_decision),
             "target_diff": self._compact_target_diff(target_diff),
@@ -290,6 +292,7 @@ class M8DailyOpsService:
 
         trading_chain = latest.get("trading_chain") or {}
         risk_chain = latest.get("risk_chain") or {}
+        m5_backtest = self._query_m5_backtest_summary()
 
         summary = {
             "latest_trading_chain_complete": self._has_all(
@@ -311,6 +314,10 @@ class M8DailyOpsService:
                 ],
             ),
             "recent_run_count": len(recent_runs),
+            "latest_m5_backtest_run_id": m5_backtest.get("run_id"),
+            "latest_m5_backtest_status": m5_backtest.get("overall_status"),
+            "latest_m5_backtest_execution_mode": m5_backtest.get("execution_mode"),
+            "latest_m5_real_execution": bool(m5_backtest.get("real_execution")),
         }
 
         return {
@@ -320,6 +327,7 @@ class M8DailyOpsService:
             "profile_code": profile_code,
             "latest_runs": latest,
             "summary": summary,
+            "m5_backtest": m5_backtest,
             "run_status_counts": run_status_counts,
             "recent_runs": recent_runs,
             "overall_status": "PASS"
@@ -529,6 +537,162 @@ class M8DailyOpsService:
             "snapshot": payload.get("snapshot"),
             "checks": payload.get("checks"),
         }
+
+    def _query_m5_backtest_summary(self) -> dict[str, Any]:
+        """Read latest M5 backtest execution status for M8/M9 reporting.
+
+        This helper is intentionally read-only and non-blocking. It should not
+        change M8 daily ops overall status; it only makes the report aware that
+        M5 has moved from placeholder / skeleton to real backtrader execution.
+        """
+
+        try:
+            rows = self._rows(
+                """
+                select
+                    id,
+                    run_id,
+                    backtest_request_id,
+                    result_status,
+                    start_date,
+                    end_date,
+                    trading_days,
+                    initial_cash,
+                    final_equity,
+                    total_return,
+                    annual_return,
+                    max_drawdown,
+                    sharpe_ratio,
+                    volatility,
+                    order_count,
+                    trade_count,
+                    result_summary
+                from research_backtest_result
+                where result_status in ('SUCCESS', 'SUCCESS_WITH_WARN')
+                order by id desc
+                limit 1
+                """,
+                {},
+            )
+            if not rows:
+                rows = self._rows(
+                    """
+                    select
+                        id,
+                        run_id,
+                        backtest_request_id,
+                        result_status,
+                        start_date,
+                        end_date,
+                        trading_days,
+                        initial_cash,
+                        final_equity,
+                        total_return,
+                        annual_return,
+                        max_drawdown,
+                        sharpe_ratio,
+                        volatility,
+                        order_count,
+                        trade_count,
+                        result_summary
+                    from research_backtest_result
+                    order by id desc
+                    limit 1
+                    """,
+                    {},
+                )
+
+            if not rows:
+                return {
+                    "overall_status": "MISSING",
+                    "run_id": None,
+                    "backtest_request_id": None,
+                    "execution_mode": None,
+                    "real_execution": False,
+                    "accepted_warning_codes": [],
+                    "message": "No research_backtest_result found.",
+                }
+
+            result = dict(rows[0])
+            summary = result.get("result_summary") or {}
+            if not isinstance(summary, dict):
+                summary = {}
+
+            execution_mode = summary.get("execution_mode")
+            warning_codes = summary.get("quality_warning_codes") or []
+            if not isinstance(warning_codes, list):
+                warning_codes = [str(warning_codes)]
+
+            artifact_rows = self._rows(
+                """
+                select artifact_code
+                from ops_run_artifact
+                where run_id = :run_id
+                order by artifact_code
+                """,
+                {"run_id": result["run_id"]},
+            )
+            artifact_codes = sorted(
+                str(row["artifact_code"]) for row in artifact_rows if row.get("artifact_code")
+            )
+
+            required_artifacts = {
+                "backtest_metrics_json",
+                "backtest_equity_curve_csv",
+                "backtest_trade_log_csv",
+            }
+            real_execution = (
+                summary.get("stage") == "M5.10_BACKTRADER_REAL_EXECUTION_P1"
+                and bool(summary.get("execution_enabled"))
+                and required_artifacts.issubset(set(artifact_codes))
+                and int(result.get("trade_count") or 0) > 0
+            )
+
+            accepted_warning_codes = []
+            if execution_mode == "SNAPSHOT_STATIC_BASKET_P1" or "SNAPSHOT_STATIC_BASKET_P1" in warning_codes:
+                accepted_warning_codes.append("SNAPSHOT_STATIC_BASKET_P1")
+
+            if not real_execution:
+                overall_status = "WARN"
+            elif accepted_warning_codes:
+                overall_status = "PASS_WITH_WARN"
+            else:
+                overall_status = "PASS"
+
+            return {
+                "overall_status": overall_status,
+                "run_id": result.get("run_id"),
+                "backtest_request_id": result.get("backtest_request_id"),
+                "backtest_result_id": result.get("id"),
+                "result_status": result.get("result_status"),
+                "execution_mode": execution_mode,
+                "real_execution": real_execution,
+                "accepted_warning_codes": accepted_warning_codes,
+                "start_date": str(result.get("start_date")) if result.get("start_date") else None,
+                "end_date": str(result.get("end_date")) if result.get("end_date") else None,
+                "trading_days": result.get("trading_days"),
+                "final_equity": self._safe_decimal_str(result.get("final_equity")),
+                "total_return": self._safe_decimal_str(result.get("total_return")),
+                "max_drawdown": self._safe_decimal_str(result.get("max_drawdown")),
+                "order_count": result.get("order_count"),
+                "trade_count": result.get("trade_count"),
+                "artifact_codes": artifact_codes,
+                "message": (
+                    "M5 real backtrader execution is available."
+                    if real_execution
+                    else "M5 latest backtest result is not yet a complete real execution."
+                ),
+            }
+        except Exception as exc:
+            return {
+                "overall_status": "WARN",
+                "run_id": None,
+                "backtest_request_id": None,
+                "execution_mode": None,
+                "real_execution": False,
+                "accepted_warning_codes": [],
+                "message": f"Failed to query M5 backtest summary: {exc}",
+            }
 
     def _rows(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         rows = self.session.execute(text(sql), params).mappings().all()

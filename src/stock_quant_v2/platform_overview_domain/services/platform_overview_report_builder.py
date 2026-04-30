@@ -24,7 +24,7 @@ _SECTION_SPECS: list[tuple[str, str, set[str]]] = [
     ("05", "05_数据质量与缺口", {"alert", "audit", "daily_ops"}),
     ("06", "06_指标/因子/特征/标签状态", {"m3_docs", "m3:m9_bridge"}),
     ("07", "07_策略与信号状态", {"m4_docs", "m4:m9_bridge"}),
-    ("08", "08_回测与研究结果", {"backtest", "m5_docs"}),
+    ("08", "08_回测与研究结果", {"backtest", "m5_docs", "m5:m9_bridge"}),
     ("09", "09_Paper Trading 交易链路", {"paper_chain", "daily_ops"}),
     ("10", "10_风控与目标仓位调整", {"risk", "human_review", "paper_chain"}),
     ("11", "11_组合持仓与盈亏", {"portfolio_snapshot", "paper_chain"}),
@@ -300,6 +300,9 @@ class PlatformOverviewReportBuilder:
             return "OK"
 
         if title.startswith("08"):
+            bridge_status = self._bridge_status(matched, "m5")
+            if bridge_status:
+                return bridge_status
             if not has_run:
                 return "WARN"
             return "OK"
@@ -365,10 +368,16 @@ class PlatformOverviewReportBuilder:
                 risks.append("当前仅发现文档级来源，尚未识别到可用于说明“最新状态”的运行事实。")
 
         if title.startswith("08"):
+            bridge_summary = self._bridge_human_summary(matched, "m5")
+            bridge_status = self._bridge_status(matched, "m5")
+            if bridge_status == "PASS_WITH_WARN":
+                risks.append("M5.10 当前已完成真实 backtrader 执行，但仍使用 SNAPSHOT_STATIC_BASKET_P1；这是 P1 可接受告警，不是失败。")
+            elif bridge_summary:
+                risks.append(bridge_summary)
             if not has_run:
                 risks.append("回测章节未识别到 run_id，无法说明最新研究运行是哪一次。")
-            if "backtest" not in topics:
-                risks.append("缺少 backtest artifact 来源时，回测章节容易退化为文档级总结。")
+            if "backtest" not in topics and "m9_bridge" not in topics:
+                risks.append("缺少 backtest artifact 或 M5→M9 bridge 来源时，回测章节容易退化为文档级总结。")
 
         if title.startswith("13"):
             latest_date, previous_date = self._comparison_window(matched, report_date)
@@ -484,6 +493,17 @@ class PlatformOverviewReportBuilder:
         topic_names: str,
     ) -> str:
         parts: list[str] = []
+
+        bridge = self._bridge_human_summary(matched, "m5")
+        bridge_status = self._bridge_status(matched, "m5")
+        if bridge:
+            parts.append(bridge)
+            if bridge_status == "PASS_WITH_WARN":
+                parts.append("该 WARN 为当前 M5.10 P1 已接受口径；M5.11 再推进历史信号逐日重放。")
+            parts.append(f"当前来源主题：{topic_names}。")
+            if latest_run_ids:
+                parts.append("可追踪 run_id：" + ", ".join(str(i) for i in latest_run_ids) + "。")
+            return " ".join(parts)
 
         if latest_run_id is not None:
             parts.append(f"当前最新可识别的回测运行为 run_id={latest_run_id}。")
@@ -613,13 +633,24 @@ class PlatformOverviewReportBuilder:
             )
 
         backtest_section = next((s for s in sections if s.section_id == "08"), None)
-        if backtest_section and backtest_section.status == "WARN":
+        if backtest_section and backtest_section.status in {"WARN", "FAIL", "MISSING"}:
             items.append(
                 ActionItem(
                     priority="P0",
                     area="08_回测与研究结果",
                     action="补齐 latest backtest run 的稳定来源，避免回测章节退化为 docs-only 总结。",
                     reason="当前回测章节未稳定识别最新运行事实。",
+                    related_sources=backtest_section.outputs[:5],
+                )
+            )
+        elif backtest_section and backtest_section.status == "PASS_WITH_WARN":
+            items.append(
+                ActionItem(
+                    priority="P2",
+                    area="08_回测与研究结果",
+                    action="保留 M5.10 真实 backtrader 执行口径，同时把 M5.11 历史信号逐日重放列为后续研究执行增强。",
+                    reason="M5.10 已通过但使用 SNAPSHOT_STATIC_BASKET_P1，这是当前可接受 WARN。",
+                    related_run_ids=backtest_section.latest_run_ids[:5],
                     related_sources=backtest_section.outputs[:5],
                 )
             )

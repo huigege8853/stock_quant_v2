@@ -40,6 +40,13 @@ def _env_decimal(name: str, default: Decimal) -> Decimal:
     return Decimal(value)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _latest_success_screen_source() -> tuple[int | None, int | None]:
     """返回最近一次成功 screen 的 (screen_request_id, signal_run_id)。
 
@@ -80,6 +87,36 @@ def main() -> None:
     benchmark_code = os.getenv("M5_BACKTEST_BENCHMARK_CODE")
     benchmark_version = os.getenv("M5_BACKTEST_BENCHMARK_VERSION")
 
+    historical_replay_enabled = _env_bool("M5_HISTORICAL_REPLAY_ENABLED", False)
+    historical_replay_start_date = os.getenv("M5_HISTORICAL_REPLAY_START_DATE")
+    historical_replay_end_date = os.getenv("M5_HISTORICAL_REPLAY_END_DATE")
+    historical_replay_top_n = _env_int("M5_HISTORICAL_REPLAY_TOP_N", 30)
+
+    portfolio_construction_payload = dict(DEFAULT_PORTFOLIO_CONSTRUCTION_PAYLOAD)
+    engine_payload = {
+        "execution_enabled": historical_replay_enabled,
+        "note": (
+            "M5.11 historical signal replay P1 request"
+            if historical_replay_enabled
+            else "M5.4 skeleton only; backtrader not started"
+        ),
+    }
+    if historical_replay_enabled:
+        portfolio_construction_payload.update(
+            {
+                "m5_historical_replay_enabled": True,
+                "historical_replay_top_n": historical_replay_top_n,
+            }
+        )
+        engine_payload.update(
+            {
+                "execution_mode": "HISTORICAL_SIGNAL_REPLAY_P1",
+                "m5_historical_replay_enabled": True,
+                "historical_replay_start_date": historical_replay_start_date,
+                "historical_replay_end_date": historical_replay_end_date,
+                "historical_replay_top_n": historical_replay_top_n,
+            }
+        )
     dto = BacktestRequestDTO(
         strategy_code=os.getenv("M5_BACKTEST_STRATEGY_CODE", "alpha_selection"),
         version_code=os.getenv("M5_BACKTEST_VERSION_CODE", "v1"),
@@ -110,16 +147,14 @@ def main() -> None:
             "M5_BACKTEST_PORTFOLIO_CONSTRUCTION_MODE",
             DEFAULT_PORTFOLIO_CONSTRUCTION_MODE,
         ),
-        portfolio_construction_payload=dict(DEFAULT_PORTFOLIO_CONSTRUCTION_PAYLOAD),
+        portfolio_construction_payload=portfolio_construction_payload,
         data_feed_payload={
             "source": "core_daily_bar",
             "adjustment": "post_adjusted_or_platform_default",
+            "m5_historical_replay_enabled": historical_replay_enabled,
         },
         engine_code=os.getenv("M5_BACKTEST_ENGINE_CODE", "backtrader"),
-        engine_payload={
-            "execution_enabled": False,
-            "note": "M5.4 skeleton only; backtrader not started",
-        },
+        engine_payload=engine_payload,
     )
 
     with SessionLocal() as session:

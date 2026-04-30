@@ -299,14 +299,15 @@ def _resolve_latest_signal_run(
     effective_date: date,
     explicit_signal_run_id: int | None,
     explicit_as_of_date: date | None,
-) -> tuple[int, date]:
+) -> tuple[int, date, date]:
     if explicit_signal_run_id is not None:
         row = session.execute(
             text(
                 """
                 select
                     run_id,
-                    max(as_of_date) as as_of_date
+                    max(as_of_date) as as_of_date,
+                    max(effective_date) as effective_date
                 from strategy_signal
                 where run_id = :run_id
                 group by run_id
@@ -319,9 +320,17 @@ def _resolve_latest_signal_run(
             raise RuntimeError(f"source_signal_run_id not found: {explicit_signal_run_id}")
 
         resolved_as_of = explicit_as_of_date or row["as_of_date"]
+        resolved_effective = row["effective_date"]
         if resolved_as_of is None:
             raise RuntimeError(f"cannot resolve as_of_date for signal run {explicit_signal_run_id}")
-        return int(row["run_id"]), resolved_as_of
+        if resolved_effective is None:
+            raise RuntimeError(f"cannot resolve effective_date for signal run {explicit_signal_run_id}")
+        if resolved_effective > effective_date:
+            raise RuntimeError(
+                "M7 daily refresh refuses future signal: "
+                f"signal_effective_date={resolved_effective}, paper_execution_date={effective_date}"
+            )
+        return int(row["run_id"]), resolved_as_of, resolved_effective
 
     row = session.execute(
         text(
@@ -343,13 +352,14 @@ def _resolve_latest_signal_run(
     if row is None:
         raise RuntimeError("cannot resolve latest strategy_signal run for M7 daily refresh")
 
-    return int(row["run_id"]), row["as_of_date"]
+    return int(row["run_id"]), row["as_of_date"], row["effective_date"]
 
 
 def _resolve_latest_screen_request_id(
     session: Session,
     *,
     effective_date: date,
+    source_signal_run_id: int | None,
     explicit_screen_request_id: int | None,
 ) -> int | None:
     if explicit_screen_request_id is not None:
@@ -374,6 +384,36 @@ def _resolve_latest_screen_request_id(
     where_status = ""
     if status_col is not None:
         where_status = f" and {status_col} = 'SUCCESS'"
+
+    # Prefer a screen result produced from the same signal run when the schema supports it.
+    # This prevents date-only resolution from accidentally pairing an old/new screen with
+    # a different strategy_signal run on the same effective date.
+    signal_run_col = None
+    if "source_signal_run_id" in cols:
+        signal_run_col = "source_signal_run_id"
+    elif "signal_run_id" in cols:
+        signal_run_col = "signal_run_id"
+
+    if source_signal_run_id is not None and signal_run_col is not None:
+        row = session.execute(
+            text(
+                f"""
+                select {req_col} as request_id
+                from research_screen_result
+                where {signal_run_col} = :source_signal_run_id
+                  and effective_date <= :effective_date
+                  {where_status}
+                order by effective_date desc, {req_col} desc
+                limit 1
+                """
+            ),
+            {
+                "source_signal_run_id": source_signal_run_id,
+                "effective_date": effective_date,
+            },
+        ).mappings().one_or_none()
+        if row is not None:
+            return int(row["request_id"])
 
     row = session.execute(
         text(
@@ -497,7 +537,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         portfolio_id = _resolve_portfolio_id(session, args.portfolio_id)
-        effective_date = date.fromisoformat(args.effective_date) if args.effective_date else _resolve_latest_available_bar_date(session)
+        latest_completed_bar_date = _resolve_latest_available_bar_date(session)
+        effective_date = date.fromisoformat(args.effective_date) if args.effective_date else latest_completed_bar_date
+
+        if effective_date > latest_completed_bar_date:
+            raise RuntimeError(
+                "M7 daily refresh refuses to execute beyond completed market data: "
+                f"paper_execution_date={effective_date}, "
+                f"latest_completed_core_daily_bar_date={latest_completed_bar_date}"
+            )
 
         previous_snapshot = _resolve_previous_snapshot(session, portfolio_id, effective_date)
         if previous_snapshot is None:
@@ -516,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         explicit_as_of_date = date.fromisoformat(args.as_of_date) if args.as_of_date else None
-        source_signal_run_id, as_of_date = _resolve_latest_signal_run(
+        source_signal_run_id, as_of_date, signal_effective_date = _resolve_latest_signal_run(
             session,
             effective_date=effective_date,
             explicit_signal_run_id=args.source_signal_run_id,
@@ -525,7 +573,44 @@ def main(argv: list[str] | None = None) -> int:
         source_screen_request_id = _resolve_latest_screen_request_id(
             session,
             effective_date=effective_date,
+            source_signal_run_id=source_signal_run_id,
             explicit_screen_request_id=args.source_screen_request_id,
+        )
+
+        signal_carry_days = (effective_date - signal_effective_date).days
+        signal_usage_mode = (
+            "EXACT_SIGNAL_DATE"
+            if signal_effective_date == effective_date
+            else "CARRY_LATEST_AVAILABLE_SIGNAL"
+        )
+        print(
+            json.dumps(
+                {
+                    "module": "M7.date_alignment",
+                    "date_policy": "paper_execution_date defaults to latest completed core_daily_bar date",
+                    "portfolio_id": portfolio_id,
+                    "latest_completed_core_daily_bar_date": latest_completed_bar_date.isoformat(),
+                    "paper_execution_date": effective_date.isoformat(),
+                    "target_price_date": as_of_date.isoformat(),
+                    "source_signal_run_id": source_signal_run_id,
+                    "source_signal_as_of_date": as_of_date.isoformat(),
+                    "source_signal_effective_date": signal_effective_date.isoformat(),
+                    "source_screen_request_id": source_screen_request_id,
+                    "signal_resolution_policy": "latest strategy_signal effective_date <= paper_execution_date",
+                    "signal_usage_mode": signal_usage_mode,
+                    "signal_carry_days": signal_carry_days,
+                    "screen_resolution_policy": "prefer same source_signal_run_id when research_screen_result supports it",
+                    "status": "PASS",
+                    "note": (
+                        "exact signal date match"
+                        if signal_carry_days == 0
+                        else "M7 is explicitly carrying the latest available signal to the paper execution date"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
         )
 
         root_run_id = _create_ops_run(
@@ -538,6 +623,9 @@ def main(argv: list[str] | None = None) -> int:
                 "portfolio_id": portfolio_id,
                 "as_of_date": as_of_date.isoformat(),
                 "effective_date": effective_date.isoformat(),
+                "source_signal_effective_date": signal_effective_date.isoformat(),
+                "latest_completed_core_daily_bar_date": latest_completed_bar_date.isoformat(),
+                "date_policy": "paper_execution_date defaults to latest completed core_daily_bar date",
                 "source_signal_run_id": source_signal_run_id,
                 "source_screen_request_id": source_screen_request_id,
                 "previous_snapshot_run_id": int(previous_snapshot["run_id"]),

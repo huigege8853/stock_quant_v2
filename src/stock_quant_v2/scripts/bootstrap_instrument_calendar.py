@@ -54,17 +54,11 @@ def main() -> None:
     baostock_api_client = None
 
     try:
-        print("[DEBUG] before build_baostock_api_client", flush=True)
         baostock_api_client = _build_baostock_api_client()
-        print("[DEBUG] after build_baostock_api_client", flush=True)
 
-        print("[DEBUG] before build_tushare_api_client", flush=True)
         tushare_api_client = _build_tushare_api_client()
-        print("[DEBUG] after build_tushare_api_client", flush=True)
 
-        print("[DEBUG] before build_akshare_api_client", flush=True)
         akshare_api_client = _build_akshare_api_client()
-        print("[DEBUG] after build_akshare_api_client", flush=True)
 
         context_json = _json_safe(
             {
@@ -76,7 +70,6 @@ def main() -> None:
             }
         )
 
-        print("[DEBUG] before create_run", flush=True)
         root_run = run_repo.create_run(
             session=session,
             run_type="DATA_BOOTSTRAP",
@@ -85,13 +78,10 @@ def main() -> None:
             context_json=context_json,
         )
         session.commit()
-        print("[DEBUG] after create_run", flush=True)
 
         run_repo.mark_run_running(session, root_run)
         session.commit()
-        print("[DEBUG] after mark_run_running", flush=True)
 
-        print("[DEBUG] before run_sync_instrument", flush=True)
         run_sync_instrument(
             session=session,
             baostock_api_client=baostock_api_client,
@@ -100,9 +90,7 @@ def main() -> None:
             run_id=root_run.id,
         )
         session.commit()
-        print("[DEBUG] after run_sync_instrument", flush=True)
 
-        print("[DEBUG] before run_sync_trading_calendar", flush=True)
         run_sync_trading_calendar(
             session=session,
             baostock_api_client=baostock_api_client,
@@ -114,7 +102,6 @@ def main() -> None:
             exchanges=("SSE", "SZSE", "BSE"),
         )
         session.commit()
-        print("[DEBUG] after run_sync_trading_calendar", flush=True)
 
         run_repo.mark_run_finished(session, root_run, status="SUCCESS")
         session.commit()

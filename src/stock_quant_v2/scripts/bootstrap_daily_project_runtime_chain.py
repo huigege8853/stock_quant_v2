@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,12 +16,160 @@ from sqlalchemy import text
 from stock_quant_v2.db.session import SessionLocal
 
 
+PROGRESS_BAR_WIDTH = 32
+PROGRESS_BUCKETS = (0, 25, 50, 75, 100)
+
+_TQDM_PROGRESS_RE = re.compile(
+    r"^(?P<task>.*?)\s+(?P<percent>\d{1,3})%\s*\|(?P<bar>[^|]*)\|\s*"
+    r"(?P<current>\d+)\s*/\s*(?P<total>\d+)(?P<rest>.*)$"
+)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
 @dataclass(frozen=True)
 class ChainStep:
     name: str
     module_name: str
     extra_args: tuple[str, ...] = ()
     extra_env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ParsedProgress:
+    task: str
+    percent: int
+    current: int
+    total: int
+    stats: str = ""
+
+
+def _strip_ansi(value: str) -> str:
+    return _ANSI_RE.sub("", value).strip()
+
+
+def _progress_bar(percent: int, width: int = PROGRESS_BAR_WIDTH) -> str:
+    percent = max(0, min(100, int(percent)))
+    filled = int(width * percent / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _progress_bucket(percent: int) -> int:
+    percent = max(0, min(100, int(percent)))
+    if percent >= 100:
+        return 100
+    if percent >= 75:
+        return 75
+    if percent >= 50:
+        return 50
+    if percent >= 25:
+        return 25
+    return 0
+
+
+def _extract_progress_stats(rest: str) -> str:
+    """Keep useful tqdm postfix stats and drop speed/ETA noise."""
+    rest = _strip_ansi(rest)
+    if not rest:
+        return ""
+
+    # tqdm postfix usually appears after the last comma separated segment.
+    # Examples:
+    #   [00:10<01:30, 55.0it/s, core=10, err=0, skip=0]
+    #   , core=10, err=0, skip=0
+    stat_match = re.search(r"(core\s*=.*)$", rest)
+    if stat_match:
+        return stat_match.group(1).strip(" ]")
+
+    # Fallback: only keep short postfix-like fragments.
+    if "=" in rest and len(rest) <= 120:
+        return rest.strip(" []|,")
+    return ""
+
+
+def _parse_progress_line(line: str) -> ParsedProgress | None:
+    clean_line = _strip_ansi(line)
+    if not clean_line:
+        return None
+
+    match = _TQDM_PROGRESS_RE.match(clean_line)
+    if not match:
+        return None
+
+    task = match.group("task").strip()
+    if not task:
+        return None
+
+    try:
+        percent = int(match.group("percent"))
+        current = int(match.group("current"))
+        total = int(match.group("total"))
+    except ValueError:
+        return None
+
+    return ParsedProgress(
+        task=task,
+        percent=max(0, min(100, percent)),
+        current=current,
+        total=total,
+        stats=_extract_progress_stats(match.group("rest")),
+    )
+
+
+class DailyOutputEmitter:
+    """
+    Convert child-process stdout/stderr into DailyRun logs.
+
+    tqdm uses carriage-return refreshes. When DailyRun is executed with nohup and
+    redirected to a log file, writing every refresh will flood the log. This
+    emitter therefore keeps normal lines unchanged, but compresses tqdm progress
+    to 0/25/50/75/100 buckets per task.
+    """
+
+    def __init__(self, step_name: str):
+        self.step_name = step_name
+        self._last_progress_bucket_by_task: dict[str, int] = {}
+
+    def handle_line(self, raw_line: str) -> None:
+        line = raw_line.strip("\r\n")
+        if not line:
+            return
+
+        progress = _parse_progress_line(line)
+        if progress is not None:
+            self._emit_progress(progress)
+            return
+
+        print(f"[DAILY][{self.step_name}] {_strip_ansi(line)}", flush=True)
+
+    def _emit_progress(self, progress: ParsedProgress) -> None:
+        bucket = _progress_bucket(progress.percent)
+        last_bucket = self._last_progress_bucket_by_task.get(progress.task)
+
+        if last_bucket == bucket:
+            return
+        if last_bucket is not None and bucket < last_bucket:
+            return
+
+        self._last_progress_bucket_by_task[progress.task] = bucket
+        bucketed = ParsedProgress(
+            task=progress.task,
+            percent=bucket,
+            current=progress.current,
+            total=progress.total,
+            stats=progress.stats,
+        )
+        print(f"[DAILY][{self.step_name}] {self._format_progress(bucketed)}", flush=True)
+
+    @staticmethod
+    def _format_progress(progress: ParsedProgress) -> str:
+        text = (
+            f"{progress.task} {progress.percent:3d}% "
+            f"|{_progress_bar(progress.percent)}| "
+            f"{progress.current}/{progress.total}"
+        )
+        if progress.stats:
+            text += f" | {progress.stats}"
+        return text
 
 
 def _detect_project_root(explicit_project_root: str | None) -> Path:
@@ -58,6 +207,10 @@ def _build_runtime_env(project_root: Path, report_date: str | None) -> dict[str,
     if report_date:
         env["M8_REPORT_DATE"] = report_date
 
+    # Keep tqdm parseable for the DailyRun log compressor.
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("TQDM_MININTERVAL", "1.0")
+
     return env
 
 
@@ -79,6 +232,7 @@ def _run_module(
 
     print(f"[DAILY][{step_name}] cmd = {' '.join(cmd)}", flush=True)
     started = time.perf_counter()
+    emitter = DailyOutputEmitter(step_name=step_name)
 
     with subprocess.Popen(
         cmd,
@@ -91,10 +245,20 @@ def _run_module(
     ) as proc:
         assert proc.stdout is not None
 
-        for raw_line in proc.stdout:
-            line = raw_line.rstrip()
-            if line:
-                print(f"[DAILY][{step_name}] {line}", flush=True)
+        buffer: list[str] = []
+        while True:
+            char = proc.stdout.read(1)
+            if char == "":
+                break
+            if char in ("\n", "\r"):
+                if buffer:
+                    emitter.handle_line("".join(buffer))
+                    buffer.clear()
+                continue
+            buffer.append(char)
+
+        if buffer:
+            emitter.handle_line("".join(buffer))
 
         rc = proc.wait()
 

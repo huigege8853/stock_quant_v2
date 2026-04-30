@@ -340,10 +340,7 @@ def run_sync_instrument(
         lifecycle_missing_count = 0
         error_rows = 0
 
-        for idx, row in enumerate(merged_rows, start=1):
-            if idx == 1 or idx % 200 == 0:
-                print(f"[DEBUG][sync_instrument] upserting row {idx}/{len(merged_rows)}", flush=True)
-
+        for row in merged_rows:
             try:
                 _upsert_instrument(session, row)
                 if row.get("list_date") is None:
