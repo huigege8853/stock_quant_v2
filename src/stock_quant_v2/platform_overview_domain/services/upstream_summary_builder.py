@@ -11,13 +11,23 @@ try:
 except Exception:
     load_dotenv = None
 
-from sqlalchemy import create_engine, text
+try:
+    from sqlalchemy import create_engine, text
+except Exception:  # pragma: no cover - allows artifact-only M9 flow without DB deps
+    create_engine = None
+    text = None
 
 
 class UpstreamSummaryBuilder:
     def __init__(self, repo_root: Path, db_url: str | None = None) -> None:
         self.repo_root = repo_root
         self.db_url = db_url or self._resolve_database_url()
+        if create_engine is None:
+            raise RuntimeError(
+                "SQLAlchemy is required for upstream summary generation. "
+                "Run the platform overview with --skip-upstream-summaries, "
+                "or install project database dependencies."
+            )
         self.engine = create_engine(self.db_url)
 
     def close(self) -> None:
@@ -38,11 +48,11 @@ class UpstreamSummaryBuilder:
 
     def build_m3_summary(self, report_date: str) -> dict[str, Any]:
         definition_counts = {
-            "meta_indicator_definition": self._scalar("SELECT COUNT(*) FROM meta_indicator_definition"),
-            "meta_factor_definition": self._scalar("SELECT COUNT(*) FROM meta_factor_definition"),
-            "meta_feature_definition": self._scalar("SELECT COUNT(*) FROM meta_feature_definition"),
-            "meta_feature_set_definition": self._scalar("SELECT COUNT(*) FROM meta_feature_set_definition"),
-            "meta_label_definition": self._scalar("SELECT COUNT(*) FROM meta_label_definition"),
+            "meta_indicator_definition": self._scalar_safe("SELECT COUNT(*) FROM meta_indicator_definition"),
+            "meta_factor_definition": self._scalar_safe("SELECT COUNT(*) FROM meta_factor_definition"),
+            "meta_feature_definition": self._scalar_safe("SELECT COUNT(*) FROM meta_feature_definition"),
+            "meta_feature_set_definition": self._scalar_safe("SELECT COUNT(*) FROM meta_feature_set_definition"),
+            "meta_label_definition": self._scalar_safe("SELECT COUNT(*) FROM meta_label_definition"),
         }
 
         snapshot_counts = {
@@ -56,7 +66,7 @@ class UpstreamSummaryBuilder:
 
         readiness_metrics = self._build_m3_readiness_metrics()
 
-        latest_success_run = self._row(
+        latest_success_run = self._row_safe(
             """
             SELECT id, run_type, run_name, status, requested_at, started_at, ended_at, error_message
             FROM ops_run
@@ -66,7 +76,7 @@ class UpstreamSummaryBuilder:
             """
         )
 
-        recent_runs = self._rows(
+        recent_runs = self._rows_safe(
             """
             SELECT id, run_type, run_name, status, requested_at, started_at, ended_at, error_message
             FROM ops_run
@@ -148,7 +158,7 @@ class UpstreamSummaryBuilder:
         }
 
     def build_m4_summary(self, report_date: str) -> dict[str, Any]:
-        strategies = self._rows(
+        strategies = self._rows_safe(
             """
             SELECT
                 id,
@@ -162,7 +172,7 @@ class UpstreamSummaryBuilder:
             """
         )
 
-        versions = self._rows(
+        versions = self._rows_safe(
             """
             SELECT
                 sv.id,
@@ -180,7 +190,7 @@ class UpstreamSummaryBuilder:
             """
         )
 
-        schemas = self._rows(
+        schemas = self._rows_safe(
             """
             SELECT
                 sps.id,
@@ -195,10 +205,10 @@ class UpstreamSummaryBuilder:
 
         schema_count = len(schemas)
         signal_total_rows = self._safe_count("strategy_signal")
-        signal_latest_as_of_date = self._scalar("SELECT MAX(as_of_date) FROM strategy_signal")
-        signal_latest_effective_date = self._scalar("SELECT MAX(effective_date) FROM strategy_signal")
+        signal_latest_as_of_date = self._scalar_safe("SELECT MAX(as_of_date) FROM strategy_signal")
+        signal_latest_effective_date = self._scalar_safe("SELECT MAX(effective_date) FROM strategy_signal")
 
-        current_true_rows = self._rows(
+        current_true_rows = self._rows_safe(
             """
             SELECT
                 sd.strategy_code,
@@ -257,7 +267,7 @@ class UpstreamSummaryBuilder:
         from old placeholder / skeleton rows.
         """
 
-        latest_result = self._row(
+        latest_result = self._row_safe(
             """
             SELECT
                 id,
@@ -285,7 +295,7 @@ class UpstreamSummaryBuilder:
         )
 
         if latest_result is None:
-            latest_result = self._row(
+            latest_result = self._row_safe(
                 """
                 SELECT
                     id,
@@ -348,7 +358,7 @@ class UpstreamSummaryBuilder:
         if not isinstance(quality_warning_codes, list):
             quality_warning_codes = [str(quality_warning_codes)]
 
-        artifacts = self._rows(
+        artifacts = self._rows_safe(
             f"""
             SELECT
                 artifact_code,
@@ -362,7 +372,7 @@ class UpstreamSummaryBuilder:
         )
         artifact_codes = sorted(str(row.get("artifact_code")) for row in artifacts if row.get("artifact_code"))
 
-        metric_rows = self._rows(
+        metric_rows = self._rows_safe(
             f"""
             SELECT
                 metric_code,
@@ -376,7 +386,7 @@ class UpstreamSummaryBuilder:
         )
         metric_codes = sorted(str(row.get("metric_code")) for row in metric_rows if row.get("metric_code"))
 
-        series_rows = self._rows(
+        series_rows = self._rows_safe(
             f"""
             SELECT
                 series_code,
@@ -672,6 +682,14 @@ class UpstreamSummaryBuilder:
         try:
             with self.engine.connect() as conn:
                 return conn.execute(text(sql), params or {}).scalar()
+        except Exception:
+            return None
+
+    def _row_safe(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(text(sql), params or {}).mappings().first()
+                return dict(row) if row else None
         except Exception:
             return None
 

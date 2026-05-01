@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-SectionStatus = Literal["OK", "WARN", "MISSING", "INFO"]
+SectionStatus = Literal["OK", "WARN", "MISSING", "INFO", "PASS", "PASS_WITH_WARN", "FAIL"]
 
 
 @dataclass(slots=True)

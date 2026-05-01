@@ -5,6 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from stock_quant_v2.platform_overview_domain.dto.overview_models import ArtifactSource
 
@@ -35,17 +36,22 @@ class ArtifactDiscoveryConfig:
     @property
     def scan_roots(self) -> list[Path]:
         return [
+            self.repo_root / "artifacts" / "m2",
             self.repo_root / "artifacts" / "m3",
             self.repo_root / "artifacts" / "m4",
             self.repo_root / "artifacts" / "m5",
+            self.repo_root / "artifacts" / "m6",
+            self.repo_root / "artifacts" / "m7",
             self.repo_root / "artifacts" / "m8",
             self.repo_root / "artifacts" / "m9",
+            self.repo_root / "docs" / "modules" / "m2",
             self.repo_root / "docs" / "modules" / "m3",
             self.repo_root / "docs" / "modules" / "m4",
             self.repo_root / "docs" / "modules" / "m5",
             self.repo_root / "docs" / "modules" / "m6",
             self.repo_root / "docs" / "modules" / "m7",
             self.repo_root / "docs" / "modules" / "m8",
+            self.repo_root / "docs" / "modules" / "m9",
         ]
 
 
@@ -76,7 +82,6 @@ class PlatformOverviewArtifactReader:
             built = self._build_source(path)
             if built is not None:
                 sources.append(built)
-
         return sources
 
     def _build_source(self, path: Path) -> ArtifactSource | None:
@@ -118,7 +123,6 @@ class PlatformOverviewArtifactReader:
     def _classify_path(self, path: Path) -> tuple[str, str]:
         relative = path.relative_to(self.repo_root)
         parts = relative.parts
-
         if not parts:
             return "misc", "misc"
 
@@ -151,6 +155,8 @@ class PlatformOverviewArtifactReader:
             keys = list(payload.keys())[:12]
             if payload.get("summary_type") in {"m3_readiness", "m4_strategy_signal", "m5_backtest_execution"}:
                 return self._bridge_json_summary(payload), keys
+            if self._looks_like_historical_backfill(payload):
+                return self._historical_backfill_json_summary(payload), keys
             if "summary" in payload and isinstance(payload["summary"], str):
                 return payload["summary"], keys
             return f"json keys: {', '.join(keys)}", keys
@@ -159,17 +165,14 @@ class PlatformOverviewArtifactReader:
         return f"json type: {type(payload).__name__}", []
 
     @staticmethod
-    def _bridge_json_summary(payload: dict) -> str:
+    def _bridge_json_summary(payload: dict[str, Any]) -> str:
         status = str(payload.get("status", "INFO"))
         human_summary = str(payload.get("human_summary", payload.get("summary", ""))).replace("|", "/")
         latest_run_id = payload.get("latest_run_id")
         report_date = payload.get("report_date")
         summary_type = payload.get("summary_type", "bridge")
 
-        parts = [
-            f"summary_type={summary_type}",
-            f"bridge_status={status}",
-        ]
+        parts = [f"summary_type={summary_type}", f"bridge_status={status}"]
         if latest_run_id is not None:
             parts.append(f"latest_run_id={latest_run_id}")
         if report_date:
@@ -179,24 +182,67 @@ class PlatformOverviewArtifactReader:
         return " | ".join(parts)
 
     @staticmethod
+    def _looks_like_historical_backfill(payload: dict[str, Any]) -> bool:
+        stage = str(payload.get("stage", "")).lower()
+        keys = set(payload.keys())
+        return "historical" in stage or "backfill" in stage or {"overall_status", "start_date", "end_date", "frequency"}.issubset(keys)
+
+    @staticmethod
+    def _historical_backfill_json_summary(payload: dict[str, Any]) -> str:
+        fields = [
+            ("stage", payload.get("stage")),
+            ("overall_status", payload.get("overall_status")),
+            ("start_date", payload.get("start_date")),
+            ("end_date", payload.get("end_date")),
+            ("frequency", payload.get("frequency")),
+            ("strategy_code", payload.get("strategy_code")),
+            ("version_code", payload.get("version_code")),
+            ("target_type", payload.get("target_type")),
+            ("generated_at", payload.get("generated_at")),
+        ]
+        parts = [f"{k}={v}" for k, v in fields if v not in (None, "")]
+        return "historical_backfill | " + " | ".join(parts) if parts else "historical_backfill json"
+
+    @staticmethod
     def _read_csv_summary(path: Path) -> tuple[str, list[str], int]:
         with path.open("r", encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f))
-
         if not rows:
             return "csv empty", [], 0
-
         headers = rows[0]
         row_count = max(len(rows) - 1, 0)
+        status_counts = PlatformOverviewArtifactReader._counts_from_csv_rows(headers, rows[1:], {"status", "result_status"})
+        severity_counts = PlatformOverviewArtifactReader._counts_from_csv_rows(headers, rows[1:], {"severity", "level", "alert_level", "priority"})
+        status_text = ""
+        if status_counts:
+            status_text += "; statuses: " + ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+        if severity_counts:
+            status_text += "; severities: " + ", ".join(f"{k}={v}" for k, v in sorted(severity_counts.items()))
         return (
-            f"csv rows: {row_count}; headers: {', '.join(headers[:8])}",
+            f"csv rows: {row_count}; headers: {', '.join(headers[:8])}{status_text}",
             headers,
             row_count,
         )
+
+    @staticmethod
+    def _counts_from_csv_rows(headers: list[str], rows: list[list[str]], candidate_columns: set[str]) -> dict[str, int]:
+        lowered = [h.strip().lower() for h in headers]
+        index = next((i for i, name in enumerate(lowered) if name in candidate_columns), None)
+        if index is None:
+            return {}
+        counts: dict[str, int] = {}
+        for row in rows:
+            if index >= len(row):
+                continue
+            value = row[index].strip()
+            if not value:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        return counts
 
     @staticmethod
     def _read_text_summary(path: Path) -> str:
         text = path.read_text(encoding="utf-8", errors="ignore")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         snippet = " | ".join(lines[:4])
-        return snippet[:320] if snippet else "text file with no non-empty lines"
+        return snippet[:420] if snippet else "text file with no non-empty lines"

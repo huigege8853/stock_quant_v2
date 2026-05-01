@@ -17,6 +17,8 @@ class M8Step:
     module_name: str
     required_env_keys: tuple[str, ...] = ()
     soft_fail_in_ops_profile: bool = False
+    cli_args: tuple[str, ...] = ()
+    ignore_failure_for_exit: bool = False
 
 
 def _project_root() -> Path:
@@ -64,9 +66,22 @@ def _parse_json_payload(stdout_text: str) -> dict | None:
     return None
 
 
-def _run_module(module_name: str, env: dict[str, str]) -> tuple[int, dict | None]:
+def _resolve_cli_args(cli_args: tuple[str, ...], env: dict[str, str]) -> list[str]:
+    resolved: list[str] = []
+    for arg in cli_args:
+        if arg == "{report_date}":
+            resolved.append(env.get("M8_REPORT_DATE") or _resolve_report_date())
+        else:
+            resolved.append(arg)
+    return resolved
+
+
+def _run_module(module_name: str, env: dict[str, str], cli_args: tuple[str, ...] = ()) -> tuple[int, dict | None]:
+    command = [sys.executable, "-m", module_name]
+    command.extend(_resolve_cli_args(cli_args, env))
+
     completed = subprocess.run(
-        [sys.executable, "-m", module_name],
+        command,
         cwd=_project_root(),
         env=env,
         text=True,
@@ -202,6 +217,34 @@ def _ops_steps() -> list[M8Step]:
     ]
 
 
+def _m9_finalizer_steps(profile: str) -> list[M8Step]:
+    """Best-effort M9 explanation/report finalizers.
+
+    M9.1.1 reports are read-only explanation artifacts built from M2-M8 outputs.
+    They should run after M8 ops/full profiles, even when an earlier M8 step failed,
+    so that the report can explain the failure. Their own failure is recorded but
+    must not mask or change the original M8/DailyRun exit code.
+    """
+    if profile == "api":
+        return []
+
+    return [
+        M8Step(
+            "bootstrap_m9_1_1_platform_overview_chain",
+            "stock_quant_v2.scripts.bootstrap_m9_1_1_platform_overview_chain",
+            soft_fail_in_ops_profile=True,
+            ignore_failure_for_exit=True,
+        ),
+        M8Step(
+            "bootstrap_m9_1_1_research_portfolio_daily",
+            "stock_quant_v2.scripts.bootstrap_m9_1_1_research_portfolio_daily",
+            soft_fail_in_ops_profile=True,
+            cli_args=("--report-date", "{report_date}"),
+            ignore_failure_for_exit=True,
+        ),
+    ]
+
+
 def _api_steps() -> list[M8Step]:
     return [
         M8Step("env_check", "stock_quant_v2.scripts.m8_env_check"),
@@ -254,7 +297,9 @@ def run_m8_ops_master_chain(args: argparse.Namespace) -> int:
             print(f"[M8] {key} = {env[key]}")
 
     failures: list[str] = []
+    soft_failures: list[str] = []
     skipped: list[str] = []
+    hard_failure_exit_code: int | None = None
 
     for step in steps:
         missing = _missing_required_env(step, env)
@@ -264,7 +309,7 @@ def run_m8_ops_master_chain(args: argparse.Namespace) -> int:
             continue
 
         print(f"\n[M8][{step.name}] starting: {step.module_name}")
-        rc, payload = _run_module(step.module_name, env)
+        rc, payload = _run_module(step.module_name, env, step.cli_args)
 
         if step.name == "env_check":
             _inject_env_from_env_check(payload, env)
@@ -273,19 +318,46 @@ def run_m8_ops_master_chain(args: argparse.Namespace) -> int:
                     print(f"[M8][env_check] inferred {key} = {env[key]}")
 
         if rc != 0:
-            failures.append(f"{step.name} (exit_code={rc})")
+            soft_fail = args.profile == "ops" and step.soft_fail_in_ops_profile
+            failure_item = f"{step.name} (exit_code={rc})"
             print(f"[M8][{step.name}] failed (exit_code={rc})")
 
-            soft_fail = args.profile == "ops" and step.soft_fail_in_ops_profile
             if soft_fail:
+                soft_failures.append(failure_item)
                 print(f"[M8][{step.name}] treated as soft-fail under ops profile; continuing.")
                 continue
 
+            failures.append(failure_item)
             if not args.continue_on_error:
-                print("[M8] Chain stopped because continue_on_error=false.")
-                return rc
+                hard_failure_exit_code = rc
+                print("[M8] Chain stopped because continue_on_error=false; M9 finalizers will still run best-effort.")
+                break
         else:
             print(f"[M8][{step.name}] succeeded.")
+
+    finalizer_steps = _m9_finalizer_steps(args.profile)
+    if finalizer_steps:
+        print("\n[M8] Running M9.1.1 finalizer reports best-effort.")
+
+    for step in finalizer_steps:
+        missing = _missing_required_env(step, env)
+        if missing:
+            skipped.append(f"{step.name} (finalizer missing env: {', '.join(missing)})")
+            print(f"\n[M8][finalizer:{step.name}] skipped: missing env -> {', '.join(missing)}")
+            continue
+
+        print(f"\n[M8][finalizer:{step.name}] starting: {step.module_name}")
+        rc, _payload = _run_module(step.module_name, env, step.cli_args)
+
+        if rc != 0:
+            item = f"{step.name} (finalizer exit_code={rc})"
+            print(f"[M8][finalizer:{step.name}] failed (exit_code={rc}); recorded as soft finalizer failure.")
+            if step.ignore_failure_for_exit:
+                soft_failures.append(item)
+            else:
+                failures.append(item)
+        else:
+            print(f"[M8][finalizer:{step.name}] succeeded.")
 
     print("\n[M8] Ops master chain completed.")
     if skipped:
@@ -293,13 +365,24 @@ def run_m8_ops_master_chain(args: argparse.Namespace) -> int:
         for item in skipped:
             print(f"  - {item}")
 
+    if soft_failures:
+        print("[M8] Soft-failed steps:")
+        for item in soft_failures:
+            print(f"  - {item}")
+
     if failures:
         print("[M8] Failed steps:")
         for item in failures:
             print(f"  - {item}")
+
+    if hard_failure_exit_code is not None:
+        print(f"[M8] Returning original hard failure exit code: {hard_failure_exit_code}")
+        return hard_failure_exit_code
+
+    if failures:
         return 1
 
-    print("[M8] All runnable steps succeeded.")
+    print("[M8] All runnable hard-required steps succeeded.")
     return 0
 
 
