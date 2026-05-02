@@ -301,6 +301,8 @@ class ResearchPortfolioDailyReportBuilder:
         alert = _read_json(alert_path)
 
         selected_rows = _read_csv_rows(paper_targets_path)
+        if not selected_rows:
+            selected_rows = self._load_selected_stock_rows_from_db(daily_ops, paper_chain, report_date)
         position_rows = _read_csv_rows(paper_positions_path)
         snapshot_csv_rows = _read_csv_rows(portfolio_snapshot_csv_path)
 
@@ -680,9 +682,11 @@ class ResearchPortfolioDailyReportBuilder:
             row for row in rows
             if row.get("identity_status") != "OK"
         ]
+        source = rows[0].get("row_source") if rows else None
         return {
             "row_count": len(rows),
             "target_count": target_summary.get("target_count") or len(rows) or None,
+            "source": source or ("artifact" if rows else "missing"),
             "top_rows": rows[:15],
             "all_rows": rows,
             "identity_status": "OK" if not missing_identity_rows else "WARN",
@@ -691,6 +695,256 @@ class ResearchPortfolioDailyReportBuilder:
                 row.get("instrument_id") for row in missing_identity_rows[:50]
             ],
         }
+
+    def _load_selected_stock_rows_from_db(
+        self,
+        daily_ops: dict[str, Any],
+        paper_chain: dict[str, Any],
+        report_date: str,
+    ) -> list[dict[str, Any]]:
+        """Best-effort selected-stock fallback from DB when M8 targets CSV is absent.
+
+        DailyRun uses the lightweight M8 entrypoint, so detailed
+        artifacts/m8/paper_chain/*_targets.csv may not exist. M9-B still needs
+        the target stock list for the daily portfolio report, therefore this
+        method performs a read-only lookup against trading_paper_target_position.
+        It never writes to DB and it soft-fails to an empty list.
+        """
+        try:
+            from sqlalchemy import text  # type: ignore
+            from stock_quant_v2.db.session import SessionLocal  # type: ignore
+        except Exception as exc:
+            self.sources.append(ReportSource(
+                "m9_selected_stocks_db_fallback",
+                "",
+                "MISSING",
+                f"DB fallback unavailable: {type(exc).__name__}: {exc}",
+            ))
+            return []
+
+        session = None
+        try:
+            session = SessionLocal()
+            table_names = self._discover_table_names(session, text)
+            table = self._first_existing_table(table_names, [
+                "trading_paper_target_position",
+                "paper_target_position",
+                "paper_target_positions",
+                "trading_target_position",
+            ])
+            if not table:
+                self.sources.append(ReportSource(
+                    "m9_selected_stocks_db_fallback",
+                    "",
+                    "MISSING",
+                    "target position table not found",
+                ))
+                return []
+
+            columns = self._read_table_columns(session, text, table)
+            if not columns:
+                self.sources.append(ReportSource(
+                    "m9_selected_stocks_db_fallback",
+                    table,
+                    "MISSING",
+                    "target position table columns unavailable",
+                ))
+                return []
+
+            target_run_id = self._resolve_target_run_id(daily_ops, paper_chain)
+            rows = self._query_target_rows(session, text, table, columns, target_run_id, report_date)
+            if not rows:
+                note = "no selected stock rows found"
+                if target_run_id is not None:
+                    note += f" for target_run_id={target_run_id}"
+                self.sources.append(ReportSource(
+                    "m9_selected_stocks_db_fallback",
+                    table,
+                    "MISSING",
+                    note,
+                ))
+                return []
+
+            normalized_rows = []
+            for row in rows:
+                item = {str(k): _to_jsonable(v) for k, v in dict(row).items()}
+                item["_source"] = "db_fallback"
+                if target_run_id is not None:
+                    item.setdefault("target_run_id", str(target_run_id))
+                normalized_rows.append(item)
+
+            self.sources.append(ReportSource(
+                "m9_selected_stocks_db_fallback",
+                table,
+                "USED",
+                f"read {len(normalized_rows)} selected stock rows" + (f" for target_run_id={target_run_id}" if target_run_id is not None else ""),
+            ))
+            return normalized_rows
+        except Exception as exc:
+            self.sources.append(ReportSource(
+                "m9_selected_stocks_db_fallback",
+                "",
+                "MISSING",
+                f"DB fallback failed: {type(exc).__name__}: {exc}",
+            ))
+            return []
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    def _first_existing_table(self, table_names: set[str], candidates: list[str]) -> str | None:
+        for table in candidates:
+            if table in table_names:
+                return table
+        return None
+
+    def _read_table_columns(self, session: Any, text: Any, table: str) -> set[str]:
+        try:
+            rows = session.execute(
+                text(
+                    "select column_name from information_schema.columns "
+                    "where table_schema not in ('pg_catalog', 'information_schema') "
+                    "and table_name = :table_name"
+                ),
+                {"table_name": table},
+            ).fetchall()
+            return {str(row[0]) for row in rows}
+        except Exception:
+            return set()
+
+    def _resolve_target_run_id(self, daily_ops: dict[str, Any], paper_chain: dict[str, Any]) -> int | None:
+        value = self._find_first_deep(
+            {"daily_ops": daily_ops, "paper_chain": paper_chain},
+            [
+                "target_run_id",
+                "target_position_run_id",
+                "source_target_run_id",
+                "adjusted_target_run_id",
+            ],
+        )
+        try:
+            if value is None or str(value).strip() == "":
+                return None
+            return int(str(value).strip())
+        except Exception:
+            return None
+
+    def _find_first_deep(self, value: Any, names: list[str]) -> Any:
+        if isinstance(value, dict):
+            lower = {str(k).lower(): v for k, v in value.items()}
+            for name in names:
+                if name in value:
+                    return value[name]
+                lowered = name.lower()
+                if lowered in lower:
+                    return lower[lowered]
+            for child in value.values():
+                found = self._find_first_deep(child, names)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._find_first_deep(child, names)
+                if found is not None:
+                    return found
+        return None
+
+    def _query_target_rows(
+        self,
+        session: Any,
+        text: Any,
+        table: str,
+        columns: set[str],
+        target_run_id: int | None,
+        report_date: str,
+    ) -> list[dict[str, Any]]:
+        run_col = self._first_existing_column(columns, [
+            "run_id",
+            "target_run_id",
+            "target_position_run_id",
+            "paper_target_run_id",
+        ])
+        date_col = self._first_existing_column(columns, [
+            "effective_date",
+            "trade_date",
+            "target_date",
+            "as_of_date",
+            "snapshot_date",
+        ])
+        order_clause = self._target_order_clause(columns)
+
+        if target_run_id is not None and run_col:
+            sql = f"select * from {table} where {run_col} = :target_run_id {order_clause}"
+            rows = [dict(row) for row in session.execute(text(sql), {"target_run_id": target_run_id}).mappings().all()]
+            if rows:
+                return rows
+
+        latest_run_id = self._find_latest_target_run_id(session, text, table, columns, run_col, date_col, report_date)
+        if latest_run_id is not None and run_col:
+            sql = f"select * from {table} where {run_col} = :target_run_id {order_clause}"
+            return [dict(row) for row in session.execute(text(sql), {"target_run_id": latest_run_id}).mappings().all()]
+
+        where = ""
+        params: dict[str, Any] = {}
+        if date_col:
+            where = f"where {date_col} <= :report_date"
+            params["report_date"] = report_date
+        limit = " limit 500"
+        sql = f"select * from {table} {where} {order_clause}{limit}"
+        return [dict(row) for row in session.execute(text(sql), params).mappings().all()]
+
+    def _find_latest_target_run_id(
+        self,
+        session: Any,
+        text: Any,
+        table: str,
+        columns: set[str],
+        run_col: str | None,
+        date_col: str | None,
+        report_date: str,
+    ) -> int | None:
+        if not run_col:
+            return None
+        try:
+            if date_col:
+                sql = (
+                    f"select {run_col} as run_id, max({date_col}) as max_date "
+                    f"from {table} where {date_col} <= :report_date "
+                    f"group by {run_col} order by max_date desc, {run_col} desc limit 1"
+                )
+                row = session.execute(text(sql), {"report_date": report_date}).mappings().first()
+            else:
+                sql = f"select {run_col} as run_id from {table} group by {run_col} order by {run_col} desc limit 1"
+                row = session.execute(text(sql)).mappings().first()
+            if not row or row.get("run_id") is None:
+                return None
+            return int(row.get("run_id"))
+        except Exception:
+            return None
+
+    def _first_existing_column(self, columns: set[str], candidates: list[str]) -> str | None:
+        for column in candidates:
+            if column in columns:
+                return column
+        return None
+
+    def _target_order_clause(self, columns: set[str]) -> str:
+        order_parts: list[str] = []
+        for column in ["rank", "target_rank", "sort_order"]:
+            if column in columns:
+                order_parts.append(f"{column} asc")
+                break
+        for column in ["target_weight", "weight", "target_amount"]:
+            if column in columns:
+                order_parts.append(f"{column} desc")
+                break
+        for column in ["id", "instrument_id"]:
+            if column in columns:
+                order_parts.append(f"{column} asc")
+        return " order by " + ", ".join(order_parts) if order_parts else ""
 
     def _load_instrument_identity_map(self, instrument_ids: Iterable[Any]) -> dict[str, dict[str, Any]]:
         """Best-effort lookup from meta_instrument by instrument_id.
@@ -820,6 +1074,8 @@ class ResearchPortfolioDailyReportBuilder:
                 "display_name": stock_name_text,
                 "display_label": display_label,
                 "identity_status": identity_status,
+                "row_source": _pick(row, ["_source"], "artifact"),
+                "target_run_id": _pick(row, ["target_run_id", "target_position_run_id", "run_id"]),
                 "target_weight": _pick(row, ["target_weight", "weight", "target_position_weight"]),
                 "target_quantity": _pick(row, ["target_quantity", "quantity", "target_qty"]),
                 "target_amount": _pick(row, ["target_amount", "amount", "target_market_value"]),
@@ -1085,7 +1341,10 @@ class ResearchPortfolioDailyReportBuilder:
     def _section_selected(self, facts: dict[str, Any]) -> ReportSection:
         selected = facts["selected"]
         rows = selected.get("top_rows") or []
-        details = [f"本轮目标/选股行数：{selected.get('row_count') or selected.get('target_count') or 'N/A'}；完整清单见 selected_stocks.csv。"]
+        details = [
+            f"本轮目标/选股行数：{selected.get('row_count') or selected.get('target_count') or 'N/A'}；完整清单见 selected_stocks.csv。",
+            f"选股明细来源：{selected.get('source') or 'N/A'}。",
+        ]
         if rows:
             for row in rows[:10]:
                 details.append(
@@ -1097,7 +1356,7 @@ class ResearchPortfolioDailyReportBuilder:
             if (selected.get("row_count") or 0) > 10:
                 details.append("正文仅展示前 10 只，完整 30 只见 selected_stocks.csv。")
         else:
-            details.append("未找到 paper_chain targets CSV；需要先生成 M8 paper_chain report，或提供 M4/M6 目标仓位明细 artifact。")
+            details.append("未找到 paper_chain targets CSV，且 DB 只读兜底未能取回目标仓位明细；需要检查 trading_paper_target_position 或生成 M8 paper_chain report。")
         summary = "本节回答买哪些、买多少、目标权重多少；后续 P1 将继续补因子得分、行业、市值和入选原因。"
         status = "OK" if rows else "MISSING"
         return ReportSection("04", "本轮选股与目标仓位", status, summary, details)

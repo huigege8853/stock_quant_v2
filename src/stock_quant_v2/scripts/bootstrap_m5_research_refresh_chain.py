@@ -68,12 +68,12 @@ def _run_module(module_name: str, extra_env: dict[str, str] | None = None) -> in
 
 @lru_cache(maxsize=1)
 def _project_dotenv_values() -> dict[str, str]:
-    """Read simple KEY=VALUE pairs from project .env without mutating os.environ.
+    """Read simple KEY=VALUE pairs from project .env.research without mutating os.environ.
 
-    Shell environment wins over .env; .env wins over built-in defaults.
+    Shell environment wins over .env.research; .env.research wins over built-in defaults.
     This keeps desktop research and Orange Pi daily on one codebase.
     """
-    env_path = _project_root() / ".env"
+    env_path = _project_root() / ".env.research"
     if not env_path.exists():
         return {}
 

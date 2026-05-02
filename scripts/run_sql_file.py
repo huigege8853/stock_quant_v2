@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, text
 
 def load_env() -> None:
     root = Path(__file__).resolve().parents[1]
-    env_file = root / ".env"
+    env_file = root / ".env.research"
     if load_dotenv is not None and env_file.exists():
         load_dotenv(env_file, override=False)
 

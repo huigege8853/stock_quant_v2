@@ -928,7 +928,7 @@ class UpstreamSummaryBuilder:
         return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db}"
 
     def _load_env(self) -> None:
-        env_file = self.repo_root / ".env"
+        env_file = self.repo_root / ".env.research"
         if load_dotenv is not None and env_file.exists():
             load_dotenv(env_file, override=False)
 

@@ -24,17 +24,17 @@ ENV_KEYS = [
 
 
 def _strip_inline_comment(value: str) -> str:
-    """Strip unquoted # comments from .env style values."""
+    """Strip unquoted # comments from .env.research style values."""
     value = value.strip().strip('"').strip("'")
     if "#" not in value:
         return value.strip()
     # URLs should not contain spaces before a real fragment in this project.
-    # The .env has: postgresql+psycopg://.../stock_quant_v2  # comment
+    # The .env.research has: postgresql+psycopg://.../stock_quant_v2  # comment
     return re.split(r"\s+#", value, maxsplit=1)[0].strip().strip('"').strip("'")
 
 
 def _load_dotenv() -> None:
-    for env_path in [Path(".env"), Path(".env.local")]:
+    for env_path in [Path(".env.research"), Path(".env.research.local")]:
         if not env_path.exists():
             continue
         try:
@@ -59,7 +59,7 @@ def _get_database_url() -> str:
             return _strip_inline_comment(value)
     raise RuntimeError(
         "Missing database url. Set DATABASE_URL / V2_SQLALCHEMY_URL, "
-        "or add one of them to .env."
+        "or add one of them to .env.research."
     )
 
 

@@ -13,7 +13,6 @@ from typing import Sequence
 
 from sqlalchemy import text
 
-from stock_quant_v2.db.session import SessionLocal
 
 
 PROGRESS_BAR_WIDTH = 32
@@ -25,6 +24,11 @@ _TQDM_PROGRESS_RE = re.compile(
 )
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
+PROFILE_CHOICES = ("runtime", "research", "full")
+PAPER_MODE_CHOICES = ("auto", "m6", "m7", "skip", "off")
+_TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+
 
 @dataclass(frozen=True)
 class ChainStep:
@@ -32,6 +36,8 @@ class ChainStep:
     module_name: str
     extra_args: tuple[str, ...] = ()
     extra_env: dict[str, str] = field(default_factory=dict)
+    optional: bool = False
+    soft_fail: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,209 @@ def _parse_progress_line(line: str) -> ParsedProgress | None:
         total=total,
         stats=_extract_progress_stats(match.group("rest")),
     )
+
+
+def _strip_env_inline_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+
+    for index, char in enumerate(value):
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double:
+            if index == 0 or value[index - 1].isspace():
+                return value[:index].rstrip()
+
+    return value.strip()
+
+
+def _normalize_env_value(value: str) -> str:
+    value = _strip_env_inline_comment(value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _load_env_file(project_root: Path, env_file: str | None) -> Path | None:
+    """Load a simple .env.research file without overriding already exported variables.
+
+    Precedence is intentionally: CLI args > process environment > env file > defaults.
+    This keeps Docker/cron/shell exports authoritative while still allowing
+    .env.research.production / .env.research.research to provide local defaults.
+    """
+    requested = (env_file or os.getenv("SQV2_ENV_FILE") or ".env.research").strip()
+    if not requested:
+        return None
+
+    path = Path(requested)
+    if not path.is_absolute():
+        path = project_root / path
+
+    if not path.exists():
+        if env_file or os.getenv("SQV2_ENV_FILE"):
+            raise FileNotFoundError(f"env file does not exist: {path}")
+        return None
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = _normalize_env_value(raw_value)
+        os.environ.setdefault(key, value)
+
+    return path
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip() != "":
+            return value.strip()
+    return None
+
+
+def _parse_bool(value: object, *, option_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value).strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+
+    raise ValueError(
+        f"Invalid boolean value for {option_name}: {value!r}. "
+        "Use true/false, yes/no, on/off, or 1/0."
+    )
+
+
+def _resolve_bool_option(
+    cli_value: bool | None,
+    env_names: Sequence[str],
+    default: bool,
+) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+
+    value = _env_first(*env_names)
+    if value is None:
+        return default
+
+    return _parse_bool(value, option_name="/".join(env_names))
+
+
+def _resolve_choice_option(
+    cli_value: str | None,
+    env_names: Sequence[str],
+    choices: Sequence[str],
+    default: str,
+) -> str:
+    value = cli_value if cli_value is not None else _env_first(*env_names)
+    if value is None:
+        return default
+
+    normalized = str(value).strip().lower()
+    if normalized not in choices:
+        raise ValueError(
+            f"Invalid value for {'/'.join(env_names)}: {value!r}. "
+            f"Allowed values: {', '.join(choices)}."
+        )
+    return normalized
+
+
+def _resolve_int_option(
+    cli_value: int | None,
+    env_names: Sequence[str],
+    default: int | None = None,
+) -> int | None:
+    if cli_value is not None:
+        return int(cli_value)
+
+    value = _env_first(*env_names)
+    if value is None:
+        return default
+
+    return int(value)
+
+
+def _resolve_report_date(cli_value: str | None) -> str | None:
+    value = cli_value or _env_first("SQV2_DAILY_REPORT_DATE", "M8_REPORT_DATE", "M9_REPORT_DATE")
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        raise ValueError(f"Invalid report date: {value!r}. Expected YYYY-MM-DD.")
+    return normalized
+
+
+def _normalize_paper_mode(value: str) -> str:
+    if value == "off":
+        return "skip"
+    return value
+
+
+def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
+    args.profile = _resolve_choice_option(
+        args.profile,
+        ("SQV2_DAILY_PROFILE",),
+        PROFILE_CHOICES,
+        "runtime",
+    )
+    args.report_date = _resolve_report_date(args.report_date)
+    args.continue_on_error = _resolve_bool_option(
+        args.continue_on_error,
+        ("SQV2_DAILY_CONTINUE_ON_ERROR",),
+        False,
+    )
+    args.skip_m5 = _resolve_bool_option(
+        args.skip_m5,
+        ("SQV2_DAILY_SKIP_M5",),
+        False,
+    )
+    args.paper_mode = _normalize_paper_mode(
+        _resolve_choice_option(
+            args.paper_mode,
+            ("SQV2_PAPER_MODE", "SQV2_DAILY_PAPER_MODE"),
+            PAPER_MODE_CHOICES,
+            "auto",
+        )
+    )
+    args.paper_portfolio_id = _resolve_int_option(
+        args.paper_portfolio_id,
+        ("SQV2_PAPER_PORTFOLIO_ID", "M7_PORTFOLIO_ID", "M6_PAPER_PORTFOLIO_ID"),
+        None,
+    )
+    args.skip_m8_daily_ops = _resolve_bool_option(
+        args.skip_m8_daily_ops,
+        ("SQV2_DAILY_SKIP_M8_DAILY_OPS",),
+        False,
+    )
+    args.enable_m8_ops_master = _resolve_bool_option(
+        args.enable_m8_ops_master,
+        ("SQV2_RESEARCH_ENABLE_M8_OPS_MASTER", "SQV2_ENABLE_M8_OPS_MASTER"),
+        True,
+    )
+    return args
+
+
+def _module_file_exists(project_root: Path, module_name: str) -> bool:
+    module_path = Path(*module_name.split(".")).with_suffix(".py")
+    return (project_root / "src" / module_path).exists()
 
 
 class DailyOutputEmitter:
@@ -284,6 +493,8 @@ class DatabaseInspector:
             ("meta_trading_calendar", "calendar_date", "is_trading_day"),
         ]
 
+        from stock_quant_v2.db.session import SessionLocal
+
         with SessionLocal() as session:
             for table_name, date_col, open_col in candidates:
                 sql = f"""
@@ -308,6 +519,8 @@ class DatabaseInspector:
           and snapshot_date < :effective_date
         limit 1
         """
+        from stock_quant_v2.db.session import SessionLocal
+
         with SessionLocal() as session:
             value = self._safe_scalar(
                 session,
@@ -391,7 +604,7 @@ def _resolve_paper_step(args: argparse.Namespace) -> ChainStep | None:
     )
 
 
-def _build_steps(args: argparse.Namespace) -> list[ChainStep]:
+def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
     steps: list[ChainStep] = [
         ChainStep("m2_data_refresh", "stock_quant_v2.scripts.bootstrap_m2_data_refresh_chain"),
         ChainStep("m3_analytics_refresh", "stock_quant_v2.scripts.bootstrap_m3_analytics_refresh_chain"),
@@ -418,12 +631,72 @@ def _build_steps(args: argparse.Namespace) -> list[ChainStep]:
     return steps
 
 
+def _build_research_steps(
+    args: argparse.Namespace,
+    *,
+    include_m5_refresh: bool,
+) -> list[ChainStep]:
+    steps: list[ChainStep] = []
+
+    # Optional heavy/research modules are skipped when the current branch does
+    # not contain them yet. This lets the production runtime profile stay stable
+    # while research capabilities are introduced incrementally.
+    steps.extend(
+        [
+            ChainStep(
+                "m3_historical_feature_backfill_p1",
+                "stock_quant_v2.scripts.bootstrap_m3_historical_feature_backfill_p1",
+                optional=True,
+            ),
+            ChainStep(
+                "m5_historical_signal_backfill_p1",
+                "stock_quant_v2.scripts.bootstrap_m5_historical_signal_backfill_p1",
+                optional=True,
+            ),
+        ]
+    )
+
+    if include_m5_refresh and not args.skip_m5:
+        steps.append(
+            ChainStep("m5_research_refresh", "stock_quant_v2.scripts.bootstrap_m5_research_refresh_chain")
+        )
+
+    if args.enable_m8_ops_master:
+        steps.append(
+            ChainStep(
+                "m8_ops_master_chain",
+                "stock_quant_v2.scripts.bootstrap_m8_ops_master_chain",
+                extra_args=("--continue-on-error",),
+                soft_fail=True,
+            )
+        )
+
+    return steps
+
+
+def _build_steps(args: argparse.Namespace) -> list[ChainStep]:
+    if args.profile == "runtime":
+        return _build_runtime_steps(args)
+
+    if args.profile == "research":
+        return _build_research_steps(args, include_m5_refresh=True)
+
+    if args.profile == "full":
+        return [
+            *_build_runtime_steps(args),
+            *_build_research_steps(args, include_m5_refresh=False),
+        ]
+
+    raise ValueError(f"Unsupported daily profile: {args.profile!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Daily runtime master chain. "
-            "Safe runtime path: M2 -> M3 -> M4 -> M5 -> "
-            "(auto route: M6 first-build or M7 daily rebalance) -> M8 daily ops."
+            "Daily master chain with profile routing. "
+            "runtime = production daily path with m8_daily_ops_entrypoint; "
+            "research = heavy/research path with bootstrap_m8_ops_master_chain; "
+            "full = runtime + research."
         )
     )
     parser.add_argument(
@@ -432,67 +705,113 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project root that contains src/. Default: auto-detect.",
     )
     parser.add_argument(
+        "--env-file",
+        default=None,
+        help=(
+            "Optional .env.research file to load before resolving DailyRun controls. "
+            "Relative paths are resolved from project root. Default: SQV2_ENV_FILE or .env.research if it exists."
+        ),
+    )
+    parser.add_argument(
         "--python-executable",
         default=sys.executable,
         help="Python executable used for child modules. Default: current interpreter.",
     )
     parser.add_argument(
+        "--profile",
+        choices=PROFILE_CHOICES,
+        default=None,
+        help="Daily profile. CLI > SQV2_DAILY_PROFILE > runtime.",
+    )
+    parser.add_argument(
         "--report-date",
         default=None,
-        help="Optional override for M8_REPORT_DATE, format YYYY-MM-DD.",
+        help="Optional override for M8_REPORT_DATE, format YYYY-MM-DD. Env: SQV2_DAILY_REPORT_DATE.",
     )
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="Continue remaining steps after a failed module.",
+        default=None,
+        help="Continue remaining steps after a failed module. Env: SQV2_DAILY_CONTINUE_ON_ERROR.",
     )
     parser.add_argument(
         "--skip-m5",
         action="store_true",
-        help="Skip M5 research refresh chain.",
+        default=None,
+        help="Skip M5 research refresh chain. Env: SQV2_DAILY_SKIP_M5.",
     )
     parser.add_argument(
         "--paper-mode",
-        choices=["auto", "m6", "m7", "skip"],
-        default="auto",
+        choices=PAPER_MODE_CHOICES,
+        default=None,
         help=(
-            "Paper trading route. "
-            "auto = no previous snapshot -> M6, existing snapshot -> M7. "
-            "Default: auto."
+            "Paper trading route. auto = no previous snapshot -> M6, existing snapshot -> M7; "
+            "skip/off = no paper step. Env: SQV2_PAPER_MODE."
         ),
     )
     parser.add_argument(
         "--paper-portfolio-id",
         type=int,
         default=None,
-        help="Portfolio id used for paper routing. Default: env or 1.",
+        help="Portfolio id used for paper routing. Env: SQV2_PAPER_PORTFOLIO_ID, M7_PORTFOLIO_ID, or M6_PAPER_PORTFOLIO_ID.",
     )
     parser.add_argument(
         "--skip-m8-daily-ops",
         action="store_true",
-        help="Skip M8 daily ops entrypoint.",
+        default=None,
+        help="Skip M8 daily ops entrypoint. Env: SQV2_DAILY_SKIP_M8_DAILY_OPS.",
+    )
+    parser.add_argument(
+        "--enable-m8-ops-master",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable M8 ops master chain for research/full profiles. "
+            "Use --no-enable-m8-ops-master to disable. "
+            "Env: SQV2_RESEARCH_ENABLE_M8_OPS_MASTER."
+        ),
     )
     return parser
 
 
 def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
     project_root = _detect_project_root(args.project_root)
+    loaded_env_path = _load_env_file(project_root, args.env_file)
+    args = _resolve_options_from_env(args)
+
     env = _build_runtime_env(project_root, args.report_date)
     steps = _build_steps(args)
 
-    print("[DAILY] Project runtime chain started.", flush=True)
+    print(f"[DAILY] Project {args.profile} chain started.", flush=True)
     print(f"[DAILY] project_root = {project_root}", flush=True)
+    if loaded_env_path is not None:
+        print(f"[DAILY] env_file = {loaded_env_path}", flush=True)
+    print(f"[DAILY] profile = {args.profile}", flush=True)
+    print(f"[DAILY] continue_on_error = {args.continue_on_error}", flush=True)
     print(f"[DAILY] python_executable = {args.python_executable}", flush=True)
     print(f"[DAILY] PYTHONPATH = {env.get('PYTHONPATH', '')}", flush=True)
     print(f"[DAILY] paper_mode = {args.paper_mode}", flush=True)
     if args.paper_portfolio_id is not None:
         print(f"[DAILY] paper_portfolio_id = {args.paper_portfolio_id}", flush=True)
+    if args.skip_m5:
+        print("[DAILY] skip_m5 = True", flush=True)
+    if args.skip_m8_daily_ops:
+        print("[DAILY] skip_m8_daily_ops = True", flush=True)
+    if args.profile in {"research", "full"}:
+        print(f"[DAILY] enable_m8_ops_master = {args.enable_m8_ops_master}", flush=True)
     if env.get("M8_REPORT_DATE"):
         print(f"[DAILY] M8_REPORT_DATE = {env['M8_REPORT_DATE']}", flush=True)
 
     failures: list[str] = []
 
     for step in steps:
+        if step.optional and not _module_file_exists(project_root, step.module_name):
+            print(
+                f"\n[DAILY][{step.name}] skipped optional module: {step.module_name}",
+                flush=True,
+            )
+            continue
+
         print(f"\n[DAILY][{step.name}] starting: {step.module_name}", flush=True)
         rc = _run_module(
             step_name=step.name,
@@ -504,6 +823,13 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
             python_executable=args.python_executable,
         )
         if rc != 0:
+            if step.soft_fail:
+                print(
+                    f"[DAILY][{step.name}] soft-failed (exit_code={rc}); continuing.",
+                    flush=True,
+                )
+                continue
+
             failures.append(f"{step.name} (exit_code={rc})")
             print(f"[DAILY][{step.name}] failed (exit_code={rc})", flush=True)
             if not args.continue_on_error:
@@ -512,14 +838,14 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
         else:
             print(f"[DAILY][{step.name}] succeeded.", flush=True)
 
-    print("\n[DAILY] Project runtime chain completed.", flush=True)
+    print(f"\n[DAILY] Project {args.profile} chain completed.", flush=True)
     if failures:
         print("[DAILY] Failed steps:", flush=True)
         for item in failures:
             print(f"  - {item}", flush=True)
         return 1
 
-    print("[DAILY] All runtime steps succeeded.", flush=True)
+    print(f"[DAILY] All {args.profile} steps succeeded.", flush=True)
     return 0
 
 

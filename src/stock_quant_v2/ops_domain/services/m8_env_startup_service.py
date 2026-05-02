@@ -372,7 +372,7 @@ class M8EnvStartupService:
                 row["status"] = "WARN"
                 row["message"] = (
                     "explicit database env var is missing, but SessionLocal database "
-                    "connection passed; likely loaded from project settings or .env"
+                    "connection passed; likely loaded from project settings or .env.research"
                 )
 
     def _check_dependencies(self) -> list[dict[str, Any]]:
