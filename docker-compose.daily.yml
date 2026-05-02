@@ -9,7 +9,7 @@ services:
     container_name: stock-quant-app
     restart: unless-stopped
     env_file:
-      - .env
+      - .env.production
     environment:
       TZ: Asia/Shanghai
       APP_TIMEZONE: Asia/Shanghai
@@ -30,7 +30,7 @@ services:
     depends_on:
       - stock-quant-app
     env_file:
-      - .env
+      - .env.production
     environment:
       TZ: Asia/Shanghai
       APP_TIMEZONE: Asia/Shanghai
