@@ -1,0 +1,18 @@
+[
+  {
+    "campaign_code": "sim_alpha_selection_v1_20d_202605",
+    "campaign_name": "alpha_selection v1 20D forward paper campaign",
+    "strategy_code": "alpha_selection",
+    "strategy_version_code": "v1",
+    "account_code": "paper_campaign_alpha_selection_v1_20d_202605",
+    "portfolio_code": "paper_campaign_alpha_selection_v1_20d_202605",
+    "initial_cash": 10000000,
+    "planned_trading_days": 20,
+    "start_trade_date": "2026-05-06",
+    "status": "ACTIVE",
+    "run_mode": "auto",
+    "target_count": 30,
+    "replace_existing": false,
+    "allow_main_portfolio": false
+  }
+]
