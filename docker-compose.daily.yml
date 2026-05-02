@@ -19,9 +19,11 @@ services:
       - ./artifacts:/app/artifacts
       - ./logs:/app/logs
       - ./strategy_release_cache:/app/strategy_release_cache
+      - ./configs/paper_campaigns:/app/configs/paper_campaigns:ro
     command: ["/bin/bash", "-lc", "sleep infinity"]
     networks:
       - stock_quant_net
+
 
   stock-quant-scheduler:
     image: stock-quant-runtime:v1.0.0
@@ -41,6 +43,7 @@ services:
       - ./logs:/app/logs
       - ./strategy_release_cache:/app/strategy_release_cache
       - ./deploy/supercronic/supercronic.crontab:/app/deploy/supercronic/supercronic.crontab:ro
+      - ./configs/paper_campaigns:/app/configs/paper_campaigns:ro
     command:
       [
         "/usr/local/bin/supercronic",
