@@ -41,6 +41,7 @@ class ArtifactDiscoveryConfig:
             self.repo_root / "artifacts" / "m4",
             self.repo_root / "artifacts" / "m5",
             self.repo_root / "artifacts" / "m6",
+            self.repo_root / "artifacts" / "m6_5",
             self.repo_root / "artifacts" / "m7",
             self.repo_root / "artifacts" / "m8",
             self.repo_root / "artifacts" / "m9",
@@ -155,6 +156,8 @@ class PlatformOverviewArtifactReader:
             keys = list(payload.keys())[:12]
             if payload.get("summary_type") in {"m3_readiness", "m4_strategy_signal", "m5_backtest_execution"}:
                 return self._bridge_json_summary(payload), keys
+            if self._looks_like_m6_5_campaign(payload):
+                return self._m6_5_campaign_json_summary(payload), keys
             if self._looks_like_historical_backfill(payload):
                 return self._historical_backfill_json_summary(payload), keys
             if "summary" in payload and isinstance(payload["summary"], str):
@@ -179,6 +182,54 @@ class PlatformOverviewArtifactReader:
             parts.append(f"report_date={report_date}")
         if human_summary:
             parts.append(f"human_summary={human_summary}")
+        return " | ".join(parts)
+
+
+    @staticmethod
+    def _looks_like_m6_5_campaign(payload: dict[str, Any]) -> bool:
+        module = str(payload.get("module", "")).upper()
+        query = str(payload.get("query", "")).lower()
+        if module == "M6.5" or "paper_campaign" in query:
+            return True
+        return "campaign_code" in payload and "trade_date" in payload and "action" in payload
+
+    @staticmethod
+    def _m6_5_campaign_json_summary(payload: dict[str, Any]) -> str:
+        if isinstance(payload.get("results"), list):
+            results = [x for x in payload.get("results") or [] if isinstance(x, dict)]
+            action_counts: dict[str, int] = {}
+            status_counts: dict[str, int] = {}
+            for item in results:
+                action = str(item.get("action") or "UNKNOWN")
+                status = str(item.get("status") or "UNKNOWN")
+                action_counts[action] = action_counts.get(action, 0) + 1
+                status_counts[status] = status_counts.get(status, 0) + 1
+            parts = [
+                "summary_type=m6_5_forward_paper_campaign_daily",
+                f"overall_status={payload.get('overall_status') or 'UNKNOWN'}",
+                f"campaign_count={payload.get('campaign_count', len(results))}",
+                f"failed_count={payload.get('failed_count', 0)}",
+            ]
+            if action_counts:
+                parts.append("actions=" + ",".join(f"{k}:{v}" for k, v in sorted(action_counts.items())))
+            if status_counts:
+                parts.append("statuses=" + ",".join(f"{k}:{v}" for k, v in sorted(status_counts.items())))
+            return " | ".join(parts)
+
+        parts = [
+            "summary_type=m6_5_forward_paper_campaign_daily_item",
+            f"campaign_code={payload.get('campaign_code') or 'UNKNOWN'}",
+            f"trade_date={payload.get('trade_date') or 'UNKNOWN'}",
+            f"day_no={payload.get('day_no') if payload.get('day_no') is not None else 'UNKNOWN'}",
+            f"action={payload.get('action') or 'UNKNOWN'}",
+            f"status={payload.get('status') or 'UNKNOWN'}",
+        ]
+        if payload.get("portfolio_id") is not None:
+            parts.append(f"portfolio_id={payload.get('portfolio_id')}")
+        if payload.get("portfolio_code"):
+            parts.append(f"portfolio_code={payload.get('portfolio_code')}")
+        if payload.get("reason"):
+            parts.append(f"reason={str(payload.get('reason')).replace('|', '/')}")
         return " | ".join(parts)
 
     @staticmethod

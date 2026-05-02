@@ -33,6 +33,7 @@ _SECTION_SPECS: list[tuple[str, str, set[str]]] = [
     ("13", "13_与上一报告日对比", {"m9:platform_overview", "m9:platform_overview_check"}),
     ("14", "14_人工复核建议", {"human_review", "alert", "risk", "acceptance", "docs_m8:m8_docs", "m9:platform_overview_check"}),
     ("15", "15_来源文件与 run_id 索引", {"*"}),
+    ("16", "16_M6.5未来模拟盘活动", {"m6_5", "paper_campaign_daily", "paper_campaign_summary"}),
 ]
 
 _OVERVIEW_REPORT_DATE_PATTERN = re.compile(r"m9_platform_overview_p\d+_(20\d{2}-\d{2}-\d{2})")
@@ -346,6 +347,14 @@ class PlatformOverviewReportBuilder:
                 return "WARN"
             return "WARN"
 
+        if title.startswith("16"):
+            combined = " ".join((s.summary or "") + " " + (s.relative_path or "") for s in matched).upper()
+            failed_counts = [int(m.group(1)) for m in re.finditer(r"FAILED_COUNT=(\d+)", combined)]
+            has_failed_status = any(token in combined for token in ("STATUS=FAIL", "STATUS=FAILED", "OVERALL_STATUS=FAIL", "OVERALL_STATUS=FAILED"))
+            if any(count > 0 for count in failed_counts) or has_failed_status:
+                return "WARN"
+            return "OK" if self._has_any_topic(matched, {"paper_campaign_daily", "paper_campaign_summary"}) or any(s.module == "m6_5" for s in matched) else "MISSING"
+
         return "OK"
 
     def _risks_for_section(
@@ -433,6 +442,12 @@ class PlatformOverviewReportBuilder:
         if title.startswith("14") and not self._has_any_topic(matched, {"human_review", "alert", "risk"}):
             risks.append("未发现专用 human_review/alert/risk artifact；人工复核建议将根据各章节 WARN/PASS_WITH_WARN 自动生成。")
 
+        if title.startswith("16"):
+            if not matched:
+                risks.append("未发现 M6.5 campaign artifact，平台总览无法解释未来模拟盘活动状态。")
+            if any("FAIL" in (s.summary or "").upper() for s in matched):
+                risks.append("M6.5 campaign artifact 中存在失败状态，需复核独立模拟组合是否推进成功。")
+
         return risks
 
     @staticmethod
@@ -463,6 +478,8 @@ class PlatformOverviewReportBuilder:
             return ["检查 M4 strategy metadata 是否 ready，以及 strategy_signal 运行事实是否仍为 0。"]
         if title.startswith("14"):
             return ["优先处理 CRITICAL/WARN，再处理信息性提醒。"]
+        if title.startswith("16"):
+            return ["核对 M6.5 campaign 是否跟随生产端 DailyRun 自动推进，并检查独立 portfolio 的 M6/M7 run lineage。"]
         if status == "MISSING":
             return ["补齐对应来源后重跑。"]
         return ["人工抽样复核本章节结论。"]
@@ -511,6 +528,25 @@ class PlatformOverviewReportBuilder:
             warn_like = [s for s in matched if s.topic in {"alert", "risk", "human_review", "platform_overview_check"}]
             prefix = "当前人工复核建议章节已读取专用运维来源。" if warn_like else "当前未发现专用人工复核 artifact，将根据各章节状态生成建议。"
             return f"{prefix} 本章节已汇总 {len(matched)} 个来源，覆盖主题：{topic_names}。"
+
+        if title.startswith("16"):
+            campaign_sources = [s for s in matched if s.module == "m6_5" or s.topic in {"paper_campaign_daily", "paper_campaign_summary"}]
+            latest_date_text = latest_date or "未识别"
+            actions: list[str] = []
+            statuses: list[str] = []
+            for src in campaign_sources:
+                action = self._bridge_field(src.summary or "", "action")
+                status_value = self._bridge_field(src.summary or "", "status") or self._bridge_field(src.summary or "", "overall_status")
+                if action and action not in actions:
+                    actions.append(action)
+                if status_value and status_value not in statuses:
+                    statuses.append(status_value)
+            return (
+                f"M6.5 未来模拟盘活动已纳入平台总览，最新 campaign artifact 日期={latest_date_text}。"
+                f"已识别来源 {len(campaign_sources)} 个，动作={', '.join(actions) if actions else '未识别'}，"
+                f"状态={', '.join(statuses) if statuses else status}。"
+                "本章节只读解释 campaign 日报/总结，不产生交易决策。"
+            )
 
         parts: list[str] = []
         if latest_date:
@@ -649,6 +685,19 @@ class PlatformOverviewReportBuilder:
                     reason="风控章节属于当前必须解释的主线。",
                     related_run_ids=related_runs[:8],
                     related_sources=[s.relative_path for s in risk_sources[:5]],
+                )
+            )
+
+        campaign_sources = [s for s in sources if s.module == "m6_5" or s.topic in {"paper_campaign_daily", "paper_campaign_summary"}]
+        failed_campaign_sources = [s for s in campaign_sources if "FAIL" in (s.summary or "").upper()]
+        if failed_campaign_sources:
+            items.append(
+                ActionItem(
+                    priority="P0",
+                    area="M6.5 Forward Paper Campaign",
+                    action="复核 M6.5 未来模拟盘活动失败项，确认独立 campaign portfolio 是否成功推进。",
+                    reason="M6.5 campaign artifact 中出现 FAIL/failed 状态。",
+                    related_sources=[s.relative_path for s in failed_campaign_sources[:5]],
                 )
             )
 
@@ -854,10 +903,13 @@ class PlatformOverviewExporter:
         def source_summary_value(module_code: str, field_name: str) -> str | None:
             pattern = rf"{re.escape(field_name)}=([^|]+)"
             for src in report.sources:
-                if src.module == module_code and src.topic == "m9_bridge":
-                    match = re.search(pattern, src.summary or "")
-                    if match:
-                        return match.group(1).strip()
+                if src.module != module_code:
+                    continue
+                if module_code != "m6_5" and src.topic != "m9_bridge":
+                    continue
+                match = re.search(pattern, src.summary or "")
+                if match:
+                    return match.group(1).strip()
             return None
 
         def first_non_empty(values: list[str | None]) -> str:
@@ -887,10 +939,14 @@ class PlatformOverviewExporter:
         m4_bridge_sources = [s for s in report.sources if s.module == "m4" and s.topic == "m9_bridge"]
         m5_bridge_sources = [s for s in report.sources if s.module == "m5" and s.topic == "m9_bridge"]
         backtest_sources = sources_for_topic("backtest") + m5_bridge_sources
+        campaign_sources = sources_for_topic("paper_campaign_daily") + sources_for_topic("paper_campaign_summary") + [s for s in report.sources if s.module == "m6_5"]
+        # Deduplicate campaign sources because module/topic matching may overlap.
+        campaign_sources = list({s.relative_path: s for s in campaign_sources}.values())
 
         data_status = merged_status(["03", "05", "06"])
         research_status = merged_status(["07", "08"])
-        paper_status = merged_status(["09", "11"])
+        paper_status = merged_status(["09", "11", "16"])
+        campaign_status = status_of("16") if campaign_sources else "MISSING"
         risk_status = merged_status(["10", "12", "14"])
         alert_status = "FAIL" if has_text("CRITICAL", alert_sources) else ("WARN" if alert_sources else "OK")
 
@@ -917,6 +973,8 @@ class PlatformOverviewExporter:
             latest_run_id_text(backtest_sources),
         ])
         latest_paper_run = latest_run_id_text(paper_sources)
+        latest_campaign_date = latest_date(campaign_sources) if campaign_sources else "未识别"
+        latest_campaign_action = first_non_empty([source_summary_value("m6_5", "action")])
         latest_risk_run = latest_run_id_text(risk_sources)
         highest_alert = "CRITICAL" if has_text("CRITICAL", alert_sources) else ("WARN/INFO" if alert_sources else "未识别")
 
@@ -925,6 +983,10 @@ class PlatformOverviewExporter:
             key_findings.append(f"Paper Trading 链路已识别，最新相关 run_id={latest_paper_run}，交易链路章节状态={status_of('09')}。")
         else:
             key_findings.append("未识别到 paper_chain 来源，交易链路闭环状态需要补源确认。")
+        if campaign_sources:
+            key_findings.append(f"M6.5 未来模拟盘活动已识别，最新日期={latest_campaign_date}，动作={latest_campaign_action}，章节状态={campaign_status}。")
+        else:
+            key_findings.append("未识别到 M6.5 campaign 来源；若已启用生产端未来模拟盘，需要检查 artifacts/m6_5/paper_campaign_daily。")
         if risk_sources:
             key_findings.append(f"风控来源已识别，最新 risk run_id={latest_risk_run}；风控章节状态={status_of('10')}。")
         else:
@@ -958,6 +1020,8 @@ class PlatformOverviewExporter:
                     f"- 最新信号来源日：{latest_signal_date}",
                     f"- 最新回测 run_id：{latest_backtest_run}",
                     f"- 最新 paper run_id：{latest_paper_run}",
+                    f"- M6.5 campaign 最新日期：{latest_campaign_date}",
+                    f"- M6.5 campaign 最新动作：{latest_campaign_action}",
                     f"- 最新 risk run_id：{latest_risk_run}",
                     f"- 最高告警级别：{highest_alert}",
                     "",
@@ -966,6 +1030,7 @@ class PlatformOverviewExporter:
                     f"- 数据链路状态：{data_status}",
                     f"- 研究链路状态：{research_status}",
                     f"- Paper Trading 状态：{paper_status}",
+                    f"- M6.5 Campaign 状态：{campaign_status}",
                     f"- 风控/告警状态：{risk_status} / {alert_status}",
                     "",
                 ])
@@ -981,6 +1046,7 @@ class PlatformOverviewExporter:
                     f"- 数据链路：{data_status}",
                     f"- 策略/研究链路：{research_status}",
                     f"- Paper Trading 链路：{paper_status}",
+                    f"- M6.5 未来模拟盘活动：{campaign_status}",
                     f"- 风控与告警：{risk_status} / {alert_status}",
                     f"- 来源总数：{len(report.sources)}，完整来源见 `m9_platform_overview_p1_{report.report_date}_sources.csv`。",
                     "",
@@ -1054,6 +1120,14 @@ class PlatformOverviewExporter:
                     lines.append("- 暂无自动生成的人工复核建议。")
                 lines.append("")
                 return lines
+            elif section.section_id == "16":
+                conclusion = "M6.5 Forward Paper Campaign 用于跟随生产端 DailyRun 推进未来真实交易日模拟盘活动；该章节只读解释 campaign artifact，不生成交易决策。"
+                facts = [
+                    f"M6.5 来源数：{len(campaign_sources)}",
+                    f"最新 campaign 日期：{latest_campaign_date}",
+                    f"最新 campaign 动作：{latest_campaign_action}",
+                    section.summary,
+                ]
             elif section.section_id == "15":
                 counts = topic_counts()
                 lines.extend([
@@ -1066,7 +1140,7 @@ class PlatformOverviewExporter:
                 for topic, count in list(counts.items())[:20]:
                     lines.append(f"- {topic}: {count}")
                 lines.extend(["", "### 核心来源", ""])
-                core_topics = {"m9_bridge", "daily_ops", "paper_chain", "portfolio_snapshot", "risk", "alert", "audit", "env", "platform_overview_check"}
+                core_topics = {"m9_bridge", "daily_ops", "paper_chain", "portfolio_snapshot", "risk", "alert", "audit", "env", "platform_overview_check", "paper_campaign_daily", "paper_campaign_summary"}
                 shown: set[str] = set()
                 for src in report.sources:
                     if src.topic not in core_topics:
@@ -1107,6 +1181,7 @@ class PlatformOverviewExporter:
             f"- DATA_CHAIN_STATUS: {data_status}",
             f"- RESEARCH_CHAIN_STATUS: {research_status}",
             f"- PAPER_TRADING_STATUS: {paper_status}",
+            f"- M6_5_CAMPAIGN_STATUS: {campaign_status}",
             f"- RISK_ALERT_STATUS: {risk_status} / {alert_status}",
             f"- FINAL_OPS_CONCLUSION: {final_conclusion}",
             "",

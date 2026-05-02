@@ -290,6 +290,13 @@ class ResearchPortfolioDailyReportBuilder:
             f"artifacts/m8/alert/*_{report_date}.json",
             "artifacts/m8/alert/*.json",
         ], "m8_alert")
+        m6_5_daily_paths = self._matching_artifacts([
+            f"artifacts/m6_5/paper_campaign_daily/*_{report_date}.json",
+            "artifacts/m6_5/paper_campaign_daily/*.json",
+        ], "m6_5_paper_campaign_daily")
+        m6_5_summary_paths = self._matching_artifacts([
+            "artifacts/m6_5/paper_campaign_summary/*.json",
+        ], "m6_5_paper_campaign_summary")
 
         m3 = _read_json(m3_path)
         m4 = _read_json(m4_path)
@@ -299,6 +306,8 @@ class ResearchPortfolioDailyReportBuilder:
         portfolio_snapshot = _read_json(portfolio_snapshot_path)
         risk = _read_json(risk_path)
         alert = _read_json(alert_path)
+        m6_5_daily_payloads = [_read_json(path) for path in m6_5_daily_paths]
+        m6_5_summary_payloads = [_read_json(path) for path in m6_5_summary_paths]
 
         selected_rows = _read_csv_rows(paper_targets_path)
         if not selected_rows:
@@ -315,6 +324,7 @@ class ResearchPortfolioDailyReportBuilder:
         selected_stock_rows = self._normalize_selected_stock_rows(selected_rows)
         selected_fact = self._extract_selected_stocks(selected_stock_rows, paper_chain)
         position_fact = self._extract_positions(position_rows, portfolio_fact)
+        campaign_fact = self._extract_paper_campaigns(m6_5_daily_payloads, m6_5_summary_payloads)
 
         facts = {
             "report_date": report_date,
@@ -327,6 +337,7 @@ class ResearchPortfolioDailyReportBuilder:
             "portfolio": portfolio_fact,
             "positions": position_fact,
             "risk": risk_fact,
+            "paper_campaigns": campaign_fact,
         }
         facts["review_flags"] = self._derive_review_flags(facts)
         facts["status_layers"] = self._derive_status_layers(facts)
@@ -341,6 +352,7 @@ class ResearchPortfolioDailyReportBuilder:
             self._section_pnl_turnover(facts),
             self._section_backtest(facts),
             self._section_risk(facts),
+            self._section_paper_campaigns(facts),
             self._section_anomalies_and_actions(facts),
             self._section_conclusion(facts),
             self._section_sources(),
@@ -369,6 +381,10 @@ class ResearchPortfolioDailyReportBuilder:
         exact matches should beat older fallback files even if a fallback file
         has a newer filesystem mtime after unzip/copy.
         """
+        matches = self._matching_artifacts(patterns, source_code, allow_many=False)
+        return matches[0] if matches else None
+
+    def _matching_artifacts(self, patterns: list[str], source_code: str, allow_many: bool = True) -> list[Path]:
         selected_pattern = ""
         candidates: list[Path] = []
         for pattern in patterns:
@@ -379,18 +395,70 @@ class ResearchPortfolioDailyReportBuilder:
                 break
         if not candidates:
             self.sources.append(ReportSource(source_code, "", "MISSING", "no matching artifact"))
-            return None
+            return []
         candidates.sort(key=lambda path: (str(path), path.stat().st_mtime), reverse=True)
-        path = candidates[0]
-        self.sources.append(
-            ReportSource(
-                source_code,
-                str(path.relative_to(self.repo_root)),
-                "USED",
-                f"latest matching artifact from pattern: {selected_pattern}",
+        selected = candidates if allow_many else candidates[:1]
+        for path in selected:
+            self.sources.append(
+                ReportSource(
+                    source_code,
+                    str(path.relative_to(self.repo_root)),
+                    "USED",
+                    f"matching artifact from pattern: {selected_pattern}",
+                )
             )
-        )
-        return path
+        return selected
+
+    def _extract_paper_campaigns(
+        self,
+        daily_payloads: list[dict[str, Any]],
+        summary_payloads: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        for payload in daily_payloads:
+            if not payload:
+                continue
+            if isinstance(payload.get("results"), list):
+                for item in payload.get("results") or []:
+                    if isinstance(item, dict):
+                        rows.append(dict(item))
+            elif payload.get("campaign_code"):
+                rows.append(dict(payload))
+
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            normalized.append({
+                "campaign_code": row.get("campaign_code"),
+                "campaign_name": row.get("campaign_name"),
+                "trade_date": row.get("trade_date"),
+                "day_no": row.get("day_no"),
+                "action": row.get("action"),
+                "status": row.get("status"),
+                "reason": row.get("reason"),
+                "portfolio_id": row.get("portfolio_id"),
+                "portfolio_code": row.get("portfolio_code"),
+                "strategy_code": row.get("strategy_code"),
+                "strategy_version_code": row.get("strategy_version_code"),
+                "signal_source": row.get("signal_source"),
+                "module_execution_count": len(row.get("module_executions") or []),
+                "extracted_run_ids": row.get("extracted_run_ids") or {},
+                "artifact_paths": row.get("artifact_paths") or {},
+            })
+
+        failed = [row for row in normalized if str(row.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}]
+        executed = [row for row in normalized if str(row.get("action") or "").upper() in {"M6_FIRST_CHAIN", "M7_DAILY_REFRESH"}]
+        skipped = [row for row in normalized if str(row.get("action") or "").upper() == "SKIP"]
+        latest = normalized[0] if normalized else {}
+        return {
+            "status": "WARN" if failed else ("OK" if normalized else "MISSING"),
+            "campaign_count": len(normalized),
+            "executed_count": len(executed),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+            "latest": latest,
+            "rows": normalized,
+            "summary_count": len([p for p in summary_payloads if p]),
+        }
 
     def _extract_strategy(self, m4: dict[str, Any]) -> dict[str, Any]:
         strategies = m4.get("strategies") or []
@@ -1121,6 +1189,7 @@ class ResearchPortfolioDailyReportBuilder:
         portfolio = facts.get("portfolio") or {}
         risk = facts.get("risk") or {}
         selected = facts.get("selected") or {}
+        campaigns = facts.get("paper_campaigns") or {}
 
         data_status = "OK"
         if _is_warnish_status(market.get("status")) or _is_warnish_status(db_market.get("status")):
@@ -1130,6 +1199,7 @@ class ResearchPortfolioDailyReportBuilder:
 
         research_status = "OK" if not _is_warnish_status(backtest.get("status")) else "WARN"
         portfolio_status = "OK" if portfolio.get("total_equity") else "WARN"
+        campaign_status = "OK" if campaigns.get("status") in {"OK", "MISSING"} else "WARN"
         risk_review_status = "OK"
         if not risk.get("status") and not risk.get("alert_status"):
             risk_review_status = "WARN"
@@ -1141,13 +1211,14 @@ class ResearchPortfolioDailyReportBuilder:
         final = "OK，可以作为 paper trading 复盘参考。"
         if "FAIL" in {data_status, research_status, portfolio_status, risk_review_status}:
             final = "FAIL，不建议参考为自动执行依据，需先处理阻断项。"
-        elif "WARN" in {data_status, research_status, portfolio_status, risk_review_status}:
+        elif "WARN" in {data_status, research_status, portfolio_status, campaign_status, risk_review_status}:
             final = "WARN，谨慎参考，需要人工复核后使用。"
 
         return {
             "DATA_STATUS": data_status,
             "RESEARCH_STATUS": research_status,
             "PORTFOLIO_STATUS": portfolio_status,
+            "CAMPAIGN_STATUS": campaign_status,
             "RISK_REVIEW_STATUS": risk_review_status,
             "FINAL_REVIEW_CONCLUSION": final,
         }
@@ -1160,6 +1231,7 @@ class ResearchPortfolioDailyReportBuilder:
         risk = facts.get("risk") or {}
         market = facts.get("market") or {}
         db_market = facts.get("db_market") or {}
+        campaigns = facts.get("paper_campaigns") or {}
 
         def add(priority: str, category: str, item: str, reason: str, suggested_action: str, source: str) -> None:
             flags.append({
@@ -1170,6 +1242,15 @@ class ResearchPortfolioDailyReportBuilder:
                 "suggested_action": suggested_action,
                 "source": source,
             })
+
+        for row in campaigns.get("rows") or []:
+            if str(row.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}:
+                add(
+                    "P0", "M6.5未来模拟盘", row.get("campaign_code") or "N/A",
+                    f"campaign daily status={row.get('status')}，action={row.get('action')}，reason={row.get('reason')}",
+                    "复核该独立 campaign portfolio 的 M6/M7 run lineage 和当日输入数据。",
+                    "m6_5_paper_campaign_daily",
+                )
 
         st_rows = [row for row in (selected.get("all_rows") or selected.get("top_rows") or []) if _is_st_or_special_treatment(row)]
         for row in st_rows[:20]:
@@ -1247,6 +1328,7 @@ class ResearchPortfolioDailyReportBuilder:
         portfolio = facts["portfolio"]
         backtest = facts["backtest"]
         risk = facts["risk"]
+        campaigns = facts.get("paper_campaigns") or {}
         layers = facts.get("status_layers") or {}
         details = [
             f"报告生成日：{facts.get('report_date') or 'N/A'}。",
@@ -1255,10 +1337,12 @@ class ResearchPortfolioDailyReportBuilder:
             f"最新信号水位：as_of_date={strategy.get('signal_latest_as_of_date') or 'N/A'}，effective_date={strategy.get('signal_latest_effective_date') or 'N/A'}。",
             f"回测区间：{backtest.get('start_date') or 'N/A'} 至 {backtest.get('end_date') or 'N/A'}，run_id={backtest.get('run_id') or 'N/A'}。",
             f"风控决策日期：{risk.get('min_decision_date') or 'N/A'} 至 {risk.get('max_decision_date') or 'N/A'}。",
+            f"M6.5 campaign：count={campaigns.get('campaign_count') or 0}，executed={campaigns.get('executed_count') or 0}，skipped={campaigns.get('skipped_count') or 0}，failed={campaigns.get('failed_count') or 0}。",
             "状态分层："
             f"DATA={layers.get('DATA_STATUS') or 'N/A'}，"
             f"RESEARCH={layers.get('RESEARCH_STATUS') or 'N/A'}，"
             f"PORTFOLIO={layers.get('PORTFOLIO_STATUS') or 'N/A'}，"
+            f"CAMPAIGN={layers.get('CAMPAIGN_STATUS') or 'N/A'}，"
             f"RISK_REVIEW={layers.get('RISK_REVIEW_STATUS') or 'N/A'}。",
         ]
         return ReportSection(
@@ -1282,6 +1366,7 @@ class ResearchPortfolioDailyReportBuilder:
         backtest = facts["backtest"]
         portfolio = facts["portfolio"]
         risk = facts["risk"]
+        campaigns = facts.get("paper_campaigns") or {}
         layers = facts.get("status_layers") or {}
         flags = facts.get("review_flags") or []
         cash_ratio = _ratio(portfolio.get("cash_balance"), portfolio.get("total_equity"))
@@ -1426,6 +1511,30 @@ class ResearchPortfolioDailyReportBuilder:
         status = "WARN" if _decimal_gt(r.get("warn_count"), "0") or str(r.get("highest_alert_level") or "").upper() == "CRITICAL" else (r.get("status") or "WARN")
         return ReportSection("08", "风控、约束与告警", str(status), summary, details)
 
+    def _section_paper_campaigns(self, facts: dict[str, Any]) -> ReportSection:
+        campaigns = facts.get("paper_campaigns") or {}
+        rows = campaigns.get("rows") or []
+        details = [
+            f"campaign_count={campaigns.get('campaign_count') or 0}，executed={campaigns.get('executed_count') or 0}，skipped={campaigns.get('skipped_count') or 0}，failed={campaigns.get('failed_count') or 0}。",
+            "M6.5 属于生产端 DailyRun 的未来模拟交易活动层；本报告只读解释，不生成信号、不下单、不调仓。",
+        ]
+        if rows:
+            for row in rows[:10]:
+                run_ids = row.get("extracted_run_ids") or {}
+                details.append(
+                    f"{row.get('campaign_code') or 'N/A'}：trade_date={row.get('trade_date') or 'N/A'}，"
+                    f"day_no={row.get('day_no') if row.get('day_no') is not None else 'N/A'}，"
+                    f"action={row.get('action') or 'N/A'}，status={row.get('status') or 'N/A'}，"
+                    f"portfolio={row.get('portfolio_id') or row.get('portfolio_code') or 'N/A'}，"
+                    f"strategy={row.get('strategy_code') or 'N/A'}:{row.get('strategy_version_code') or 'N/A'}，"
+                    f"run_lineage={run_ids or 'N/A'}。"
+                )
+        else:
+            details.append("未识别到 M6.5 campaign 日报；若生产端已启用，请检查 artifacts/m6_5/paper_campaign_daily。")
+        summary = "本节展示未来真实交易日模拟盘活动的推进状态，回答 campaign 今天是否执行、执行到第几天、是否触发 M6/M7。"
+        status = campaigns.get("status") or "MISSING"
+        return ReportSection("09", "M6.5 Forward Paper Campaign", str(status), summary, details)
+
     def _section_anomalies_and_actions(self, facts: dict[str, Any]) -> ReportSection:
         flags = facts.get("review_flags") or []
         details: list[str] = []
@@ -1437,7 +1546,7 @@ class ResearchPortfolioDailyReportBuilder:
         else:
             details.append("当前未识别到必须立即处理的组合级问题；建议人工抽查前十大目标仓位、风控 WARN 和资金状态。")
         return ReportSection(
-            "09",
+            "10",
             "异常标的与人工复核清单",
             "WARN" if flags else "OK",
             "本节集中展示需要人工处理的标的、资金、风控、告警、回测和数据问题。",
@@ -1456,7 +1565,7 @@ class ResearchPortfolioDailyReportBuilder:
         if flags:
             details.append("建议优先处理 P0/P1 复核项，再决定是否采信本轮组合结论。")
         status = "WARN" if flags else "OK"
-        return ReportSection("10", "结论与人工动作建议", status, "本节给出最终可采信程度和人工动作边界。", details)
+        return ReportSection("11", "结论与人工动作建议", status, "本节给出最终可采信程度和人工动作边界。", details)
 
     def _section_sources(self) -> ReportSection:
         used = [s for s in self.sources if s.status == "USED"]
@@ -1464,7 +1573,7 @@ class ResearchPortfolioDailyReportBuilder:
         details = [f"已使用来源 {len(used)} 个，缺失/不可用来源 {len(missing)} 个。"]
         for src in self.sources:
             details.append(f"{src.status}: {src.source_code} -> {src.path or src.note}")
-        return ReportSection("11", "来源文件与 run_id 血缘", "OK" if used else "WARN", "报告只基于已落地 artifact 和可选 DB 快照生成，保留完整来源索引。", details)
+        return ReportSection("12", "来源文件与 run_id 血缘", "OK" if used else "WARN", "报告只基于已落地 artifact 和可选 DB 快照生成，保留完整来源索引。", details)
 
     def _section_appendix(self, facts: dict[str, Any]) -> ReportSection:
         report_date = facts.get("report_date") or "YYYY-MM-DD"
@@ -1478,7 +1587,7 @@ class ResearchPortfolioDailyReportBuilder:
             f"{stem}_sources.csv：来源 artifact 索引。",
             "后续 P1/P2 可新增 risk_review_items.csv、alert_items.csv、return_attribution.csv、factor_exposure.csv。",
         ]
-        return ReportSection("12", "附录索引", "OK", "本节列出本次报告同步输出的结构化附件。", details)
+        return ReportSection("13", "附录索引", "OK", "本节列出本次报告同步输出的结构化附件。", details)
 
     def _build_action_items(self, facts: dict[str, Any], sections: list[ReportSection]) -> list[dict[str, Any]]:
         action_items: list[dict[str, Any]] = []
@@ -1580,6 +1689,7 @@ class ResearchPortfolioDailyReportExporter:
             lines.append(f"- DATA_STATUS: {layers.get('DATA_STATUS') or 'N/A'}")
             lines.append(f"- RESEARCH_STATUS: {layers.get('RESEARCH_STATUS') or 'N/A'}")
             lines.append(f"- PORTFOLIO_STATUS: {layers.get('PORTFOLIO_STATUS') or 'N/A'}")
+            lines.append(f"- CAMPAIGN_STATUS: {layers.get('CAMPAIGN_STATUS') or 'N/A'}")
             lines.append(f"- RISK_REVIEW_STATUS: {layers.get('RISK_REVIEW_STATUS') or 'N/A'}")
             lines.append(f"- FINAL_REVIEW_CONCLUSION: {layers.get('FINAL_REVIEW_CONCLUSION') or 'N/A'}")
         lines.append("")
