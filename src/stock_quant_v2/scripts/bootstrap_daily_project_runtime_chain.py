@@ -316,6 +316,15 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         ("SQV2_RESEARCH_ENABLE_M8_OPS_MASTER", "SQV2_ENABLE_M8_OPS_MASTER"),
         True,
     )
+    args.enable_m6_5_campaign = _resolve_bool_option(
+        args.enable_m6_5_campaign,
+        ("SQV2_DAILY_ENABLE_M6_5_CAMPAIGN", "SQV2_ENABLE_M6_5_CAMPAIGN"),
+        False,
+    )
+    args.m6_5_campaign_config = (
+        args.m6_5_campaign_config
+        or _env_first("SQV2_M6_5_CAMPAIGN_CONFIG", "M6_5_CAMPAIGN_CONFIG")
+    )
     return args
 
 
@@ -620,6 +629,20 @@ def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
     if paper_step is not None:
         steps.append(paper_step)
 
+    if getattr(args, "enable_m6_5_campaign", False):
+        extra_args: tuple[str, ...] = ()
+        if getattr(args, "m6_5_campaign_config", None):
+            extra_args = ("--config", str(args.m6_5_campaign_config))
+        steps.append(
+            ChainStep(
+                "m6_5_paper_campaign_daily",
+                "stock_quant_v2.scripts.bootstrap_m6_5_paper_campaign_daily",
+                extra_args=extra_args,
+                optional=True,
+                soft_fail=True,
+            )
+        )
+
     if not args.skip_m8_daily_ops:
         steps.append(
             ChainStep(
@@ -771,6 +794,23 @@ def build_parser() -> argparse.ArgumentParser:
             "Env: SQV2_RESEARCH_ENABLE_M8_OPS_MASTER."
         ),
     )
+    parser.add_argument(
+        "--enable-m6-5-campaign",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable optional M6.5 Forward Paper Campaign daily runner in runtime/full profiles. "
+            "Default is disabled. Env: SQV2_DAILY_ENABLE_M6_5_CAMPAIGN."
+        ),
+    )
+    parser.add_argument(
+        "--m6-5-campaign-config",
+        default=None,
+        help=(
+            "Optional path to active_campaigns.json for M6.5. "
+            "Env: SQV2_M6_5_CAMPAIGN_CONFIG."
+        ),
+    )
     return parser
 
 
@@ -799,6 +839,10 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
         print("[DAILY] skip_m8_daily_ops = True", flush=True)
     if args.profile in {"research", "full"}:
         print(f"[DAILY] enable_m8_ops_master = {args.enable_m8_ops_master}", flush=True)
+    if getattr(args, "enable_m6_5_campaign", False):
+        print("[DAILY] enable_m6_5_campaign = True", flush=True)
+        if getattr(args, "m6_5_campaign_config", None):
+            print(f"[DAILY] m6_5_campaign_config = {args.m6_5_campaign_config}", flush=True)
     if env.get("M8_REPORT_DATE"):
         print(f"[DAILY] M8_REPORT_DATE = {env['M8_REPORT_DATE']}", flush=True)
 
