@@ -160,7 +160,7 @@ def main() -> None:
 
     try:
         root_run_id = 1
-        start_date, end_date = _resolve_trade_dates()
+        start_date, end_date = _resolve_date_range()
 
         with SessionLocal() as session:
             session: Session
