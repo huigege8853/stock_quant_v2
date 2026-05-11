@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from sqlalchemy import text
@@ -46,14 +46,19 @@ from stock_quant_v2.db.session import SessionLocal, dispose_engine
 from stock_quant_v2.scripts.bootstrap_meta_data_domain import main as bootstrap_meta_data_domain
 
 
-def _date_iter(start_date: date, end_date: date):
-    current = start_date
-    while current <= end_date:
-        yield current
-        current = date.fromordinal(current.toordinal() + 1)
+def _coerce_to_date(value: object | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        return date.fromisoformat(value[:10])
+    return None
 
 
-def _resolve_trade_dates() -> tuple[date, date]:
+def _resolve_date_range() -> tuple[date, date]:
     start_date = settings.bootstrap_daily_bar_start_date
     end_date = settings.bootstrap_daily_bar_end_date
 
@@ -64,6 +69,71 @@ def _resolve_trade_dates() -> tuple[date, date]:
         )
 
     return start_date, end_date
+
+
+def _query_trading_calendar_dates(session: Session, start_date: date, end_date: date) -> list[date]:
+    candidates = [
+        ("meta_trading_calendar", "trade_date", "is_open"),
+        ("meta_trading_calendar", "calendar_date", "is_open"),
+        ("meta_trading_calendar", "trade_date", "is_trading_day"),
+        ("meta_trading_calendar", "calendar_date", "is_trading_day"),
+    ]
+
+    for table_name, date_col, open_col in candidates:
+        try:
+            rows = session.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT {date_col} AS trade_date
+                    FROM {table_name}
+                    WHERE {open_col} = TRUE
+                      AND {date_col} BETWEEN :start_date AND :end_date
+                    ORDER BY {date_col}
+                    """
+                ),
+                {"start_date": start_date, "end_date": end_date},
+            ).all()
+        except Exception:
+            continue
+
+        resolved = [_coerce_to_date(row._mapping.get("trade_date")) for row in rows]
+        dates = [trade_date for trade_date in resolved if trade_date is not None]
+        if dates:
+            return dates
+
+    return []
+
+
+def _query_core_daily_bar_dates(session: Session, start_date: date, end_date: date) -> list[date]:
+    try:
+        rows = session.execute(
+            text(
+                """
+                SELECT DISTINCT trade_date
+                FROM core_daily_bar
+                WHERE price_adjust_type = 'RAW'
+                  AND trade_date BETWEEN :start_date AND :end_date
+                ORDER BY trade_date
+                """
+            ),
+            {"start_date": start_date, "end_date": end_date},
+        ).all()
+    except Exception:
+        return []
+
+    resolved = [_coerce_to_date(row._mapping.get("trade_date")) for row in rows]
+    return [trade_date for trade_date in resolved if trade_date is not None]
+
+
+def _resolve_target_trade_dates(session: Session, start_date: date, end_date: date) -> list[date]:
+    calendar_dates = _query_trading_calendar_dates(session, start_date, end_date)
+    if calendar_dates:
+        return calendar_dates
+
+    # Fallback only for damaged/incomplete calendar bootstrap states.  price_limit_daily
+    # is derived from core_daily_bar, so RAW daily-bar dates are still valid trading
+    # evidence and avoid iterating natural-calendar holidays/weekends.
+    return _query_core_daily_bar_dates(session, start_date, end_date)
 
 
 def _resolve_data_version_id(session: Session, preferred_id: int | None = 1) -> int:
@@ -96,8 +166,24 @@ def main() -> None:
             session: Session
 
             data_version_id = _resolve_data_version_id(session=session, preferred_id=1)
+            trade_dates = _resolve_target_trade_dates(session=session, start_date=start_date, end_date=end_date)
 
-            for trade_date in _date_iter(start_date, end_date):
+            if not trade_dates:
+                print(
+                    "[PRICE_LIMIT_DAILY] no trading dates to sync "
+                    f"for range {start_date.isoformat()} -> {end_date.isoformat()}, skipped.",
+                    flush=True,
+                )
+                return
+
+            print(
+                "[PRICE_LIMIT_DAILY] resolved trading dates: "
+                f"{trade_dates[0].isoformat()} -> {trade_dates[-1].isoformat()} "
+                f"count={len(trade_dates)}",
+                flush=True,
+            )
+
+            for trade_date in trade_dates:
                 print(f"[PRICE_LIMIT_DAILY] sync {trade_date.isoformat()}", flush=True)
                 run_sync_price_limit_daily(
                     session=session,
