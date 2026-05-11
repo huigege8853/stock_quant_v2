@@ -26,6 +26,7 @@ CN_A_APP_TIMEZONE = "Asia/Shanghai"
 # present yet.
 DAILY_BAR_SAME_DAY_READY_HOUR = 18
 DAILY_BAR_SAME_DAY_READY_MINUTE = 0
+DERIVED_FROM_DAILY_BAR_DATE_TOPICS = {"price_limit_daily"}
 
 
 @dataclass(frozen=True)
@@ -503,24 +504,29 @@ def run_m2_data_refresh_chain(include_optional: bool = False) -> int:
             print(f"\n[M2][{topic.name}] current_row_count = {row_count}")
             print(f"[M2][{topic.name}] current_max_date = {last_date.isoformat() if last_date else '-'}")
 
-            topic_end_date = daily_bar_end_date if topic.name in {"daily_bar", "adjust_factor"} else latest_trading_day
+            topic_end_date = (
+                daily_bar_end_date
+                if topic.name in DERIVED_FROM_DAILY_BAR_DATE_TOPICS
+                else latest_trading_day
+            )
             if topic_end_date != latest_trading_day:
                 print(
                     f"[M2][{topic.name}] target_end_date adjusted: "
-                    f"{latest_trading_day.isoformat()} -> {topic_end_date.isoformat()}"
+                    f"{latest_trading_day.isoformat()} -> {topic_end_date.isoformat()} "
+                    "because this topic depends on completed core_daily_bar rows"
                 )
 
             start_date = _resolve_incremental_start_date(topic.init_start_date, last_date, row_count)
 
-            if last_date is not None and last_date >= latest_trading_day:
+            if last_date is not None and last_date >= topic_end_date:
                 print(f"[M2][{topic.name}] already up to date, skipped.")
                 continue
 
-            if start_date > latest_trading_day:
+            if start_date > topic_end_date:
                 print(f"[M2][{topic.name}] computed empty range, skipped.")
                 continue
 
-            rc = _run_date_chain_topic(topic, start_date=start_date, end_date=latest_trading_day)
+            rc = _run_date_chain_topic(topic, start_date=start_date, end_date=topic_end_date)
             if rc != 0:
                 print(f"[M2][{topic.name}] incremental update failed (exit_code={rc})")
                 return rc
