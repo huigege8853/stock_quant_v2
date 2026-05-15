@@ -2626,12 +2626,15 @@ class ProductionObservationReportExporter:
                 writer.writerow(row)
 
     def _build_payload(self, report: ResearchPortfolioDailyReport) -> dict[str, Any]:
+        # Production report facts must come from production DB/artifacts first.
+        # Research overview remains a reference block, not the primary fact source.
         overview = self._overview_json("latest_strategy_report.json")
         gate = self._overview_json("latest_gate_decision.json")
         overview_readme = self.overview_dir / "README.md"
         latest_strategy_report_md = self.overview_dir / "latest_strategy_report.md"
 
-        top_signals = overview.get("top_signals") or report.selected_stocks or []
+        production_selected_rows = report.selected_stocks or []
+        research_top_signals = overview.get("top_signals") or []
         industry_focus = overview.get("industry_focus") or []
         by_industry = self._overview_rows("latest_by_industry_performance.csv")
         by_regime = self._overview_rows("latest_by_regime_performance.csv")
@@ -2641,19 +2644,20 @@ class ProductionObservationReportExporter:
         strategy_parameters = self._overview_rows("latest_strategy_parameters.csv")
         sources = self._overview_rows("latest_sources.csv")
 
-        market_state = self._build_market_state(overview)
+        production_db_market = (report.facts or {}).get("db_market") or {}
+        market_state = self._build_market_state(overview, production_db_market)
         strategy_state = self._build_strategy_state(overview)
-        candidate_pool = self._build_candidate_pool(top_signals)
-        paper_execution = self._build_paper_execution(trade_attribution, exit_reasons)
+        candidate_pool = self._build_candidate_pool(production_selected_rows or research_top_signals)
+        paper_execution = self._build_paper_execution(trade_attribution, exit_reasons, report)
         portfolio_snapshot = self._build_portfolio_snapshot(gate, trade_attribution, report)
-        industry_snapshot = self._build_industry_snapshot(industry_focus, by_industry)
+        industry_snapshot = self._build_industry_snapshot(industry_focus, by_industry, candidate_pool)
         regime_snapshot = self._build_regime_snapshot(by_regime)
         human_next_actions = self._build_human_next_actions(next_experiments, report.action_items)
         risk_gates = self._build_risk_gates(gate)
 
         payload: dict[str, Any] = {
             "report_name": "production_observation_daily",
-            "stage": "Stage 6.17c-R1",
+            "stage": "Stage 6.17f",
             "report_date": report.report_date,
             "generated_at": _utc_now_iso(),
             "artifact_only": True,
@@ -2666,6 +2670,11 @@ class ProductionObservationReportExporter:
             "can_trade_live": False,
             "needs_research_review": True,
             "overall_status": "WARN",
+            "source_boundary": {
+                "production_report_primary_source": "production_db_and_production_artifacts",
+                "research_overview_usage": "research_reference_only",
+                "decision": "Do not use research overview as today's production fact source.",
+            },
             "daily_conclusion": self._build_daily_conclusion(
                 market_state=market_state,
                 portfolio_snapshot=portfolio_snapshot,
@@ -2694,6 +2703,18 @@ class ProductionObservationReportExporter:
                     "decision": "Use amount/turnover/liquidity proxies first; formal capital-flow is Stage 7 readiness.",
                 },
             ],
+            "research_reference": {
+                "latest_strategy_report_date": overview.get("report_date"),
+                "latest_strategy_report_generated_at": overview.get("generated_at"),
+                "latest_strategy_report_scope": overview.get("scope"),
+                "latest_gate_decision": gate,
+                "latest_by_industry_performance_rows": len(by_industry),
+                "latest_by_regime_performance_rows": len(by_regime),
+                "latest_trade_attribution_rows": len(trade_attribution),
+                "latest_exit_reason_summary_rows": len(exit_reasons),
+                "latest_next_experiments_rows": len(next_experiments),
+                "note": "Research overview is shown as reference evidence only, not today's production fact source.",
+            },
             "overview_files": {
                 "overview_dir": self.overview_dir,
                 "latest_strategy_report_md": latest_strategy_report_md,
@@ -2728,14 +2749,29 @@ class ProductionObservationReportExporter:
             "next_stage": gate.get("next_stage") or "research_review",
         }
 
-    def _build_market_state(self, overview: dict[str, Any]) -> dict[str, Any]:
+    def _build_market_state(self, overview: dict[str, Any], db_market: dict[str, Any] | None = None) -> dict[str, Any]:
+        db_market = db_market or {}
         market = overview.get("market_regime") or {}
+        breadth = db_market.get("breadth") or {}
+        index_bar = db_market.get("index_bar") or {}
+        daily_bar_summary = db_market.get("daily_bar_summary") or {}
+
+        raw_regime = market.get("latest_raw_market_regime")
+        confirmed_regime = market.get("latest_confirmed_market_regime")
+        has_regime = bool(raw_regime or confirmed_regime)
+        has_db_market = bool(breadth or index_bar or daily_bar_summary)
+
+        status = market.get("status") or overview.get("overall_status")
+        if not status:
+            status = "READY_NO_REGIME" if has_db_market else "MISSING"
+
         return {
-            "status": market.get("status") or overview.get("overall_status") or "UNKNOWN",
+            "status": status,
+            "market_data_status": db_market.get("status"),
             "latest_signal_as_of_date": market.get("latest_signal_as_of_date"),
-            "raw_market_regime": market.get("latest_raw_market_regime"),
-            "confirmed_market_regime": market.get("latest_confirmed_market_regime"),
-            "market_regime_display": market.get("latest_market_regime_display"),
+            "raw_market_regime": raw_regime,
+            "confirmed_market_regime": confirmed_regime,
+            "market_regime_display": market.get("latest_market_regime_display") or confirmed_regime or raw_regime,
             "route_name": market.get("latest_route_name"),
             "regime_days_in_state": market.get("latest_regime_days_in_state"),
             "regime_confidence": market.get("latest_regime_confidence"),
@@ -2743,6 +2779,28 @@ class ProductionObservationReportExporter:
             "reason_code": market.get("latest_regime_reason_code"),
             "raw_market_regime_counts": market.get("raw_market_regime_counts") or {},
             "confirmed_market_regime_counts": market.get("confirmed_market_regime_counts") or {},
+            "market_index_latest_trade_date": index_bar.get("trade_date"),
+            "market_index_close": index_bar.get("close"),
+            "market_index_pct_chg": index_bar.get("pct_chg"),
+            "market_index_amount": index_bar.get("amount"),
+            "breadth_trade_date": breadth.get("trade_date"),
+            "breadth_market_scope": breadth.get("market_scope"),
+            "breadth_universe_count": breadth.get("universe_count"),
+            "breadth_bar_count": breadth.get("bar_count"),
+            "breadth_advancers": breadth.get("advancers"),
+            "breadth_decliners": breadth.get("decliners"),
+            "breadth_unchanged": breadth.get("unchanged"),
+            "breadth_suspended_count": breadth.get("suspended_count"),
+            "breadth_total_turnover_amount_cny": breadth.get("total_turnover_amount_cny"),
+            "breadth_mean_return": breadth.get("mean_return"),
+            "breadth_median_return": breadth.get("median_return"),
+            "daily_bar_latest_trade_date": daily_bar_summary.get("latest_trade_date"),
+            "daily_bar_row_count": daily_bar_summary.get("row_count"),
+            "regime_status_note": (
+                "regime ready" if has_regime else
+                "market data ready but regime signal not mapped into production report"
+                if has_db_market else "market data missing"
+            ),
         }
 
     def _build_strategy_state(self, overview: dict[str, Any]) -> dict[str, Any]:
@@ -2769,17 +2827,61 @@ class ProductionObservationReportExporter:
     def _build_candidate_pool(self, top_signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for row in top_signals[:30]:
+            code = (
+                row.get("instrument_code")
+                or row.get("display_code")
+                or row.get("stock_code")
+                or row.get("security_code")
+            )
+            display_name = (
+                row.get("display_name")
+                or row.get("stock_name")
+                or row.get("instrument_name")
+                or row.get("display_label")
+            )
+            name_text = str(display_name or "")
+            risk_status = row.get("risk_status") or row.get("identity_status") or ""
+            is_st = ("ST" in name_text.upper()) or ("*ST" in name_text.upper()) or ("ST" in str(risk_status).upper())
+            target_weight = row.get("target_weight")
+            target_amount = row.get("target_amount")
+            target_quantity = row.get("target_quantity")
+
+            if is_st:
+                action = "manual_review_blocked_st"
+            else:
+                action = "paper_observation_candidate"
+
+            reason_parts = []
+            if row.get("reason_summary"):
+                reason_parts.append(str(row.get("reason_summary")))
+            if row.get("reason_code"):
+                reason_parts.append(f"reason_code={row.get('reason_code')}")
+            if target_weight not in (None, ""):
+                reason_parts.append(f"target_weight={target_weight}")
+            if target_amount not in (None, ""):
+                reason_parts.append(f"target_amount={target_amount}")
+            if risk_status not in (None, ""):
+                reason_parts.append(f"risk_status={risk_status}")
+            if is_st:
+                reason_parts.append("ST_or_star_ST_detected; manual review required")
+
             rows.append({
-                "rank": row.get("rank_in_batch") or row.get("rank") or row.get("target_rank"),
-                "instrument_code": row.get("instrument_code"),
-                "display_name": row.get("display_name") or row.get("instrument_name"),
-                "industry": row.get("industry") or row.get("industry_tag_name"),
-                "strategy_source": row.get("candidate_strategy_code") or row.get("strategy_source") or "baseline_candidate_pool",
+                "rank": row.get("rank_in_batch") or row.get("rank") or row.get("target_rank") or row.get("rank_no"),
+                "instrument_code": code,
+                "display_name": display_name,
+                "industry": row.get("industry") or row.get("industry_tag_name") or row.get("industry_name"),
+                "strategy_source": row.get("candidate_strategy_code") or row.get("strategy_source") or row.get("row_source") or "production_target_position",
                 "score": row.get("normalized_score") or row.get("candidate_strategy_score") or row.get("score"),
+                "target_weight": target_weight,
+                "target_quantity": target_quantity,
+                "target_amount": target_amount,
                 "confirmed_market_regime": row.get("confirmed_market_regime"),
                 "route_name": row.get("route_name"),
-                "action": "paper_observation_candidate",
-                "reason_summary": row.get("reason_summary") or row.get("reason") or row.get("detail") or "",
+                "risk_status": risk_status,
+                "identity_status": row.get("identity_status"),
+                "action": action,
+                "reason_summary": "；".join(reason_parts),
+                "source": row.get("_source") or row.get("row_source") or "production_artifact",
             })
         return rows
 
@@ -2787,21 +2889,32 @@ class ProductionObservationReportExporter:
         self,
         trade_attribution: list[dict[str, Any]],
         exit_reasons: list[dict[str, Any]],
+        report: ResearchPortfolioDailyReport,
     ) -> dict[str, Any]:
+        # Production daily observation prefers current production portfolio
+        # snapshot rows. Research overview trade attribution is reference only.
         latest_trade_day = trade_attribution[-1] if trade_attribution else {}
+        latest_position_summary = report.position_summary_rows[-1] if report.position_summary_rows else {}
+        latest_date = latest_position_summary.get("snapshot_date") or latest_trade_day.get("trade_date")
+
         return {
             "latest_trade_day": latest_trade_day,
-            "latest_trade_date": latest_trade_day.get("trade_date"),
+            "latest_trade_date": latest_date,
             "buy_count": latest_trade_day.get("buy_count"),
             "sell_count": latest_trade_day.get("sell_count"),
-            "position_count": latest_trade_day.get("position_count"),
-            "ending_cash": latest_trade_day.get("ending_cash"),
-            "gross_exposure": latest_trade_day.get("gross_exposure"),
-            "total_equity": latest_trade_day.get("total_equity"),
+            "position_count": latest_position_summary.get("holding_count") or latest_trade_day.get("position_count"),
+            "ending_cash": latest_position_summary.get("cash_balance") or latest_trade_day.get("ending_cash"),
+            "gross_exposure": latest_position_summary.get("gross_exposure") or latest_trade_day.get("gross_exposure"),
+            "total_equity": latest_position_summary.get("total_equity") or latest_trade_day.get("total_equity"),
+            "daily_pnl": latest_position_summary.get("daily_pnl"),
+            "cumulative_pnl": latest_position_summary.get("cumulative_pnl"),
             "confirmed_market_regime": latest_trade_day.get("confirmed_market_regime"),
             "exit_reason_summary": exit_reasons[:20],
             "trade_attribution_tail": trade_attribution[-10:] if trade_attribution else [],
-            "note": "Counts are paper/backtest observation rows from overview artifacts; they are not live orders.",
+            "note": (
+                "Production position summary is today's production observation fact. "
+                "Research trade attribution is included as reference only; these rows are not live orders."
+            ),
         }
 
     def _build_portfolio_snapshot(
@@ -2814,16 +2927,24 @@ class ProductionObservationReportExporter:
         latest_trade_day = trade_attribution[-1] if trade_attribution else {}
         facts = report.facts or {}
         portfolio = facts.get("portfolio") or {}
+        latest_position_summary = report.position_summary_rows[-1] if report.position_summary_rows else {}
+
         return {
-            "total_equity": latest_trade_day.get("total_equity") or portfolio.get("total_equity"),
-            "ending_cash": latest_trade_day.get("ending_cash") or portfolio.get("cash"),
-            "gross_exposure": latest_trade_day.get("gross_exposure") or portfolio.get("gross_exposure"),
-            "position_count": latest_trade_day.get("position_count") or metrics.get("open_position_count"),
+            "snapshot_date": latest_position_summary.get("snapshot_date") or portfolio.get("snapshot_date"),
+            "total_equity": latest_position_summary.get("total_equity") or latest_trade_day.get("total_equity") or portfolio.get("total_equity"),
+            "ending_cash": latest_position_summary.get("cash_balance") or latest_trade_day.get("ending_cash") or portfolio.get("cash") or portfolio.get("cash_balance"),
+            "cash_balance": latest_position_summary.get("cash_balance") or portfolio.get("cash_balance") or portfolio.get("cash"),
+            "market_value": latest_position_summary.get("market_value") or portfolio.get("market_value"),
+            "gross_exposure": latest_position_summary.get("gross_exposure") or latest_trade_day.get("gross_exposure") or portfolio.get("gross_exposure"),
+            "net_exposure": latest_position_summary.get("net_exposure") or portfolio.get("net_exposure"),
+            "daily_pnl": latest_position_summary.get("daily_pnl"),
+            "cumulative_pnl": latest_position_summary.get("cumulative_pnl"),
+            "position_count": latest_position_summary.get("holding_count") or latest_trade_day.get("position_count") or metrics.get("open_position_count"),
+            "open_position_count": latest_position_summary.get("holding_count") or metrics.get("open_position_count"),
             "trade_count": metrics.get("trade_count"),
             "buy_count": metrics.get("buy_count"),
             "sell_count": metrics.get("sell_count"),
             "closed_position_count": metrics.get("closed_position_count"),
-            "open_position_count": metrics.get("open_position_count"),
             "realized_pnl": metrics.get("realized_pnl"),
             "realized_return": metrics.get("realized_return"),
             "win_rate": metrics.get("win_rate"),
@@ -2836,12 +2957,47 @@ class ProductionObservationReportExporter:
         self,
         industry_focus: list[dict[str, Any]],
         by_industry: list[dict[str, Any]],
+        candidate_pool: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        candidate_pool = candidate_pool or []
+        counts: Counter[str] = Counter()
+        for row in candidate_pool:
+            industry = row.get("industry") or "UNKNOWN"
+            counts[str(industry)] += 1
+
+        production_candidate_industries = [
+            {"industry": industry, "candidate_count": count, "source": "production_candidate_pool"}
+            for industry, count in counts.most_common(15)
+            if industry and industry != "UNKNOWN"
+        ]
+
+        missing_industry_count = counts.get("UNKNOWN", 0)
+
+        strong_industries = production_candidate_industries or [
+            {
+                "industry": row.get("industry"),
+                "selected_count_in_latest_top20": row.get("selected_count_in_latest_top20"),
+                "avg_industry_strength_20": row.get("avg_industry_strength_20"),
+                "source": "research_overview_reference",
+            }
+            for row in industry_focus[:15]
+        ]
+
+        loss_industries = [
+            {**row, "source": "research_overview_reference"}
+            for row in by_industry[:15]
+        ]
+
         return {
-            "strong_industries": industry_focus[:15],
-            "loss_industries": by_industry[:15],
+            "strong_industries": strong_industries,
+            "loss_industries": loss_industries,
             "industry_rows": by_industry,
-            "note": "Strong industries come from latest overview signal focus; loss industries come from closed paper/backtest attribution.",
+            "production_candidate_industries": production_candidate_industries,
+            "missing_industry_count": missing_industry_count,
+            "note": (
+                "Production candidate industry counts are current production facts when available. "
+                "Research by-industry attribution is reference-only and must not be treated as today's production industry state."
+            ),
         }
 
     def _build_regime_snapshot(self, by_regime: list[dict[str, Any]]) -> dict[str, Any]:
