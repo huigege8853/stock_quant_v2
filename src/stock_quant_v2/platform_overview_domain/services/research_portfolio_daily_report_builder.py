@@ -2602,6 +2602,29 @@ class ProductionObservationReportExporter:
         path = self.overview_dir / name
         return _read_csv_rows(path)
 
+    def _write_rows(self, path: Path, rows: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        normalized_rows = [
+            row if isinstance(row, dict) else {"value": row}
+            for row in (rows or [])
+        ]
+
+        fieldnames: list[str] = []
+        for row in normalized_rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        if not fieldnames:
+            fieldnames = ["empty"]
+
+        with path.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in normalized_rows:
+                writer.writerow(row)
+
     def _build_payload(self, report: ResearchPortfolioDailyReport) -> dict[str, Any]:
         overview = self._overview_json("latest_strategy_report.json")
         gate = self._overview_json("latest_gate_decision.json")
