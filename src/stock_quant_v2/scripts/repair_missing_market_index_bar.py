@@ -265,3 +265,7 @@ if __name__ == "__main__":
             raise
         finally:
             session.close()
+
+
+if __name__ == "__main__":
+    main()

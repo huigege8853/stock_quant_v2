@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 
 from stock_quant_v2.config.settings import settings
+from stock_quant_v2.data_domain.repositories.run_repository import RunRepository
+from stock_quant_v2.data_domain.tasks.sync_instrument_status_daily import run_sync_instrument_status_daily
+from stock_quant_v2.data_domain.tasks.sync_market_breadth import run_sync_market_breadth
+from stock_quant_v2.data_domain.tasks.sync_market_index_bar import run_sync_market_index_bar
+from stock_quant_v2.db.session import SessionLocal
 
 
 DAILY_BAR_TAIL_SCAN_TRADING_DAYS = 10
@@ -77,25 +83,35 @@ SYMBOL_RANGE_TOPICS: list[SymbolRangeTopic] = [
 
 DATE_CHAIN_TOPICS: list[DateChainTopic] = [
     DateChainTopic(
-        name="instrument_status_daily",
-        table_name="core_instrument_status_daily",
-        date_column="trade_date",
-        bootstrap_module="stock_quant_v2.scripts.bootstrap_instrument_status_daily_first_chain",
-        init_start_date=settings.bootstrap_daily_bar_start_date,
-    ),
-    DateChainTopic(
         name="price_limit_daily",
         table_name="core_price_limit_daily",
         date_column="trade_date",
         bootstrap_module="stock_quant_v2.scripts.bootstrap_price_limit_daily_first_chain",
         init_start_date=settings.bootstrap_daily_bar_start_date,
     ),
+]
+
+UPPER_LAYER_DATE_TOPICS: list[DateChainTopic] = [
+    DateChainTopic(
+        name="instrument_status_daily",
+        table_name="core_instrument_status_daily",
+        date_column="trade_date",
+        bootstrap_module="stock_quant_v2.data_domain.tasks.sync_instrument_status_daily",
+        init_start_date=settings.bootstrap_daily_bar_start_date,
+    ),
     DateChainTopic(
         name="market_index_bar",
-        table_name="core_market_index_bar",
+        table_name="market_index_bar",
         date_column="trade_date",
-        bootstrap_module="stock_quant_v2.scripts.bootstrap_market_index_first_chain",
+        bootstrap_module="stock_quant_v2.data_domain.tasks.sync_market_index_bar",
         init_start_date=settings.bootstrap_daily_bar_start_date,
+    ),
+    DateChainTopic(
+        name="market_breadth",
+        table_name="core_market_breadth",
+        date_column="trade_date",
+        bootstrap_module="stock_quant_v2.data_domain.tasks.sync_market_breadth",
+        init_start_date=date(2024, 1, 2),
     ),
 ]
 
@@ -230,6 +246,43 @@ class DatabaseInspector:
     def row_count(self, table_name: str) -> int | None:
         value = self._safe_scalar(f"SELECT COUNT(*) FROM {table_name}")
         return int(value) if value is not None else None
+
+    def latest_data_version_id(self) -> int | None:
+        value = self._safe_scalar("SELECT MAX(id) FROM meta_data_version")
+        return int(value) if value is not None else None
+
+    def open_trading_days(self, start_date: date, end_date: date) -> list[date]:
+        candidates = [
+            ("meta_trading_calendar", "trade_date", "is_open"),
+            ("meta_trading_calendar", "calendar_date", "is_open"),
+            ("meta_trading_calendar", "trade_date", "is_trading_day"),
+            ("meta_trading_calendar", "calendar_date", "is_trading_day"),
+        ]
+
+        for table_name, date_col, open_col in candidates:
+            sql = f"""
+            SELECT DISTINCT {date_col} AS trade_date
+            FROM {table_name}
+            WHERE {open_col} = TRUE
+              AND {date_col} BETWEEN :start_date AND :end_date
+            ORDER BY {date_col}
+            """
+            rows = self._safe_rows(sql, {"start_date": start_date, "end_date": end_date})
+            dates = [self._coerce_to_date(row.get("trade_date")) for row in rows]
+            resolved = [d for d in dates if d is not None]
+            if resolved:
+                return resolved
+
+        fallback_sql = """
+        SELECT DISTINCT trade_date
+        FROM core_daily_bar
+        WHERE price_adjust_type = 'RAW'
+          AND trade_date BETWEEN :start_date AND :end_date
+        ORDER BY trade_date
+        """
+        rows = self._safe_rows(fallback_sql, {"start_date": start_date, "end_date": end_date})
+        dates = [self._coerce_to_date(row.get("trade_date")) for row in rows]
+        return [d for d in dates if d is not None]
 
     def recent_trading_days(self, end_date: date, limit: int) -> list[date]:
         candidates = [
@@ -395,6 +448,222 @@ def _run_date_chain_topic(topic: DateChainTopic, start_date: date, end_date: dat
     )
 
 
+def _parse_market_index_codes(value: str | None) -> list[str]:
+    if not value:
+        return ["000001.SH", "399001.SZ", "399006.SZ", "000300.SH"]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _latest_data_version_id(session: Session) -> int:
+    value = session.execute(text("SELECT MAX(id) FROM meta_data_version")).scalar_one_or_none()
+    if value is None:
+        raise RuntimeError("meta_data_version is empty; cannot refresh upper-layer data")
+    return int(value)
+
+
+def _create_upper_layer_run(session: Session, topic_name: str, start_date: date, end_date: date):
+    run_repo = RunRepository()
+    run = run_repo.create_run(
+        session=session,
+        run_type="DATA_SYNC",
+        run_name=f"m2_daily_upper_{topic_name}",
+        trigger_type="DAILY_RUNTIME",
+        context_json={
+            "stage": "Stage 6.16e",
+            "topic": topic_name,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "guardrails": [
+                "production_daily_runtime",
+                "sync_to_research_required",
+                "no_strategy_signal",
+                "no_m6",
+                "no_live_trade",
+            ],
+        },
+    )
+    run_repo.mark_run_running(session, run)
+    session.commit()
+    return run_repo, run
+
+
+def _finish_upper_layer_run(
+    session: Session,
+    run_repo: RunRepository,
+    run,
+    *,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    run = session.get(type(run), run.id)
+    if run is not None:
+        run_repo.mark_run_finished(
+            session=session,
+            run=run,
+            status=status,
+            error_message=error_message,
+        )
+        session.commit()
+
+
+def _run_market_index_bar_upper_layer(start_date: date, end_date: date) -> int:
+    print(
+        f"[M2][market_index_bar] upper-layer daily update: "
+        f"{start_date.isoformat()} -> {end_date.isoformat()}"
+    )
+
+    seed_rc = _run_module("stock_quant_v2.scripts.seed_market_index_core_universe")
+    if seed_rc != 0:
+        print(f"[M2][market_index_bar] seed_market_index_core_universe failed (exit_code={seed_rc})")
+        return seed_rc
+
+    index_codes = _parse_market_index_codes(os.environ.get("BOOTSTRAP_MARKET_INDEX_CODES"))
+
+    session = SessionLocal()
+    run_repo = None
+    run = None
+    try:
+        run_repo, run = _create_upper_layer_run(session, "market_index_bar", start_date, end_date)
+        result = run_sync_market_index_bar(
+            session=session,
+            sina_api_client=None,
+            run_id=run.id,
+            start_date=start_date,
+            end_date=end_date,
+            index_codes=index_codes,
+            provider_name=os.environ.get("BOOTSTRAP_MARKET_INDEX_PROVIDER", "fallback"),
+            sync_mode="INCREMENTAL",
+        )
+        print(f"[M2][market_index_bar] result={result}")
+        status = "SUCCESS" if int(result.get("error_rows") or 0) == 0 else "PARTIAL"
+        _finish_upper_layer_run(session, run_repo, run, status=status)
+        return 0 if status == "SUCCESS" else 1
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        if run_repo is not None and run is not None:
+            try:
+                _finish_upper_layer_run(session, run_repo, run, status="FAILED", error_message=str(exc))
+            except Exception:
+                session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _run_instrument_status_upper_layer(inspector: DatabaseInspector, start_date: date, end_date: date) -> int:
+    print(
+        f"[M2][instrument_status_daily] upper-layer daily update: "
+        f"{start_date.isoformat()} -> {end_date.isoformat()}"
+    )
+
+    trade_dates = inspector.open_trading_days(start_date, end_date)
+    if not trade_dates:
+        print("[M2][instrument_status_daily] no open trading days, skipped.")
+        return 0
+
+    session = SessionLocal()
+    run_repo = None
+    run = None
+    try:
+        data_version_id = _latest_data_version_id(session)
+        run_repo, run = _create_upper_layer_run(session, "instrument_status_daily", start_date, end_date)
+
+        done = 0
+        for trade_date in trade_dates:
+            run_sync_instrument_status_daily(
+                session=session,
+                run_id=run.id,
+                data_version_id=data_version_id,
+                trade_date=trade_date,
+            )
+            done += 1
+            if done % 20 == 0 or done == len(trade_dates):
+                print(
+                    f"[M2][instrument_status_daily] progress "
+                    f"{done}/{len(trade_dates)} current_date={trade_date.isoformat()}",
+                    flush=True,
+                )
+
+        _finish_upper_layer_run(session, run_repo, run, status="SUCCESS")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        if run_repo is not None and run is not None:
+            try:
+                _finish_upper_layer_run(session, run_repo, run, status="FAILED", error_message=str(exc))
+            except Exception:
+                session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _run_market_breadth_upper_layer(inspector: DatabaseInspector, start_date: date, end_date: date) -> int:
+    print(
+        f"[M2][market_breadth] upper-layer daily update: "
+        f"{start_date.isoformat()} -> {end_date.isoformat()}"
+    )
+
+    trade_dates = inspector.open_trading_days(start_date, end_date)
+    if not trade_dates:
+        print("[M2][market_breadth] no open trading days, skipped.")
+        return 0
+
+    session = SessionLocal()
+    run_repo = None
+    run = None
+    try:
+        data_version_id = _latest_data_version_id(session)
+        run_repo, run = _create_upper_layer_run(session, "market_breadth", start_date, end_date)
+
+        done = 0
+        for trade_date in trade_dates:
+            run_sync_market_breadth(
+                session=session,
+                run_id=run.id,
+                trade_date=trade_date,
+                market_scope="CN_A",
+                exchange_codes=("SSE", "SZSE", "BSE"),
+                data_version_id=data_version_id,
+            )
+            done += 1
+            if done % 20 == 0 or done == len(trade_dates):
+                print(
+                    f"[M2][market_breadth] progress "
+                    f"{done}/{len(trade_dates)} current_date={trade_date.isoformat()}",
+                    flush=True,
+                )
+
+        _finish_upper_layer_run(session, run_repo, run, status="SUCCESS")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        if run_repo is not None and run is not None:
+            try:
+                _finish_upper_layer_run(session, run_repo, run, status="FAILED", error_message=str(exc))
+            except Exception:
+                session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def _run_upper_layer_date_topic(
+    inspector: DatabaseInspector,
+    topic: DateChainTopic,
+    start_date: date,
+    end_date: date,
+) -> int:
+    if topic.name == "market_index_bar":
+        return _run_market_index_bar_upper_layer(start_date, end_date)
+    if topic.name == "instrument_status_daily":
+        return _run_instrument_status_upper_layer(inspector, start_date, end_date)
+    if topic.name == "market_breadth":
+        return _run_market_breadth_upper_layer(inspector, start_date, end_date)
+
+    raise ValueError(f"Unsupported upper-layer topic: {topic.name}")
+
+
 def run_m2_data_refresh_chain(include_optional: bool = False) -> int:
     inspector = DatabaseInspector(str(settings.postgres_v2_url))
     try:
@@ -532,6 +801,40 @@ def run_m2_data_refresh_chain(include_optional: bool = False) -> int:
                 return rc
 
             print(f"[M2][{topic.name}] incremental update succeeded.")
+
+        # 3) 已验证的顶层基础数据进入生产 daily runtime。
+        #    铁律：生产 daily 生成的基础数据，必须由 production -> research sync 同步到研究库。
+        for topic in UPPER_LAYER_DATE_TOPICS:
+            row_count = inspector.row_count(topic.table_name)
+            last_date = inspector.max_date(topic.table_name, topic.date_column)
+
+            print(f"\n[M2][{topic.name}] current_row_count = {row_count}")
+            print(f"[M2][{topic.name}] current_max_date = {last_date.isoformat() if last_date else '-'}")
+
+            # These P0 upper-layer datasets should align with the latest completed daily_bar date.
+            topic_end_date = daily_bar_end_date
+
+            start_date = _resolve_incremental_start_date(topic.init_start_date, last_date, row_count)
+
+            if last_date is not None and last_date >= topic_end_date:
+                print(f"[M2][{topic.name}] already up to date, skipped.")
+                continue
+
+            if start_date > topic_end_date:
+                print(f"[M2][{topic.name}] computed empty range, skipped.")
+                continue
+
+            rc = _run_upper_layer_date_topic(
+                inspector=inspector,
+                topic=topic,
+                start_date=start_date,
+                end_date=topic_end_date,
+            )
+            if rc != 0:
+                print(f"[M2][{topic.name}] upper-layer update failed (exit_code={rc})")
+                return rc
+
+            print(f"[M2][{topic.name}] upper-layer update succeeded.")
 
         print("\n[M2] Data refresh chain completed successfully.")
         print("[M2] Next action: run sql/m2_2_acceptance.sql before moving to M3.")
