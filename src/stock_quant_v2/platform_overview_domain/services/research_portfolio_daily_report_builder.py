@@ -2536,17 +2536,29 @@ class ResearchPortfolioDailyReportExporter:
                     safe_row[key] = value
                 writer.writerow(safe_row)
 
-class ProductionObservationReportExporter(ResearchPortfolioDailyReportExporter):
-    """Export the research/portfolio report as a production observation report MVP.
 
-    This exporter deliberately reuses the existing M9 research portfolio daily
-    report facts instead of creating a parallel reporting framework. The output
-    is artifact-only: it does not write DB rows, create trading signals, route to
-    M6, or authorize live trading.
+class ProductionObservationReportExporter:
+    """Export a production-facing daily observation report from overview artifacts.
+
+    Stage 6.17c-R1 changes the report contract from "research report wrapper"
+    to "daily observation front page".  The exporter still reuses the existing
+    M9 task flow: BuildResearchPortfolioDailyReport first refreshes
+    overview/latest_* artifacts, then this exporter reads those artifacts and
+    mirrors them into artifacts/m9/production_observation.
+
+    It is artifact-only.  It does not write database rows, create signals,
+    route to M6, or authorize live trading.
     """
 
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, overview_dir: Path | None = None):
         self.output_dir = Path(output_dir)
+        if overview_dir is None:
+            # output_dir is normally <repo_root>/artifacts/m9/production_observation
+            try:
+                overview_dir = self.output_dir.parents[2] / "overview"
+            except IndexError:
+                overview_dir = Path("overview")
+        self.overview_dir = Path(overview_dir)
 
     def export(self, report: ResearchPortfolioDailyReport) -> dict[str, Path]:
         by_date_dir = self.output_dir / "by_date" / report.report_date
@@ -2582,229 +2594,540 @@ class ProductionObservationReportExporter(ResearchPortfolioDailyReportExporter):
         outputs.update({f"production_observation_latest_section_{k}": v for k, v in latest_section_outputs.items()})
         return outputs
 
+    def _overview_json(self, name: str) -> dict[str, Any]:
+        path = self.overview_dir / name
+        return _read_json(path)
+
+    def _overview_rows(self, name: str) -> list[dict[str, Any]]:
+        path = self.overview_dir / name
+        return _read_csv_rows(path)
+
     def _build_payload(self, report: ResearchPortfolioDailyReport) -> dict[str, Any]:
-        facts = report.facts or {}
-        selected = facts.get("selected") or {}
-        portfolio = facts.get("portfolio") or {}
-        positions = facts.get("positions") or {}
-        market = facts.get("market") or {}
-        db_market = facts.get("db_market") or {}
-        risk = facts.get("risk") or {}
-        backtest = facts.get("backtest") or {}
-        strategy = facts.get("strategy") or {}
-        status_layers = facts.get("status_layers") or {}
+        overview = self._overview_json("latest_strategy_report.json")
+        gate = self._overview_json("latest_gate_decision.json")
+        overview_readme = self.overview_dir / "README.md"
+        latest_strategy_report_md = self.overview_dir / "latest_strategy_report.md"
 
-        gates = [
-            {
-                "gate": "can_publish_report_to_production",
-                "value": True,
-                "status": "PASS",
-                "reason": "This is an observation/report artifact and can be published to production.",
-            },
-            {
-                "gate": "can_publish_strategy_to_production",
-                "value": False,
-                "status": "BLOCKED",
-                "reason": "Strategy has not passed M6 promotion gates; report is not strategy productionization.",
-            },
-            {
-                "gate": "can_route_to_m6",
-                "value": False,
-                "status": "BLOCKED",
-                "reason": "M6 requires full sample-out validation, attribution, drawdown/Sharpe/cost gates, and human review.",
-            },
-            {
-                "gate": "can_trade_live",
-                "value": False,
-                "status": "BLOCKED",
-                "reason": "This stage is paper/observation only and must not trigger live trading.",
-            },
-            {
-                "gate": "needs_research_review",
-                "value": True,
-                "status": "REQUIRED",
-                "reason": "The report is intended to reveal research follow-up items before any promotion decision.",
-            },
-        ]
+        top_signals = overview.get("top_signals") or report.selected_stocks or []
+        industry_focus = overview.get("industry_focus") or []
+        by_industry = self._overview_rows("latest_by_industry_performance.csv")
+        by_regime = self._overview_rows("latest_by_regime_performance.csv")
+        exit_reasons = self._overview_rows("latest_exit_reason_summary.csv")
+        trade_attribution = self._overview_rows("latest_trade_attribution.csv")
+        next_experiments = self._overview_rows("latest_next_experiments.csv")
+        strategy_parameters = self._overview_rows("latest_strategy_parameters.csv")
+        sources = self._overview_rows("latest_sources.csv")
 
-        data_sources = [
-            {
-                "layer": "L0_data_quality",
-                "dataset": "core_daily_bar/core_adjust_factor/core_price_limit_daily/core_instrument_status_daily",
-                "status": "READY_OR_SYNCED",
-                "usage": "Data freshness, tradability, ST/suspension/listing status and limit checks.",
-            },
-            {
-                "layer": "L1_market_state",
-                "dataset": "market_index_bar",
-                "status": "READY_OR_SYNCED",
-                "usage": "Index and market regime context.",
-            },
-            {
-                "layer": "L2_risk_budget",
-                "dataset": "risk/execution policy artifacts",
-                "status": "PARTIAL_READY",
-                "usage": "Position cap, cash preference and new-entry allowance display.",
-            },
-            {
-                "layer": "L3_strategy_allocator",
-                "dataset": "candidate_strategy_policies / strategy artifacts",
-                "status": "PARTIAL_READY",
-                "usage": "Strategy enable/disable/observation-only display.",
-            },
-            {
-                "layer": "L4_market_breadth",
-                "dataset": "core_market_breadth",
-                "status": "READY_OR_SYNCED",
-                "usage": "Breadth, limit structure and market赚钱效应.",
-            },
-            {
-                "layer": "L5_liquidity_volatility",
-                "dataset": "feat_tradability_score / feat_volatility_rank_20 / amount / turnover proxy",
-                "status": "PARTIAL_READY",
-                "usage": "Trading difficulty, liquidity shrinkage and volatility environment.",
-            },
-            {
-                "layer": "L6_industry_structure",
-                "dataset": "industry features / candidate industry tags",
-                "status": "PARTIAL_READY",
-                "usage": "Industry strength, concentration and industry exposure.",
-            },
-            {
-                "layer": "L7_concept_theme",
-                "dataset": "concept_strength / capital_flow",
-                "status": "NOT_READY_STAGE7_BACKLOG",
-                "usage": "Displayed as readiness gap only; not used for buy/sell decisions in this MVP.",
-            },
-            {
-                "layer": "L8_style_environment",
-                "dataset": "feat_mom_20 / feat_trend_strength_20 / feat_volatility_rank_20",
-                "status": "PARTIAL_READY",
-                "usage": "Style proxy and factor tailwind/headwind.",
-            },
-            {
-                "layer": "L9_portfolio_exposure",
-                "dataset": "paper portfolio / dry-run / position lifecycle artifacts",
-                "status": "PARTIAL_READY",
-                "usage": "Paper exposure, cash, concentration and PnL display.",
-            },
-        ]
+        market_state = self._build_market_state(overview)
+        strategy_state = self._build_strategy_state(overview)
+        candidate_pool = self._build_candidate_pool(top_signals)
+        paper_execution = self._build_paper_execution(trade_attribution, exit_reasons)
+        portfolio_snapshot = self._build_portfolio_snapshot(gate, trade_attribution, report)
+        industry_snapshot = self._build_industry_snapshot(industry_focus, by_industry)
+        regime_snapshot = self._build_regime_snapshot(by_regime)
+        human_next_actions = self._build_human_next_actions(next_experiments, report.action_items)
+        risk_gates = self._build_risk_gates(gate)
 
-        executive_summary = {
-            "report_date": report.report_date,
-            "generated_at": report.generated_at,
-            "overall_status": report.overall_status,
-            "scope": "Production Observation Report MVP",
-            "market_status": (market.get("status") or db_market.get("status") or "UNKNOWN"),
-            "strategy_code": strategy.get("strategy_code"),
-            "strategy_version_code": strategy.get("version_code"),
-            "selected_count": selected.get("selected_count") or selected.get("target_count") or len(report.selected_stocks),
-            "position_count": positions.get("position_count") or len(report.position_summary_rows),
-            "cash": portfolio.get("cash"),
-            "total_equity": portfolio.get("total_equity"),
-            "total_return": backtest.get("total_return"),
-            "max_drawdown": backtest.get("max_drawdown"),
-            "risk_status": risk.get("status"),
-            "final_review_conclusion": status_layers.get("FINAL_REVIEW_CONCLUSION"),
-        }
-
-        return {
-            "stage": "Stage 6.17c",
-            "name": "production_observation_report_mvp",
+        payload: dict[str, Any] = {
+            "report_name": "production_observation_daily",
+            "stage": "Stage 6.17c-R1",
             "report_date": report.report_date,
             "generated_at": _utc_now_iso(),
             "artifact_only": True,
             "not_m6": True,
             "not_stage7": True,
             "db_write_rows": 0,
+            "can_publish_report_to_production": True,
+            "can_publish_strategy_to_production": False,
+            "can_route_to_m6": False,
             "can_trade_live": False,
-            "gates": gates,
-            "executive_summary": executive_summary,
-            "data_sources": data_sources,
-            "status_layers": status_layers,
-            "sections": [s.__dict__ for s in report.sections],
-            "selected_stocks": report.selected_stocks,
-            "position_summary_rows": report.position_summary_rows,
-            "action_items": report.action_items,
-            "sources": [s.__dict__ for s in report.sources],
-            "facts": facts,
+            "needs_research_review": True,
+            "overall_status": "WARN",
+            "daily_conclusion": self._build_daily_conclusion(
+                market_state=market_state,
+                portfolio_snapshot=portfolio_snapshot,
+                risk_gates=risk_gates,
+                candidate_count=len(candidate_pool),
+            ),
+            "market_state": market_state,
+            "strategy_state": strategy_state,
+            "regime_snapshot": regime_snapshot,
+            "industry_snapshot": industry_snapshot,
+            "candidate_pool": candidate_pool,
+            "paper_execution": paper_execution,
+            "portfolio_snapshot": portfolio_snapshot,
+            "risk_gates": risk_gates,
+            "human_next_actions": human_next_actions,
+            "data_readiness": self._build_data_readiness(),
+            "stage7_backlog": [
+                {
+                    "domain": "concept_strength",
+                    "status": "NOT_READY_STAGE7_BACKLOG",
+                    "decision": "Only display readiness gap in this report; do not use it for buy/sell decisions.",
+                },
+                {
+                    "domain": "capital_flow",
+                    "status": "NOT_READY_STAGE7_BACKLOG",
+                    "decision": "Use amount/turnover/liquidity proxies first; formal capital-flow is Stage 7 readiness.",
+                },
+            ],
+            "overview_files": {
+                "overview_dir": self.overview_dir,
+                "latest_strategy_report_md": latest_strategy_report_md,
+                "latest_strategy_report_json": self.overview_dir / "latest_strategy_report.json",
+                "latest_gate_decision": self.overview_dir / "latest_gate_decision.json",
+                "readme": overview_readme,
+            },
+            "overview_source_status": {
+                "latest_strategy_report_json_exists": (self.overview_dir / "latest_strategy_report.json").exists(),
+                "latest_strategy_report_md_exists": latest_strategy_report_md.exists(),
+                "latest_gate_decision_exists": (self.overview_dir / "latest_gate_decision.json").exists(),
+            },
+            "strategy_parameters": strategy_parameters,
+            "sources": sources or [s.__dict__ for s in report.sources],
+            "boundary": (
+                "Production observation and paper review only. "
+                "Not M6, not strategy productionization, not live trading."
+            ),
         }
+        return payload
+
+    def _build_risk_gates(self, gate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "can_publish_report_to_production": True,
+            "can_publish_strategy_to_production": False,
+            "can_route_to_m6": False,
+            "can_trade_live": False,
+            "needs_research_review": True,
+            "overview_can_enter_m6": bool(gate.get("can_enter_m6")),
+            "overview_can_claim_strategy_effective": bool(gate.get("can_claim_strategy_effective")),
+            "overview_gate_reason": gate.get("gate_reason") or gate.get("reason") or "",
+            "next_stage": gate.get("next_stage") or "research_review",
+        }
+
+    def _build_market_state(self, overview: dict[str, Any]) -> dict[str, Any]:
+        market = overview.get("market_regime") or {}
+        return {
+            "status": market.get("status") or overview.get("overall_status") or "UNKNOWN",
+            "latest_signal_as_of_date": market.get("latest_signal_as_of_date"),
+            "raw_market_regime": market.get("latest_raw_market_regime"),
+            "confirmed_market_regime": market.get("latest_confirmed_market_regime"),
+            "market_regime_display": market.get("latest_market_regime_display"),
+            "route_name": market.get("latest_route_name"),
+            "regime_days_in_state": market.get("latest_regime_days_in_state"),
+            "regime_confidence": market.get("latest_regime_confidence"),
+            "transition_flag": market.get("latest_regime_transition_flag"),
+            "reason_code": market.get("latest_regime_reason_code"),
+            "raw_market_regime_counts": market.get("raw_market_regime_counts") or {},
+            "confirmed_market_regime_counts": market.get("confirmed_market_regime_counts") or {},
+        }
+
+    def _build_strategy_state(self, overview: dict[str, Any]) -> dict[str, Any]:
+        strategy = overview.get("strategy") or {}
+        backtest = overview.get("backtest") or {}
+        diagnostics = overview.get("diagnostics") or {}
+        return {
+            "strategy_code": strategy.get("strategy_code"),
+            "strategy_name": strategy.get("strategy_name"),
+            "strategy_version_code": strategy.get("strategy_version_code"),
+            "strategy_version_id": strategy.get("strategy_version_id"),
+            "source_signal_run_id": strategy.get("source_signal_run_id"),
+            "concept_strength_enabled": strategy.get("concept_strength_enabled"),
+            "backtest_run_id": backtest.get("run_id"),
+            "backtest_request_id": backtest.get("backtest_request_id"),
+            "total_return": backtest.get("total_return"),
+            "max_drawdown": backtest.get("max_drawdown"),
+            "sharpe_ratio": backtest.get("sharpe_ratio"),
+            "performance_claim_allowed": diagnostics.get("performance_claim_allowed"),
+            "quality_warning_codes": diagnostics.get("quality_warning_codes"),
+            "main_interpretation": diagnostics.get("main_interpretation"),
+        }
+
+    def _build_candidate_pool(self, top_signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in top_signals[:30]:
+            rows.append({
+                "rank": row.get("rank_in_batch") or row.get("rank") or row.get("target_rank"),
+                "instrument_code": row.get("instrument_code"),
+                "display_name": row.get("display_name") or row.get("instrument_name"),
+                "industry": row.get("industry") or row.get("industry_tag_name"),
+                "strategy_source": row.get("candidate_strategy_code") or row.get("strategy_source") or "baseline_candidate_pool",
+                "score": row.get("normalized_score") or row.get("candidate_strategy_score") or row.get("score"),
+                "confirmed_market_regime": row.get("confirmed_market_regime"),
+                "route_name": row.get("route_name"),
+                "action": "paper_observation_candidate",
+                "reason_summary": row.get("reason_summary") or row.get("reason") or row.get("detail") or "",
+            })
+        return rows
+
+    def _build_paper_execution(
+        self,
+        trade_attribution: list[dict[str, Any]],
+        exit_reasons: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        latest_trade_day = trade_attribution[-1] if trade_attribution else {}
+        return {
+            "latest_trade_day": latest_trade_day,
+            "latest_trade_date": latest_trade_day.get("trade_date"),
+            "buy_count": latest_trade_day.get("buy_count"),
+            "sell_count": latest_trade_day.get("sell_count"),
+            "position_count": latest_trade_day.get("position_count"),
+            "ending_cash": latest_trade_day.get("ending_cash"),
+            "gross_exposure": latest_trade_day.get("gross_exposure"),
+            "total_equity": latest_trade_day.get("total_equity"),
+            "confirmed_market_regime": latest_trade_day.get("confirmed_market_regime"),
+            "exit_reason_summary": exit_reasons[:20],
+            "trade_attribution_tail": trade_attribution[-10:] if trade_attribution else [],
+            "note": "Counts are paper/backtest observation rows from overview artifacts; they are not live orders.",
+        }
+
+    def _build_portfolio_snapshot(
+        self,
+        gate: dict[str, Any],
+        trade_attribution: list[dict[str, Any]],
+        report: ResearchPortfolioDailyReport,
+    ) -> dict[str, Any]:
+        metrics = gate.get("metrics") or {}
+        latest_trade_day = trade_attribution[-1] if trade_attribution else {}
+        facts = report.facts or {}
+        portfolio = facts.get("portfolio") or {}
+        return {
+            "total_equity": latest_trade_day.get("total_equity") or portfolio.get("total_equity"),
+            "ending_cash": latest_trade_day.get("ending_cash") or portfolio.get("cash"),
+            "gross_exposure": latest_trade_day.get("gross_exposure") or portfolio.get("gross_exposure"),
+            "position_count": latest_trade_day.get("position_count") or metrics.get("open_position_count"),
+            "trade_count": metrics.get("trade_count"),
+            "buy_count": metrics.get("buy_count"),
+            "sell_count": metrics.get("sell_count"),
+            "closed_position_count": metrics.get("closed_position_count"),
+            "open_position_count": metrics.get("open_position_count"),
+            "realized_pnl": metrics.get("realized_pnl"),
+            "realized_return": metrics.get("realized_return"),
+            "win_rate": metrics.get("win_rate"),
+            "avg_holding_days": metrics.get("avg_holding_days"),
+            "hard_stop_loss_realized_pnl": metrics.get("hard_stop_loss_realized_pnl"),
+            "hard_stop_loss_closed_position_count": metrics.get("hard_stop_loss_closed_position_count"),
+        }
+
+    def _build_industry_snapshot(
+        self,
+        industry_focus: list[dict[str, Any]],
+        by_industry: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "strong_industries": industry_focus[:15],
+            "loss_industries": by_industry[:15],
+            "industry_rows": by_industry,
+            "note": "Strong industries come from latest overview signal focus; loss industries come from closed paper/backtest attribution.",
+        }
+
+    def _build_regime_snapshot(self, by_regime: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "by_regime_performance": by_regime,
+            "note": "Regime rows are closed trade attribution only and are not a live-trading claim.",
+        }
+
+    def _build_human_next_actions(
+        self,
+        next_experiments: list[dict[str, Any]],
+        action_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in next_experiments[:10]:
+            rows.append({
+                "source": "overview_latest_next_experiments",
+                "priority": row.get("priority"),
+                "action": row.get("experiment_code") or row.get("what_to_change"),
+                "reason": row.get("reason") or row.get("why"),
+                "allowed_now": row.get("allowed_now"),
+            })
+        for row in action_items[:10]:
+            rows.append({
+                "source": "research_portfolio_daily_action_items",
+                "priority": row.get("priority") or row.get("severity"),
+                "action": row.get("action") or row.get("item") or row.get("title"),
+                "reason": row.get("reason") or row.get("summary"),
+                "allowed_now": row.get("allowed_now"),
+            })
+        if not rows:
+            rows.append({
+                "source": "system",
+                "priority": "P0",
+                "action": "人工复核生产观察日报，确认下一步研究对象。",
+                "reason": "当前报告只允许观察，不允许实盘或 M6 晋级。",
+                "allowed_now": True,
+            })
+        return rows
+
+    def _build_daily_conclusion(
+        self,
+        market_state: dict[str, Any],
+        portfolio_snapshot: dict[str, Any],
+        risk_gates: dict[str, Any],
+        candidate_count: int,
+    ) -> dict[str, Any]:
+        regime = market_state.get("confirmed_market_regime") or market_state.get("raw_market_regime") or "UNKNOWN"
+        if regime == "RISK_ON":
+            posture = "谨慎模拟，禁止实盘"
+        elif regime in {"RANGE", "NEUTRAL"}:
+            posture = "观察为主，少量模拟"
+        elif regime == "RISK_OFF":
+            posture = "防守观察，优先控制风险"
+        else:
+            posture = "数据不足，人工复核"
+
+        return {
+            "market_regime": regime,
+            "operation_posture": posture,
+            "candidate_count": candidate_count,
+            "position_count": portfolio_snapshot.get("position_count"),
+            "total_equity": portfolio_snapshot.get("total_equity"),
+            "key_warning": risk_gates.get("overview_gate_reason") or "M6 and live trading remain blocked.",
+            "human_readable": (
+                f"当前市场状态={regime}；建议={posture}；"
+                f"候选股={candidate_count}；持仓数={portfolio_snapshot.get('position_count') or 'N/A'}；"
+                "日报可发布，但策略不可生产化，禁止真实交易。"
+            ),
+        }
+
+    def _build_data_readiness(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "layer": "L0_data_quality",
+                "status": "READY",
+                "dataset": "core_daily_bar / core_adjust_factor / core_price_limit_daily / core_instrument_status_daily",
+                "decision": "可用于生产观察日报的数据质量和可交易性检查。",
+            },
+            {
+                "layer": "L1_market_state",
+                "status": "READY",
+                "dataset": "market_index_bar",
+                "decision": "可用于市场状态展示。",
+            },
+            {
+                "layer": "L4_market_breadth",
+                "status": "READY",
+                "dataset": "core_market_breadth",
+                "decision": "可用于市场宽度和赚钱效应展示。",
+            },
+            {
+                "layer": "L5_liquidity_volatility",
+                "status": "PARTIAL_READY",
+                "dataset": "tradability / volatility / amount / turnover proxies",
+                "decision": "可先做观察，不作为实盘门禁。",
+            },
+            {
+                "layer": "L6_industry_structure",
+                "status": "PARTIAL_READY",
+                "dataset": "industry focus / by_industry_performance",
+                "decision": "可用于行业强弱和拖累展示。",
+            },
+            {
+                "layer": "L7_concept_theme",
+                "status": "NOT_READY_STAGE7_BACKLOG",
+                "dataset": "concept_strength / capital_flow",
+                "decision": "只展示缺口，不进入买卖逻辑。",
+            },
+            {
+                "layer": "L8_style_environment",
+                "status": "PARTIAL_READY",
+                "dataset": "mom / trend / volatility proxies",
+                "decision": "可先做风格代理观察。",
+            },
+            {
+                "layer": "L9_portfolio_exposure",
+                "status": "PARTIAL_READY",
+                "dataset": "paper portfolio / overview attribution",
+                "decision": "可用于模拟组合观察，不代表实盘组合。",
+            },
+        ]
 
     def _write_section_csvs(self, payload: dict[str, Any], sections_dir: Path) -> dict[str, Path]:
         outputs = {
-            "gates_csv": sections_dir / "gates.csv",
-            "data_sources_csv": sections_dir / "data_sources.csv",
-            "selected_stocks_csv": sections_dir / "selected_stocks.csv",
-            "position_summary_csv": sections_dir / "position_summary.csv",
-            "action_items_csv": sections_dir / "action_items.csv",
+            "risk_gates_csv": sections_dir / "risk_gates.csv",
+            "data_readiness_csv": sections_dir / "data_readiness.csv",
+            "candidate_pool_csv": sections_dir / "candidate_pool.csv",
+            "strong_industries_csv": sections_dir / "strong_industries.csv",
+            "loss_industries_csv": sections_dir / "loss_industries.csv",
+            "by_regime_performance_csv": sections_dir / "by_regime_performance.csv",
+            "trade_attribution_tail_csv": sections_dir / "trade_attribution_tail.csv",
+            "exit_reason_summary_csv": sections_dir / "exit_reason_summary.csv",
+            "human_next_actions_csv": sections_dir / "human_next_actions.csv",
             "sources_csv": sections_dir / "sources.csv",
-            "status_layers_csv": sections_dir / "status_layers.csv",
         }
-        self._write_rows(outputs["gates_csv"], payload.get("gates") or [])
-        self._write_rows(outputs["data_sources_csv"], payload.get("data_sources") or [])
-        self._write_rows(outputs["selected_stocks_csv"], payload.get("selected_stocks") or [])
-        self._write_rows(outputs["position_summary_csv"], payload.get("position_summary_rows") or [])
-        self._write_rows(outputs["action_items_csv"], payload.get("action_items") or [])
+
+        self._write_rows(outputs["risk_gates_csv"], [
+            {"gate": key, "value": value}
+            for key, value in (payload.get("risk_gates") or {}).items()
+        ])
+        self._write_rows(outputs["data_readiness_csv"], payload.get("data_readiness") or [])
+        self._write_rows(outputs["candidate_pool_csv"], payload.get("candidate_pool") or [])
+        self._write_rows(outputs["strong_industries_csv"], (payload.get("industry_snapshot") or {}).get("strong_industries") or [])
+        self._write_rows(outputs["loss_industries_csv"], (payload.get("industry_snapshot") or {}).get("loss_industries") or [])
+        self._write_rows(outputs["by_regime_performance_csv"], (payload.get("regime_snapshot") or {}).get("by_regime_performance") or [])
+        self._write_rows(outputs["trade_attribution_tail_csv"], (payload.get("paper_execution") or {}).get("trade_attribution_tail") or [])
+        self._write_rows(outputs["exit_reason_summary_csv"], (payload.get("paper_execution") or {}).get("exit_reason_summary") or [])
+        self._write_rows(outputs["human_next_actions_csv"], payload.get("human_next_actions") or [])
         self._write_rows(outputs["sources_csv"], payload.get("sources") or [])
-        status_rows = [
-            {"status_layer": key, "value": value}
-            for key, value in sorted((payload.get("status_layers") or {}).items())
-        ]
-        self._write_rows(outputs["status_layers_csv"], status_rows)
         return outputs
 
     def _to_production_observation_markdown(self, payload: dict[str, Any]) -> str:
-        summary = payload.get("executive_summary") or {}
+        conclusion = payload.get("daily_conclusion") or {}
+        market = payload.get("market_state") or {}
+        strategy = payload.get("strategy_state") or {}
+        industry = payload.get("industry_snapshot") or {}
+        execution = payload.get("paper_execution") or {}
+        portfolio = payload.get("portfolio_snapshot") or {}
+        risk_gates = payload.get("risk_gates") or {}
+        candidates = payload.get("candidate_pool") or []
+        actions = payload.get("human_next_actions") or []
+
         lines: list[str] = [
-            "# Production Observation Report MVP",
+            f"# 生产观察日报｜{payload.get('report_date')}",
             "",
-            f"- Report Date: {payload.get('report_date')}",
-            f"- Generated At: {payload.get('generated_at')}",
-            "- Stage: Stage 6.17c",
-            "- Artifact Only: true",
-            "- Not M6: true",
-            "- Not Stage 7: true",
-            "- Can Trade Live: false",
-            "- DB Write Rows: 0",
+            f"- 生成时间：{payload.get('generated_at')}",
+            "- 报告定位：生产端观察 / 模拟复盘 / 人工复核",
+            "- 实盘状态：禁止真实交易",
+            "- M6 状态：未通过，禁止晋级",
             "",
-            "## Executive Summary",
+            "## 1. 今日结论",
             "",
-            f"- Overall Status: {summary.get('overall_status') or 'UNKNOWN'}",
-            f"- Market Status: {summary.get('market_status') or 'UNKNOWN'}",
-            f"- Strategy: {summary.get('strategy_code') or 'UNKNOWN'} / {summary.get('strategy_version_code') or 'UNKNOWN'}",
-            f"- Selected Count: {summary.get('selected_count') or 0}",
-            f"- Position Count: {summary.get('position_count') or 0}",
-            f"- Cash: {_fmt_money(summary.get('cash'))}",
-            f"- Total Equity: {_fmt_money(summary.get('total_equity'))}",
-            f"- Backtest Total Return: {_fmt_pct(summary.get('total_return'), signed=True)}",
-            f"- Backtest Max Drawdown: {_fmt_pct(summary.get('max_drawdown'))}",
-            f"- Final Review: {summary.get('final_review_conclusion') or 'N/A'}",
+            f"- 市场状态：{conclusion.get('market_regime') or 'UNKNOWN'}",
+            f"- 操作建议：{conclusion.get('operation_posture') or '人工复核'}",
+            f"- 今日候选股数量：{conclusion.get('candidate_count')}",
+            f"- 当前模拟持仓数：{conclusion.get('position_count') or 'N/A'}",
+            f"- 总资产/权益：{_fmt_money(conclusion.get('total_equity'))}",
+            f"- 关键提醒：{conclusion.get('key_warning') or 'N/A'}",
             "",
-            "## Gates",
+            "## 2. 市场情况",
             "",
+            f"- raw_market_regime：{market.get('raw_market_regime') or 'UNKNOWN'}",
+            f"- confirmed_market_regime：{market.get('confirmed_market_regime') or 'UNKNOWN'}",
+            f"- route_name：{market.get('route_name') or 'UNKNOWN'}",
+            f"- confidence：{market.get('regime_confidence') or 'N/A'}",
+            f"- transition_flag：{market.get('transition_flag')}",
+            f"- regime_days_in_state：{market.get('regime_days_in_state') or 'N/A'}",
+            f"- latest_signal_as_of_date：{market.get('latest_signal_as_of_date') or 'N/A'}",
+            "",
+            "## 3. 行业情况",
+            "",
+            "### 强势行业 / 当前候选池行业焦点",
         ]
-        for gate in payload.get("gates") or []:
+
+        for row in (industry.get("strong_industries") or [])[:10]:
             lines.append(
-                f"- {gate.get('gate')}: `{gate.get('value')}` / {gate.get('status')} — {gate.get('reason')}"
+                f"- {row.get('industry') or row.get('industry_tag_name')}: "
+                f"selected={row.get('selected_count_in_latest_top20')}, "
+                f"strength={row.get('avg_industry_strength_20')}"
             )
 
-        lines.extend(["", "## L0-L9 Data Sources", ""])
-        for item in payload.get("data_sources") or []:
+        lines.extend(["", "### 亏损/拖累行业归因"])
+        for row in (industry.get("loss_industries") or [])[:10]:
             lines.append(
-                f"- {item.get('layer')} / {item.get('dataset')}: `{item.get('status')}` — {item.get('usage')}"
+                f"- {row.get('industry_tag_name')}: trades={row.get('trade_count')}, "
+                f"pnl={row.get('realized_pnl')}, return={row.get('realized_return')}, "
+                f"holding_days={row.get('avg_holding_days')}"
             )
 
-        lines.extend(["", "## Report Sections", ""])
-        for section in payload.get("sections") or []:
+        lines.extend([
+            "",
+            "## 4. 今日候选股 / 人工观察池",
+            "",
+            "| 排名 | 代码 | 名称 | 行业 | 策略来源 | 分数 | 动作 |",
+            "|---:|---|---|---|---|---:|---|",
+        ])
+        for row in candidates[:15]:
             lines.append(
-                f"- {section.get('section_id')} / {section.get('title')}: `{section.get('status')}` — {section.get('summary')}"
+                f"| {row.get('rank') or ''} | {row.get('instrument_code') or ''} | "
+                f"{row.get('display_name') or ''} | {row.get('industry') or ''} | "
+                f"{row.get('strategy_source') or ''} | {row.get('score') or ''} | "
+                f"{row.get('action') or 'paper_observation_candidate'} |"
             )
+
+        lines.extend(["", "### 候选理由 Top 5"])
+        for row in candidates[:5]:
+            reason = str(row.get("reason_summary") or "").replace("\n", " ")
+            if len(reason) > 220:
+                reason = reason[:220] + "..."
+            lines.append(f"- {row.get('instrument_code')} {row.get('display_name')}: {reason}")
+
+        lines.extend([
+            "",
+            "## 5. 今日模拟买卖",
+            "",
+            f"- 最新模拟日期：{execution.get('latest_trade_date') or 'N/A'}",
+            f"- 模拟买入数量：{execution.get('buy_count') or 0}",
+            f"- 模拟卖出数量：{execution.get('sell_count') or 0}",
+            f"- 模拟持仓数量：{execution.get('position_count') or portfolio.get('position_count') or 'N/A'}",
+            f"- 现金：{_fmt_money(execution.get('ending_cash'))}",
+            f"- 暴露：{_fmt_money(execution.get('gross_exposure'))}",
+            f"- 总权益：{_fmt_money(execution.get('total_equity'))}",
+            "",
+            "### 卖出原因归因",
+        ])
+        for row in (execution.get("exit_reason_summary") or [])[:8]:
+            lines.append(
+                f"- {row.get('exit_reason')}: closed={row.get('closed_position_count')}, "
+                f"pnl={row.get('realized_pnl')}, win_rate={row.get('win_rate')}"
+            )
+
+        lines.extend([
+            "",
+            "## 6. 模拟组合状态",
+            "",
+            f"- total_equity：{_fmt_money(portfolio.get('total_equity'))}",
+            f"- ending_cash：{_fmt_money(portfolio.get('ending_cash'))}",
+            f"- gross_exposure：{_fmt_money(portfolio.get('gross_exposure'))}",
+            f"- open_position_count：{portfolio.get('open_position_count') or portfolio.get('position_count') or 'N/A'}",
+            f"- trade_count：{portfolio.get('trade_count') or 'N/A'}",
+            f"- realized_pnl：{_fmt_signed_money(portfolio.get('realized_pnl'))}",
+            f"- realized_return：{_fmt_pct(portfolio.get('realized_return'), signed=True)}",
+            f"- win_rate：{_fmt_pct(portfolio.get('win_rate'))}",
+            f"- avg_holding_days：{portfolio.get('avg_holding_days') or 'N/A'}",
+            f"- hard_stop_loss_realized_pnl：{_fmt_signed_money(portfolio.get('hard_stop_loss_realized_pnl'))}",
+            "",
+            "## 7. 策略与研究状态",
+            "",
+            f"- strategy_code：{strategy.get('strategy_code') or 'UNKNOWN'}",
+            f"- strategy_version_code：{strategy.get('strategy_version_code') or 'UNKNOWN'}",
+            f"- source_signal_run_id：{strategy.get('source_signal_run_id') or 'N/A'}",
+            f"- backtest_run_id：{strategy.get('backtest_run_id') or 'N/A'}",
+            f"- total_return：{_fmt_pct(strategy.get('total_return'), signed=True)}",
+            f"- max_drawdown：{_fmt_pct(strategy.get('max_drawdown'))}",
+            f"- sharpe_ratio：{strategy.get('sharpe_ratio') or 'N/A'}",
+            f"- performance_claim_allowed：{strategy.get('performance_claim_allowed')}",
+            f"- quality_warning_codes：{strategy.get('quality_warning_codes') or 'N/A'}",
+            "",
+            "## 8. 门禁",
+            "",
+            f"- 可以发布日报：{risk_gates.get('can_publish_report_to_production')}",
+            f"- 可以发布策略：{risk_gates.get('can_publish_strategy_to_production')}",
+            f"- 可以进入 M6：{risk_gates.get('can_route_to_m6')}",
+            f"- 可以实盘：{risk_gates.get('can_trade_live')}",
+            f"- 需要研究复核：{risk_gates.get('needs_research_review')}",
+            f"- overview gate reason：{risk_gates.get('overview_gate_reason') or 'N/A'}",
+            "",
+            "## 9. 人工下一步",
+            "",
+        ])
+        for row in actions[:10]:
+            lines.append(
+                f"- [{row.get('priority') or 'P?'}] {row.get('action') or ''} — {row.get('reason') or ''}"
+            )
+
+        lines.extend([
+            "",
+            "## 10. 数据与边界",
+            "",
+        ])
+        for row in payload.get("data_readiness") or []:
+            lines.append(f"- {row.get('layer')}: `{row.get('status')}` — {row.get('decision')}")
 
         lines.extend([
             "",
             "## Boundary",
             "",
-            "This report is for production-side observation and paper review only. It must not be used as an M6 promotion decision, live-trading signal, or unattended execution approval.",
+            "本报告只用于生产端观察、模拟盘复盘和人工研究复核；不得作为 M6 晋级、策略生产化、真实交易或无人值守执行依据。",
             "",
         ])
         return "\n".join(lines).rstrip() + "\n"
