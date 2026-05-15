@@ -28,6 +28,8 @@ PROFILE_CHOICES = ("runtime", "research", "full")
 PAPER_MODE_CHOICES = ("auto", "m6", "m7", "skip", "off")
 _TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+DEFAULT_RESEARCH_STRATEGY_CODE = "regime_sector_industry_selection_v1"
+DEFAULT_RESEARCH_STRATEGY_VERSION_CODE = "v1_regime_state_machine"
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,27 @@ def _resolve_int_option(
     return int(value)
 
 
+def _resolve_string_option(
+    cli_value: str | None,
+    env_names: Sequence[str],
+    default: str,
+) -> str:
+    value = cli_value if cli_value is not None else _env_first(*env_names)
+    if value is None:
+        return default
+
+    normalized = str(value).strip()
+    if not normalized:
+        return default
+    return normalized
+
+
+def _safe_artifact_label(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    normalized = normalized.strip("._-")
+    return normalized or "research_strategy"
+
+
 def _resolve_report_date(cli_value: str | None) -> str | None:
     value = cli_value or _env_first("SQV2_DAILY_REPORT_DATE", "M8_REPORT_DATE", "M9_REPORT_DATE")
     if value is None:
@@ -315,6 +338,36 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         args.enable_m8_ops_master,
         ("SQV2_RESEARCH_ENABLE_M8_OPS_MASTER", "SQV2_ENABLE_M8_OPS_MASTER"),
         True,
+    )
+    args.enable_regime_state_machine_research = _resolve_bool_option(
+        args.enable_regime_state_machine_research,
+        ("SQV2_RESEARCH_ENABLE_REGIME_STATE_MACHINE",),
+        False,
+    )
+    args.research_strategy_code = _resolve_string_option(
+        args.research_strategy_code,
+        ("SQV2_RESEARCH_STRATEGY_CODE",),
+        DEFAULT_RESEARCH_STRATEGY_CODE,
+    )
+    args.research_strategy_version_code = _resolve_string_option(
+        args.research_strategy_version_code,
+        ("SQV2_RESEARCH_STRATEGY_VERSION_CODE",),
+        DEFAULT_RESEARCH_STRATEGY_VERSION_CODE,
+    )
+    args.research_target_top_n = _resolve_int_option(
+        args.research_target_top_n,
+        ("SQV2_RESEARCH_TARGET_TOP_N",),
+        100,
+    )
+    args.research_max_signal_batches = _resolve_int_option(
+        args.research_max_signal_batches,
+        ("SQV2_RESEARCH_MAX_SIGNAL_BATCHES",),
+        120,
+    )
+    args.research_min_candidate_rows = _resolve_int_option(
+        args.research_min_candidate_rows,
+        ("SQV2_RESEARCH_MIN_CANDIDATE_ROWS",),
+        1000,
     )
     args.enable_m6_5_campaign = _resolve_bool_option(
         args.enable_m6_5_campaign,
@@ -651,7 +704,105 @@ def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
             )
         )
 
+    steps.append(
+        ChainStep(
+            "m9_production_observation_report",
+            "stock_quant_v2.platform_overview_domain.tasks.build_research_portfolio_daily_report",
+            extra_args=_report_date_args(args.report_date),
+            optional=True,
+            soft_fail=True,
+        )
+    )
+
     return steps
+
+
+def _report_date_args(report_date: str | None) -> tuple[str, ...]:
+    if report_date:
+        return ("--report-date", report_date)
+    return ()
+
+
+def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list[ChainStep]:
+    strategy_code = str(args.research_strategy_code)
+    strategy_version_code = str(args.research_strategy_version_code)
+    label = _safe_artifact_label(strategy_version_code)
+    base_dir = f"artifacts/m4/research_chain_{label}"
+    design_dir = f"{base_dir}/historical_signal_generation_design"
+    preview_dir = f"{base_dir}/historical_signal_generation_preview"
+    db_write_preview_dir = f"{base_dir}/historical_signal_db_write_preview"
+    report_date_args = _report_date_args(args.report_date)
+
+    common_strategy_args = (
+        "--project-root",
+        ".",
+        *report_date_args,
+        "--strategy-code",
+        strategy_code,
+        "--strategy-version-code",
+        strategy_version_code,
+    )
+
+    return [
+        ChainStep(
+            "m4_regime_sm_historical_design",
+            "stock_quant_v2.scripts.bootstrap_m4_historical_signal_generation_design",
+            extra_args=(
+                *common_strategy_args,
+                "--mode",
+                "design",
+                "--output-dir",
+                design_dir,
+            ),
+        ),
+        ChainStep(
+            "m4_regime_sm_historical_preview",
+            "stock_quant_v2.scripts.bootstrap_m4_historical_signal_generation_design",
+            extra_args=(
+                *common_strategy_args,
+                "--mode",
+                "preview_dry_run",
+                "--design-artifact-dir",
+                design_dir,
+                "--output-dir",
+                preview_dir,
+                "--target-top-n",
+                str(args.research_target_top_n),
+                "--max-signal-batches",
+                str(args.research_max_signal_batches),
+            ),
+        ),
+        ChainStep(
+            "m4_regime_sm_db_write_preview",
+            "stock_quant_v2.scripts.bootstrap_m4_historical_signal_generation_design",
+            extra_args=(
+                *common_strategy_args,
+                "--mode",
+                "db_write_preview",
+                "--preview-artifact-dir",
+                preview_dir,
+                "--output-dir",
+                db_write_preview_dir,
+                "--min-candidate-rows",
+                str(args.research_min_candidate_rows),
+            ),
+        ),
+        ChainStep(
+            "m5_m9_bridge_refresh",
+            "stock_quant_v2.platform_overview_domain.tasks.build_upstream_readiness_summaries",
+            extra_args=report_date_args,
+        ),
+        ChainStep(
+            "m9_research_portfolio_daily_report",
+            "stock_quant_v2.platform_overview_domain.tasks.build_research_portfolio_daily_report",
+            extra_args=report_date_args,
+        ),
+        ChainStep(
+            "m9_platform_overview_report",
+            "stock_quant_v2.platform_overview_domain.tasks.build_platform_overview_report",
+            extra_args=report_date_args,
+        ),
+    ]
 
 
 def _build_research_steps(
@@ -684,6 +835,9 @@ def _build_research_steps(
             ChainStep("m5_research_refresh", "stock_quant_v2.scripts.bootstrap_m5_research_refresh_chain")
         )
 
+    if args.enable_regime_state_machine_research:
+        steps.extend(_build_regime_state_machine_research_steps(args))
+
     if args.enable_m8_ops_master:
         steps.append(
             ChainStep(
@@ -695,7 +849,6 @@ def _build_research_steps(
         )
 
     return steps
-
 
 def _build_steps(args: argparse.Namespace) -> list[ChainStep]:
     if args.profile == "runtime":
@@ -795,6 +948,55 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-regime-state-machine-research",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable optional research-only regime state machine candidate chain. "
+            "Default is disabled. Env: SQV2_RESEARCH_ENABLE_REGIME_STATE_MACHINE."
+        ),
+    )
+    parser.add_argument(
+        "--research-strategy-code",
+        default=None,
+        help=(
+            "Strategy code for optional research candidate chain. "
+            "Env: SQV2_RESEARCH_STRATEGY_CODE."
+        ),
+    )
+    parser.add_argument(
+        "--research-strategy-version-code",
+        default=None,
+        help=(
+            "Strategy version code for optional research candidate chain. "
+            "Env: SQV2_RESEARCH_STRATEGY_VERSION_CODE."
+        ),
+    )
+    parser.add_argument(
+        "--research-target-top-n",
+        type=int,
+        default=None,
+        help="Target top-N for optional research historical preview. Env: SQV2_RESEARCH_TARGET_TOP_N.",
+    )
+    parser.add_argument(
+        "--research-max-signal-batches",
+        type=int,
+        default=None,
+        help=(
+            "Maximum historical signal batches for optional research preview. "
+            "Env: SQV2_RESEARCH_MAX_SIGNAL_BATCHES."
+        ),
+    )
+    parser.add_argument(
+        "--research-min-candidate-rows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum candidate rows for optional research DB-write preview. "
+            "Env: SQV2_RESEARCH_MIN_CANDIDATE_ROWS."
+        ),
+    )
+    parser.add_argument(
         "--enable-m6-5-campaign",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -839,6 +1041,25 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
         print("[DAILY] skip_m8_daily_ops = True", flush=True)
     if args.profile in {"research", "full"}:
         print(f"[DAILY] enable_m8_ops_master = {args.enable_m8_ops_master}", flush=True)
+        print(
+            f"[DAILY] enable_regime_state_machine_research = {args.enable_regime_state_machine_research}",
+            flush=True,
+        )
+        if args.enable_regime_state_machine_research:
+            print(f"[DAILY] research_strategy_code = {args.research_strategy_code}", flush=True)
+            print(
+                f"[DAILY] research_strategy_version_code = {args.research_strategy_version_code}",
+                flush=True,
+            )
+            print(f"[DAILY] research_target_top_n = {args.research_target_top_n}", flush=True)
+            print(
+                f"[DAILY] research_max_signal_batches = {args.research_max_signal_batches}",
+                flush=True,
+            )
+            print(
+                f"[DAILY] research_min_candidate_rows = {args.research_min_candidate_rows}",
+                flush=True,
+            )
     if getattr(args, "enable_m6_5_campaign", False):
         print("[DAILY] enable_m6_5_campaign = True", flush=True)
         if getattr(args, "m6_5_campaign_config", None):
