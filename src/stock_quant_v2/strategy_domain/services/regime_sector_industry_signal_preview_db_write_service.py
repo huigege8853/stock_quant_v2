@@ -581,6 +581,8 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                 }
             )
 
+        rank_changed_count = self._sort_and_recompute_candidate_ranks(prepared)
+
         empty_failures = {column: count for column, count in empty_counts.items() if count > 0}
         required_value_failures = dict(empty_failures)
         if strategy_version_id is None:
@@ -592,7 +594,69 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         checks.append(self._check("candidate_json_payloads", "PASS" if json_errors == 0 else "FAIL", f"json_errors={json_errors}", rows=len(prepared)))
         checks.append(self._check("candidate_score_bounds", "PASS" if score_out_of_bounds == 0 else "FAIL", f"score_out_of_bounds={score_out_of_bounds}", rows=len(prepared)))
         checks.append(self._check("candidate_unique_keys", "PASS" if duplicate_key_count == 0 else "FAIL", f"duplicate_key_count={duplicate_key_count}", rows=len(prepared)))
+        checks.append(
+            self._check(
+                "candidate_rank_recomputed",
+                "PASS",
+                f"rank_basis=v1_1_preview_score_desc_then_confidence_desc; rank_changed_count={rank_changed_count}",
+                rows=len(prepared),
+            )
+        )
         return prepared, checks
+
+    def _sort_and_recompute_candidate_ranks(self, rows: list[dict[str, Any]]) -> int:
+        """Sort final DB-write candidates by the score that will actually be written.
+
+        S3 preview rank is produced before v1.1 concept/capital score enrichment.
+        The DB contract writes v1.1_preview_score into strategy_signal.raw_score and
+        normalized_score, so rank_in_batch must be recomputed from that final DB
+        score rather than copied from the source preview artifact. The original
+        preview rank is retained in source_preview_rank for traceability.
+        """
+
+        def sort_key(row: Mapping[str, Any]) -> tuple[Decimal, Decimal, int, int]:
+            score = row.get("raw_score")
+            confidence = row.get("confidence_score")
+            source_rank = safe_int(row.get("source_preview_rank")) or 10**9
+            instrument_id = safe_int(row.get("instrument_id")) or 10**18
+            return (
+                -(score if isinstance(score, Decimal) else Decimal("-1")),
+                -(confidence if isinstance(confidence, Decimal) else Decimal("-1")),
+                source_rank,
+                instrument_id,
+            )
+
+        rows.sort(key=sort_key)
+
+        rank_changed_count = 0
+        rank_basis = "v1_1_preview_score_desc_then_confidence_desc"
+        for write_rank, row in enumerate(rows, start=1):
+            source_rank = safe_int(row.get("source_preview_rank"))
+            if source_rank != write_rank:
+                rank_changed_count += 1
+            row["rank_in_batch"] = write_rank
+
+            reason_payload = parse_json_object(row.get("reason_payload_json"))
+            reason_payload.update(
+                {
+                    "source_preview_rank": row.get("source_preview_rank"),
+                    "db_write_rank": write_rank,
+                    "db_write_rank_basis": rank_basis,
+                    "rank_recomputed_before_db_write": True,
+                }
+            )
+            row["reason_payload_json"] = json.dumps(reason_payload, ensure_ascii=False, sort_keys=True, default=json_default)
+
+            parameter_payload = parse_json_object(row.get("parameter_payload_json"))
+            parameter_payload.update(
+                {
+                    "db_write_rank_basis": rank_basis,
+                    "rank_recomputed_before_db_write": True,
+                }
+            )
+            row["parameter_payload_json"] = json.dumps(parameter_payload, ensure_ascii=False, sort_keys=True, default=json_default)
+
+        return rank_changed_count
 
     def _resolve_effective_date(
         self,
@@ -896,6 +960,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             "reason_code_counts": reason_counts,
             "write_mode": write_mode,
             "score_written_to_db": "v1_1_preview_score",
+            "rank_written_to_db": "recomputed_by_v1_1_preview_score_desc_then_confidence_desc",
         }
 
     def _decision_reason(self, *, final_blocker_count: int, write_db: bool, run_id: int | None) -> str:
@@ -965,6 +1030,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             "writes_strategy_signal_only_when_write_db_and_confirmation_are_supplied" if write_db else "dry_run_only_no_db_write",
             "blocks_append_when_existing_same_version_date_unless_explicitly_allowed",
             "score_written_to_db_is_v1_1_preview_score",
+            "rank_in_batch_recomputed_from_written_score_before_insert",
         ]
 
     def _write_artifacts(self, *, config: SignalPreviewDbWriteContractConfig, result: SignalPreviewDbWriteContractResult) -> SignalPreviewDbWriteContractResult:
