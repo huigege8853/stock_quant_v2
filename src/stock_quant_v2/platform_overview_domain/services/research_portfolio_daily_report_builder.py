@@ -2657,7 +2657,7 @@ class ProductionObservationReportExporter:
 
         payload: dict[str, Any] = {
             "report_name": "production_observation_daily",
-            "stage": "Stage 6.17f",
+            "stage": "Stage 6.18d-5",
             "report_date": report.report_date,
             "generated_at": _utc_now_iso(),
             "artifact_only": True,
@@ -2691,16 +2691,23 @@ class ProductionObservationReportExporter:
             "risk_gates": risk_gates,
             "human_next_actions": human_next_actions,
             "data_readiness": self._build_data_readiness(),
+            "content_gap_status": self._build_content_gap_status(
+                market_state=market_state,
+                industry_snapshot=industry_snapshot,
+                candidate_pool=candidate_pool,
+                paper_execution=paper_execution,
+                portfolio_snapshot=portfolio_snapshot,
+            ),
             "stage7_backlog": [
                 {
                     "domain": "concept_strength",
-                    "status": "NOT_READY_STAGE7_BACKLOG",
-                    "decision": "Only display readiness gap in this report; do not use it for buy/sell decisions.",
+                    "status": "READY_FOR_M4_SCORING_PREVIEW",
+                    "decision": "CONCEPT_EM can enter M4 candidate scoring preview and report explanation; do not use it for M5 buy/sell or live trading.",
                 },
                 {
-                    "domain": "capital_flow",
-                    "status": "NOT_READY_STAGE7_BACKLOG",
-                    "decision": "Use amount/turnover/liquidity proxies first; formal capital-flow is Stage 7 readiness.",
+                    "domain": "capital_activity_proxy",
+                    "status": "READY_FOR_M4_SCORING_PREVIEW",
+                    "decision": "Use amount/turnover/liquidity proxies for M4 scoring preview only; formal capital-flow remains gated.",
                 },
             ],
             "research_reference": {
@@ -2759,19 +2766,41 @@ class ProductionObservationReportExporter:
         raw_regime = market.get("latest_raw_market_regime")
         confirmed_regime = market.get("latest_confirmed_market_regime")
         has_regime = bool(raw_regime or confirmed_regime)
-        has_db_market = bool(breadth or index_bar or daily_bar_summary)
+        has_breadth = bool(breadth)
+        has_index_bar = bool(index_bar)
+        has_daily_bar = bool(daily_bar_summary)
+        has_db_market = bool(has_breadth or has_index_bar or has_daily_bar)
 
         status = market.get("status") or overview.get("overall_status")
         if not status:
             status = "READY_NO_REGIME" if has_db_market else "MISSING"
 
+        universe_count = _to_decimal(breadth.get("universe_count"))
+        advancers = _to_decimal(breadth.get("advancers"))
+        decliners = _to_decimal(breadth.get("decliners"))
+        advancer_ratio = None
+        decliner_ratio = None
+        if universe_count and universe_count != 0:
+            advancer_ratio = advancers / universe_count if advancers is not None else None
+            decliner_ratio = decliners / universe_count if decliners is not None else None
+
+        turnover = _to_decimal(breadth.get("total_turnover_amount_cny"))
+        turnover_billion = turnover / Decimal("100000000") if turnover is not None else None
+
+        market_index_pct = index_bar.get("pct_chg")
+        market_regime_display = market.get("latest_market_regime_display") or confirmed_regime or raw_regime or "UNKNOWN"
+
         return {
             "status": status,
             "market_data_status": db_market.get("status"),
+            "has_regime": has_regime,
+            "has_breadth": has_breadth,
+            "has_market_index_bar": has_index_bar,
+            "has_daily_bar_summary": has_daily_bar,
             "latest_signal_as_of_date": market.get("latest_signal_as_of_date"),
             "raw_market_regime": raw_regime,
             "confirmed_market_regime": confirmed_regime,
-            "market_regime_display": market.get("latest_market_regime_display") or confirmed_regime or raw_regime,
+            "market_regime_display": market_regime_display,
             "route_name": market.get("latest_route_name"),
             "regime_days_in_state": market.get("latest_regime_days_in_state"),
             "regime_confidence": market.get("latest_regime_confidence"),
@@ -2781,7 +2810,7 @@ class ProductionObservationReportExporter:
             "confirmed_market_regime_counts": market.get("confirmed_market_regime_counts") or {},
             "market_index_latest_trade_date": index_bar.get("trade_date"),
             "market_index_close": index_bar.get("close"),
-            "market_index_pct_chg": index_bar.get("pct_chg"),
+            "market_index_pct_chg": market_index_pct,
             "market_index_amount": index_bar.get("amount"),
             "breadth_trade_date": breadth.get("trade_date"),
             "breadth_market_scope": breadth.get("market_scope"),
@@ -2792,10 +2821,19 @@ class ProductionObservationReportExporter:
             "breadth_unchanged": breadth.get("unchanged"),
             "breadth_suspended_count": breadth.get("suspended_count"),
             "breadth_total_turnover_amount_cny": breadth.get("total_turnover_amount_cny"),
+            "breadth_total_turnover_billion_cny": turnover_billion,
             "breadth_mean_return": breadth.get("mean_return"),
             "breadth_median_return": breadth.get("median_return"),
+            "breadth_advancer_ratio": advancer_ratio,
+            "breadth_decliner_ratio": decliner_ratio,
             "daily_bar_latest_trade_date": daily_bar_summary.get("latest_trade_date"),
             "daily_bar_row_count": daily_bar_summary.get("row_count"),
+            "market_summary": (
+                f"指数日期={index_bar.get('trade_date') or 'N/A'}；"
+                f"指数涨跌={market_index_pct if market_index_pct not in (None, '') else 'N/A'}；"
+                f"上涨/下跌={breadth.get('advancers') or 'N/A'}/{breadth.get('decliners') or 'N/A'}；"
+                f"中位收益={breadth.get('median_return') if breadth.get('median_return') not in (None, '') else 'N/A'}"
+            ),
             "regime_status_note": (
                 "regime ready" if has_regime else
                 "market data ready but regime signal not mapped into production report"
@@ -3046,14 +3084,27 @@ class ProductionObservationReportExporter:
         candidate_count: int,
     ) -> dict[str, Any]:
         regime = market_state.get("confirmed_market_regime") or market_state.get("raw_market_regime") or "UNKNOWN"
+        has_market_data = bool(
+            market_state.get("has_breadth")
+            or market_state.get("has_market_index_bar")
+            or market_state.get("has_daily_bar_summary")
+        )
+        has_regime = bool(market_state.get("has_regime"))
+
         if regime == "RISK_ON":
             posture = "谨慎模拟，禁止实盘"
         elif regime in {"RANGE", "NEUTRAL"}:
             posture = "观察为主，少量模拟"
         elif regime == "RISK_OFF":
             posture = "防守观察，优先控制风险"
+        elif has_market_data and not has_regime:
+            posture = "市场数据可观察，状态信号未映射，禁止实盘"
         else:
             posture = "数据不足，人工复核"
+
+        key_warning = risk_gates.get("overview_gate_reason") or "M6 and live trading remain blocked."
+        if has_market_data and not has_regime:
+            key_warning = "市场基础数据已就绪，但 RISK_ON/RANGE/RISK_OFF 状态尚未映射到生产日报；" + key_warning
 
         return {
             "market_regime": regime,
@@ -3061,13 +3112,97 @@ class ProductionObservationReportExporter:
             "candidate_count": candidate_count,
             "position_count": portfolio_snapshot.get("position_count"),
             "total_equity": portfolio_snapshot.get("total_equity"),
-            "key_warning": risk_gates.get("overview_gate_reason") or "M6 and live trading remain blocked.",
+            "key_warning": key_warning,
             "human_readable": (
                 f"当前市场状态={regime}；建议={posture}；"
                 f"候选股={candidate_count}；持仓数={portfolio_snapshot.get('position_count') or 'N/A'}；"
                 "日报可发布，但策略不可生产化，禁止真实交易。"
             ),
         }
+
+    def _build_content_gap_status(
+        self,
+        market_state: dict[str, Any],
+        industry_snapshot: dict[str, Any],
+        candidate_pool: list[dict[str, Any]],
+        paper_execution: dict[str, Any],
+        portfolio_snapshot: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        def add_gap(domain: str, severity: str, status: str, finding: str, next_action: str) -> None:
+            rows.append({
+                "domain": domain,
+                "severity": severity,
+                "status": status,
+                "finding": finding,
+                "next_action": next_action,
+            })
+
+        if not market_state.get("has_regime"):
+            add_gap(
+                "L1_market_regime",
+                "P0",
+                "MISSING_MAPPING",
+                "市场基础数据已进入生产日报，但 confirmed_market_regime/raw_market_regime 仍为 UNKNOWN。",
+                "把生产端 market regime/state-machine 输出接入 production_observation。",
+            )
+
+        missing_industry_count = int(industry_snapshot.get("missing_industry_count") or 0)
+        if candidate_pool and missing_industry_count >= len(candidate_pool):
+            add_gap(
+                "L6_industry_structure",
+                "P0",
+                "MISSING_MAPPING",
+                "候选池行业字段全部为空，无法展示行业结构。",
+                "把 instrument->industry 映射或候选池 enriched industry 字段接入生产日报。",
+            )
+        elif missing_industry_count > 0:
+            add_gap(
+                "L6_industry_structure",
+                "P1",
+                "PARTIAL_MAPPING",
+                f"候选池仍有 {missing_industry_count} 条缺行业字段。",
+                "补齐缺失标的的行业映射。",
+            )
+
+        st_count = sum(1 for row in candidate_pool if row.get("action") == "manual_review_blocked_st")
+        if st_count:
+            add_gap(
+                "L0_tradability_risk",
+                "P0",
+                "BLOCKED_ST_REVIEW",
+                f"候选池中 {st_count} 只 ST/*ST 已被降级为 manual_review_blocked_st。",
+                "后续策略候选池应在入池或执行前过滤 ST/*ST，而不是只在报告层阻断。",
+            )
+
+        if paper_execution.get("buy_count") in (None, "") or paper_execution.get("sell_count") in (None, ""):
+            add_gap(
+                "L9_paper_execution",
+                "P1",
+                "PARTIAL_MAPPING",
+                "模拟买卖数量仍未完全来自生产执行事实。",
+                "把最新 paper trade/order/fill 或 trade attribution 的生产事实接入日报。",
+            )
+
+        if portfolio_snapshot.get("daily_pnl") in (None, "") or portfolio_snapshot.get("cumulative_pnl") in (None, ""):
+            add_gap(
+                "L9_portfolio_pnl",
+                "P1",
+                "PARTIAL_MAPPING",
+                "组合日盈亏/累计盈亏仍为空。",
+                "把 paper portfolio snapshot 的 daily_pnl/cumulative_pnl 固化到生产日报事实源。",
+            )
+
+        if not rows:
+            rows.append({
+                "domain": "production_observation",
+                "severity": "OK",
+                "status": "READY",
+                "finding": "生产观察日报关键内容映射暂无 P0 缺口。",
+                "next_action": "继续人工复核，仍禁止 M6 和真实交易。",
+            })
+        return rows
 
     def _build_data_readiness(self) -> list[dict[str, Any]]:
         return [
@@ -3103,9 +3238,9 @@ class ProductionObservationReportExporter:
             },
             {
                 "layer": "L7_concept_theme",
-                "status": "NOT_READY_STAGE7_BACKLOG",
-                "dataset": "concept_strength / capital_flow",
-                "decision": "只展示缺口，不进入买卖逻辑。",
+                "status": "READY_FOR_M4_SCORING_PREVIEW",
+                "dataset": "tag / instrument_tag CONCEPT_EM + capital activity proxies",
+                "decision": "可进入 M4 选股评分 preview 和生产报告解释；不进入 M5 买点、卖点、仓位或实盘决策。",
             },
             {
                 "layer": "L8_style_environment",
@@ -3132,6 +3267,7 @@ class ProductionObservationReportExporter:
             "trade_attribution_tail_csv": sections_dir / "trade_attribution_tail.csv",
             "exit_reason_summary_csv": sections_dir / "exit_reason_summary.csv",
             "human_next_actions_csv": sections_dir / "human_next_actions.csv",
+            "content_gap_status_csv": sections_dir / "content_gap_status.csv",
             "sources_csv": sections_dir / "sources.csv",
         }
 
@@ -3147,6 +3283,7 @@ class ProductionObservationReportExporter:
         self._write_rows(outputs["trade_attribution_tail_csv"], (payload.get("paper_execution") or {}).get("trade_attribution_tail") or [])
         self._write_rows(outputs["exit_reason_summary_csv"], (payload.get("paper_execution") or {}).get("exit_reason_summary") or [])
         self._write_rows(outputs["human_next_actions_csv"], payload.get("human_next_actions") or [])
+        self._write_rows(outputs["content_gap_status_csv"], payload.get("content_gap_status") or [])
         self._write_rows(outputs["sources_csv"], payload.get("sources") or [])
         return outputs
 
@@ -3180,6 +3317,7 @@ class ProductionObservationReportExporter:
             "",
             "## 2. 市场情况",
             "",
+            f"- market_data_status：{market.get('market_data_status') or market.get('status') or 'N/A'}",
             f"- raw_market_regime：{market.get('raw_market_regime') or 'UNKNOWN'}",
             f"- confirmed_market_regime：{market.get('confirmed_market_regime') or 'UNKNOWN'}",
             f"- route_name：{market.get('route_name') or 'UNKNOWN'}",
@@ -3187,8 +3325,23 @@ class ProductionObservationReportExporter:
             f"- transition_flag：{market.get('transition_flag')}",
             f"- regime_days_in_state：{market.get('regime_days_in_state') or 'N/A'}",
             f"- latest_signal_as_of_date：{market.get('latest_signal_as_of_date') or 'N/A'}",
+            f"- 指数日期：{market.get('market_index_latest_trade_date') or 'N/A'}",
+            f"- 指数收盘：{market.get('market_index_close') or 'N/A'}",
+            f"- 指数涨跌幅：{_fmt_pct(market.get('market_index_pct_chg'), signed=True)}",
+            f"- 市场宽度日期：{market.get('breadth_trade_date') or 'N/A'}",
+            f"- 上涨/下跌/平盘：{market.get('breadth_advancers') or 'N/A'} / {market.get('breadth_decliners') or 'N/A'} / {market.get('breadth_unchanged') or 'N/A'}",
+            f"- 上涨占比：{_fmt_pct(market.get('breadth_advancer_ratio'))}",
+            f"- 下跌占比：{_fmt_pct(market.get('breadth_decliner_ratio'))}",
+            f"- 样本数/有效行情数：{market.get('breadth_universe_count') or 'N/A'} / {market.get('breadth_bar_count') or 'N/A'}",
+            f"- 市场中位收益：{_fmt_pct(market.get('breadth_median_return'), signed=True)}",
+            f"- 市场平均收益：{_fmt_pct(market.get('breadth_mean_return'), signed=True)}",
+            f"- 成交额估算：{_fmt_money(market.get('breadth_total_turnover_amount_cny'))}",
+            f"- 状态说明：{market.get('regime_status_note') or 'N/A'}",
             "",
             "## 3. 行业情况",
+            "",
+            f"- 生产候选池行业缺失数：{industry.get('missing_industry_count') or 0}",
+            f"- 行业说明：{industry.get('note') or 'N/A'}",
             "",
             "### 强势行业 / 当前候选池行业焦点",
         ]
@@ -3200,6 +3353,9 @@ class ProductionObservationReportExporter:
                 f"strength={row.get('avg_industry_strength_20')}"
             )
 
+        if not (industry.get("strong_industries") or []):
+            lines.append("- 当前生产候选池没有可展示的行业字段；这是 L6 行业映射缺口，不使用研究归因冒充今日行业事实。")
+
         lines.extend(["", "### 亏损/拖累行业归因"])
         for row in (industry.get("loss_industries") or [])[:10]:
             lines.append(
@@ -3208,18 +3364,23 @@ class ProductionObservationReportExporter:
                 f"holding_days={row.get('avg_holding_days')}"
             )
 
+        if not (industry.get("loss_industries") or []):
+            lines.append("- 暂无生产侧亏损/拖累行业事实；研究归因只进入 research_reference。")
+
         lines.extend([
             "",
             "## 4. 今日候选股 / 人工观察池",
             "",
-            "| 排名 | 代码 | 名称 | 行业 | 策略来源 | 分数 | 动作 |",
-            "|---:|---|---|---|---|---:|---|",
+            "| 排名 | 代码 | 名称 | 行业 | 策略来源 | 分数 | 目标权重 | 目标金额 | 风险状态 | 动作 |",
+            "|---:|---|---|---|---|---:|---:|---:|---|---|",
         ])
         for row in candidates[:15]:
             lines.append(
                 f"| {row.get('rank') or ''} | {row.get('instrument_code') or ''} | "
                 f"{row.get('display_name') or ''} | {row.get('industry') or ''} | "
                 f"{row.get('strategy_source') or ''} | {row.get('score') or ''} | "
+                f"{_fmt_pct(row.get('target_weight'))} | {_fmt_money(row.get('target_amount'))} | "
+                f"{row.get('risk_status') or row.get('identity_status') or ''} | "
                 f"{row.get('action') or 'paper_observation_candidate'} |"
             )
 
@@ -3241,6 +3402,8 @@ class ProductionObservationReportExporter:
             f"- 现金：{_fmt_money(execution.get('ending_cash'))}",
             f"- 暴露：{_fmt_money(execution.get('gross_exposure'))}",
             f"- 总权益：{_fmt_money(execution.get('total_equity'))}",
+            f"- 当日盈亏：{_fmt_signed_money(execution.get('daily_pnl'))}",
+            f"- 累计盈亏：{_fmt_signed_money(execution.get('cumulative_pnl'))}",
             "",
             "### 卖出原因归因",
         ])
@@ -3256,9 +3419,14 @@ class ProductionObservationReportExporter:
             "",
             f"- total_equity：{_fmt_money(portfolio.get('total_equity'))}",
             f"- ending_cash：{_fmt_money(portfolio.get('ending_cash'))}",
+            f"- cash_balance：{_fmt_money(portfolio.get('cash_balance'))}",
+            f"- market_value：{_fmt_money(portfolio.get('market_value'))}",
             f"- gross_exposure：{_fmt_money(portfolio.get('gross_exposure'))}",
+            f"- net_exposure：{_fmt_money(portfolio.get('net_exposure'))}",
             f"- open_position_count：{portfolio.get('open_position_count') or portfolio.get('position_count') or 'N/A'}",
             f"- trade_count：{portfolio.get('trade_count') or 'N/A'}",
+            f"- daily_pnl：{_fmt_signed_money(portfolio.get('daily_pnl'))}",
+            f"- cumulative_pnl：{_fmt_signed_money(portfolio.get('cumulative_pnl'))}",
             f"- realized_pnl：{_fmt_signed_money(portfolio.get('realized_pnl'))}",
             f"- realized_return：{_fmt_pct(portfolio.get('realized_return'), signed=True)}",
             f"- win_rate：{_fmt_pct(portfolio.get('win_rate'))}",
@@ -3286,7 +3454,18 @@ class ProductionObservationReportExporter:
             f"- 需要研究复核：{risk_gates.get('needs_research_review')}",
             f"- overview gate reason：{risk_gates.get('overview_gate_reason') or 'N/A'}",
             "",
-            "## 9. 人工下一步",
+            "## 9. 内容缺口与下一步补数",
+            "",
+        ])
+        for row in payload.get("content_gap_status") or []:
+            lines.append(
+                f"- [{row.get('severity') or 'P?'}] {row.get('domain')}: "
+                f"{row.get('status')} — {row.get('finding')}；下一步：{row.get('next_action')}"
+            )
+
+        lines.extend([
+            "",
+            "## 10. 人工下一步",
             "",
         ])
         for row in actions[:10]:
@@ -3296,7 +3475,7 @@ class ProductionObservationReportExporter:
 
         lines.extend([
             "",
-            "## 10. 数据与边界",
+            "## 11. 数据与边界",
             "",
         ])
         for row in payload.get("data_readiness") or []:

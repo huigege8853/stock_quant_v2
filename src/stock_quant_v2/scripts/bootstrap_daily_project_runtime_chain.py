@@ -666,10 +666,47 @@ def _resolve_paper_step(args: argparse.Namespace) -> ChainStep | None:
     )
 
 
+def _build_taxonomy_daily_refresh_args(report_date: str | None) -> tuple[str, ...]:
+    args: list[str] = [
+        "--daily-refresh",
+        "--fail-safe",
+        "--fetch-sw-industry-akshare",
+        "--fetch-em-concepts",
+        "--output-dir",
+        "artifacts/m4/taxonomy_daily_refresh",
+        "--progress-every",
+        "20",
+        "--sw-fetch-delay-seconds",
+        "1.5",
+        "--sw-fallback-delay-seconds",
+        "2",
+        "--sw-fetch-retry-attempts",
+        "3",
+        "--sw-fetch-retry-backoff-seconds",
+        "5",
+        "--sw-fetch-timeout-seconds",
+        "30",
+        "--concept-import-progress-every",
+        "5000",
+        "--concept-import-commit-every",
+        "5000",
+    ]
+    if report_date:
+        args.extend(["--report-date", report_date])
+    return tuple(args)
+
+
 def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
     steps: list[ChainStep] = [
         ChainStep("m2_data_refresh", "stock_quant_v2.scripts.bootstrap_m2_data_refresh_chain"),
         ChainStep("m3_analytics_refresh", "stock_quant_v2.scripts.bootstrap_m3_analytics_refresh_chain"),
+        ChainStep(
+            "m4_taxonomy_daily_refresh",
+            "stock_quant_v2.scripts.bootstrap_m4_taxonomy_inputs_p0",
+            extra_args=_build_taxonomy_daily_refresh_args(args.report_date),
+            optional=True,
+            soft_fail=True,
+        ),
         ChainStep("m4_strategy_refresh", "stock_quant_v2.scripts.bootstrap_m4_strategy_refresh_chain"),
     ]
 

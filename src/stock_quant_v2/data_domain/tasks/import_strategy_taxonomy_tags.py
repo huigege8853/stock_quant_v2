@@ -11,6 +11,7 @@ from stock_quant_v2.data_domain.services.taxonomy_tag_import_service import (
     DEFAULT_EFFECTIVE_FROM,
     SW_AKSHARE_SOURCE_PROVIDER,
     TaxonomyImportResult,
+    TaxonomyImportStats,
     TaxonomyTagImportService,
     fetch_sw_industry_rows_from_akshare,
     utc_now_iso,
@@ -44,10 +45,35 @@ def run_import_strategy_taxonomy_tags(
     sw_fetch_timeout_seconds: float = 20.0,
     concept_import_progress_every: int = 2000,
     concept_import_commit_every: int = 5000,
+    fail_safe: bool = False,
 ) -> TaxonomyImportResult:
     service = TaxonomyTagImportService()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     result = TaxonomyImportResult(run_id=run_id, started_at=utc_now_iso())
+
+    def append_provider_skip(import_name: str, source: str, tag_type: str, exc: Exception) -> None:
+        result.stats.append(
+            TaxonomyImportStats(
+                import_name=import_name,
+                source=source,
+                tag_type=tag_type,
+                input_rows=0,
+                skipped_rows=1,
+                error_rows=1,
+                errors=[
+                    {
+                        "issue_code": "PROVIDER_UNAVAILABLE",
+                        "message": f"{type(exc).__name__}: {exc}",
+                        "daily_fail_safe": fail_safe,
+                    }
+                ],
+            )
+        )
+        if progress_callback:
+            progress_callback(
+                f"{import_name.upper()}_SKIPPED_PROVIDER_UNAVAILABLE "
+                f"error={type(exc).__name__}: {exc}"
+            )
 
     if sw_industry_csv:
         if progress_callback:
@@ -69,40 +95,50 @@ def run_import_strategy_taxonomy_tags(
         if progress_callback:
             progress_callback("SW_AKSHARE_IMPORT_START")
         try:
-            import akshare as ak
-        except ImportError as exc:  # pragma: no cover - depends on local env.
-            raise RuntimeError("akshare is required for --fetch-sw-industry-akshare. Install project dependencies first.") from exc
-        sw_rows = fetch_sw_industry_rows_from_akshare(
-            ak_module=ak,
-            industry_codes=sw_industry_codes,
-            max_industries=max_sw_industries,
-            progress_callback=progress_callback,
-            progress_every=progress_every,
-            sw_fetch_delay_seconds=sw_fetch_delay_seconds,
-            sw_fallback_delay_seconds=sw_fallback_delay_seconds,
-            sw_fetch_retry_attempts=sw_fetch_retry_attempts,
-            sw_fetch_retry_backoff_seconds=sw_fetch_retry_backoff_seconds,
-            sw_fetch_timeout_seconds=sw_fetch_timeout_seconds,
-        )
-        output_path = Path(output_dir) / "sw_industry_2021_mapping.csv"
-        write_source_rows_csv(output_path, sw_rows)
-        if progress_callback:
-            progress_callback(f"SW_AKSHARE_SOURCE_CSV_WRITTEN path={output_path} rows={len(sw_rows)}")
-        result.stats.append(
-            service.import_sw_industry_rows(
-                session=session,
-                rows=sw_rows,
-                source="akshare.sw_index_third_info + akshare_or_legulegu_sw_index_third_cons",
-                source_provider=SW_AKSHARE_SOURCE_PROVIDER,
-                effective_from=effective_from,
-                effective_to=effective_to,
-                confidence=Decimal("0.9000"),
-                import_name="sw_industry_akshare",
+            try:
+                import akshare as ak
+            except ImportError as exc:  # pragma: no cover - depends on local env.
+                raise RuntimeError("akshare is required for --fetch-sw-industry-akshare. Install project dependencies first.") from exc
+            sw_rows = fetch_sw_industry_rows_from_akshare(
+                ak_module=ak,
+                industry_codes=sw_industry_codes,
+                max_industries=max_sw_industries,
+                progress_callback=progress_callback,
+                progress_every=progress_every,
+                sw_fetch_delay_seconds=sw_fetch_delay_seconds,
+                sw_fallback_delay_seconds=sw_fallback_delay_seconds,
+                sw_fetch_retry_attempts=sw_fetch_retry_attempts,
+                sw_fetch_retry_backoff_seconds=sw_fetch_retry_backoff_seconds,
+                sw_fetch_timeout_seconds=sw_fetch_timeout_seconds,
             )
-        )
-        if progress_callback:
-            stat = result.stats[-1]
-            progress_callback(f"SW_AKSHARE_IMPORT_DONE input_rows={stat.input_rows} instrument_tag_upsert_rows={stat.instrument_tag_upsert_rows} missing_instruments={stat.missing_instruments} error_rows={stat.error_rows}")
+            output_path = Path(output_dir) / "sw_industry_2021_mapping.csv"
+            write_source_rows_csv(output_path, sw_rows)
+            if progress_callback:
+                progress_callback(f"SW_AKSHARE_SOURCE_CSV_WRITTEN path={output_path} rows={len(sw_rows)}")
+            result.stats.append(
+                service.import_sw_industry_rows(
+                    session=session,
+                    rows=sw_rows,
+                    source="akshare.sw_index_third_info + akshare_or_legulegu_sw_index_third_cons",
+                    source_provider=SW_AKSHARE_SOURCE_PROVIDER,
+                    effective_from=effective_from,
+                    effective_to=effective_to,
+                    confidence=Decimal("0.9000"),
+                    import_name="sw_industry_akshare",
+                )
+            )
+            if progress_callback:
+                stat = result.stats[-1]
+                progress_callback(f"SW_AKSHARE_IMPORT_DONE input_rows={stat.input_rows} instrument_tag_upsert_rows={stat.instrument_tag_upsert_rows} missing_instruments={stat.missing_instruments} error_rows={stat.error_rows}")
+        except Exception as exc:  # noqa: BLE001
+            if not fail_safe:
+                raise
+            append_provider_skip(
+                "sw_industry_akshare",
+                "akshare.sw_index_third_info + akshare_or_legulegu_sw_index_third_cons",
+                "SW_INDUSTRY_L1/L2/L3",
+                exc,
+            )
 
     if concept_em_csv:
         if progress_callback:
@@ -124,27 +160,37 @@ def run_import_strategy_taxonomy_tags(
         if progress_callback:
             progress_callback("CONCEPT_AKSHARE_IMPORT_START")
         try:
-            import akshare as ak
-        except ImportError as exc:  # pragma: no cover - depends on local env.
-            raise RuntimeError("akshare is required for --fetch-em-concepts. Install project dependencies first.") from exc
-        result.stats.append(
-            service.import_concept_em_from_akshare(
-                session=session,
-                ak_module=ak,
-                concept_names=concept_names,
-                max_concepts=max_concepts,
-                progress_callback=progress_callback,
-                progress_every=progress_every,
-                effective_from=effective_from,
-                effective_to=effective_to,
-                confidence=Decimal("0.9000"),
-                concept_import_progress_every=concept_import_progress_every,
-                concept_import_commit_every=concept_import_commit_every,
+            try:
+                import akshare as ak
+            except ImportError as exc:  # pragma: no cover - depends on local env.
+                raise RuntimeError("akshare is required for --fetch-em-concepts. Install project dependencies first.") from exc
+            result.stats.append(
+                service.import_concept_em_from_akshare(
+                    session=session,
+                    ak_module=ak,
+                    concept_names=concept_names,
+                    max_concepts=max_concepts,
+                    progress_callback=progress_callback,
+                    progress_every=progress_every,
+                    effective_from=effective_from,
+                    effective_to=effective_to,
+                    confidence=Decimal("0.9000"),
+                    concept_import_progress_every=concept_import_progress_every,
+                    concept_import_commit_every=concept_import_commit_every,
+                )
             )
-        )
-        if progress_callback:
-            stat = result.stats[-1]
-            progress_callback(f"CONCEPT_AKSHARE_IMPORT_DONE input_rows={stat.input_rows} instrument_tag_upsert_rows={stat.instrument_tag_upsert_rows} missing_instruments={stat.missing_instruments} error_rows={stat.error_rows}")
+            if progress_callback:
+                stat = result.stats[-1]
+                progress_callback(f"CONCEPT_AKSHARE_IMPORT_DONE input_rows={stat.input_rows} instrument_tag_upsert_rows={stat.instrument_tag_upsert_rows} missing_instruments={stat.missing_instruments} error_rows={stat.error_rows}")
+        except Exception as exc:  # noqa: BLE001
+            if not fail_safe:
+                raise
+            append_provider_skip(
+                "concept_em_akshare",
+                "akshare.stock_board_concept_name_em + stock_board_concept_cons_em",
+                "CONCEPT_EM",
+                exc,
+            )
 
     if not result.stats:
         raise ValueError("No taxonomy input was requested. Provide --sw-industry-csv, --fetch-sw-industry-akshare, --concept-em-csv, or --fetch-em-concepts.")

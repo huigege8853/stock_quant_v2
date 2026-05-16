@@ -6,6 +6,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from sqlalchemy import text
+
 
 def _parse_env_line(line: str) -> tuple[str, str] | None:
     stripped = line.strip()
@@ -48,11 +50,29 @@ def _split_csv(value: str | None) -> list[str] | None:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+
+
+def _resolve_report_date(session, explicit_report_date: str | None) -> str:
+    if explicit_report_date:
+        return explicit_report_date
+
+    value = session.execute(
+        text(
+            "select max(trade_date)::text "
+            "from public.core_daily_bar "
+            "where price_adjust_type = 'RAW'"
+        )
+    ).scalar_one_or_none()
+    if not value:
+        raise ValueError("Cannot resolve report date: no RAW rows in public.core_daily_bar")
+    return str(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="M4 S1.1 taxonomy input import: SW industry + Eastmoney concept mapping.")
     parser.add_argument("--project-root", default=".")
     parser.add_argument("--env-file", default=None)
-    parser.add_argument("--report-date", required=True)
+    parser.add_argument("--report-date", default=None, help="Report date. Default: latest RAW core_daily_bar trade_date from DB.")
     parser.add_argument("--output-dir", default="artifacts/m4/strategy_research_readiness_taxonomy")
     parser.add_argument("--sw-industry-csv", default=None, help="CSV containing SW 2021 industry L1/L2/L3 mapping.")
     parser.add_argument("--fetch-sw-industry-akshare", action="store_true", help="Fetch SW industry L3 constituents through AKShare and import SW_INDUSTRY mappings.")
@@ -72,6 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sw-fetch-timeout-seconds", type=float, default=20.0, help="HTTP timeout for Legulegu SW constituent fallback requests.")
     parser.add_argument("--concept-import-progress-every", type=int, default=2000, help="Print one progress line every N concept mapping rows during DB import.")
     parser.add_argument("--concept-import-commit-every", type=int, default=5000, help="Commit every N concept mapping rows. Use 0 to keep one transaction.")
+    parser.add_argument("--daily-refresh", action="store_true", help="Daily taxonomy refresh mode. If no taxonomy input is provided, attempt SW industry and Eastmoney concept providers.")
+    parser.add_argument("--fail-safe", action="store_true", help="Do not fail the caller when a taxonomy provider is unavailable; write WARN/PARTIAL artifacts and keep last-good DB data.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress logs.")
     return parser
 
@@ -110,6 +132,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_repo = RunRepository()
     run = None
     try:
+        resolved_report_date = _resolve_report_date(session, args.report_date)
+
+        if args.daily_refresh and not any([
+            args.sw_industry_csv,
+            args.fetch_sw_industry_akshare,
+            args.concept_em_csv,
+            args.fetch_em_concepts,
+        ]):
+            args.fetch_sw_industry_akshare = True
+            args.fetch_em_concepts = True
+
+        progress(
+            "RESOLVED "
+            f"report_date={resolved_report_date} "
+            f"daily_refresh={args.daily_refresh} "
+            f"fail_safe={args.fail_safe}"
+        )
+
         run = run_repo.create_run(
             session=session,
             run_type="DATA_BACKFILL",
@@ -133,6 +173,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "max_concepts": args.max_concepts,
                 "concept_import_progress_every": args.concept_import_progress_every,
                 "concept_import_commit_every": args.concept_import_commit_every,
+                "daily_refresh": args.daily_refresh,
+                "fail_safe": args.fail_safe,
+                "report_date": resolved_report_date,
                 "guardrails": ["no_strategy_signal", "no_backtest", "no_paper_trading", "no_risk_change"],
             },
         )
@@ -142,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         result = run_import_strategy_taxonomy_tags(
             session=session,
             run_id=run.id,
-            report_date=args.report_date,
+            report_date=resolved_report_date,
             output_dir=output_dir,
             sw_industry_csv=args.sw_industry_csv,
             fetch_sw_industry_akshare=args.fetch_sw_industry_akshare,
@@ -163,6 +206,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             sw_fetch_timeout_seconds=args.sw_fetch_timeout_seconds,
             concept_import_progress_every=args.concept_import_progress_every,
             concept_import_commit_every=args.concept_import_commit_every,
+            fail_safe=args.fail_safe,
         )
         session.commit()
         final_status = "SUCCESS" if result.status == "SUCCESS" else "PARTIAL"
