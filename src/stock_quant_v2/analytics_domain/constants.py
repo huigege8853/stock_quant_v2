@@ -25,6 +25,9 @@ FEATURE_CODES = {
     "FEAT_VOLATILITY_RANK_20": "feat_volatility_rank_20",
     "FEAT_TRADABILITY_SCORE": "feat_tradability_score",
     "FEAT_TRADABLE_FLAG": "feat_tradable_flag",
+    "FEAT_INDUSTRY_STRENGTH_20": "feat_industry_strength_20",
+    "FEAT_INDUSTRY_RET_20": "feat_industry_ret_20",
+    "FEAT_INDUSTRY_BREADTH_20": "feat_industry_breadth_20",
 }
 
 FEATURE_SET_CODES = {

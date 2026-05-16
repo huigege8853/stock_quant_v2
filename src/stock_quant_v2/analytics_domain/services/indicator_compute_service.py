@@ -159,6 +159,8 @@ class IndicatorComputeService:
                     db.instrument_id,
                     db.trade_date,
                     db.close AS close_price,
+                    db.volume AS volume,
+                    db.amount AS amount,
                     af.forward_factor AS adjust_factor,
                     pl.up_limit AS up_limit_price,
                     COALESCE(isd.trading_status, 'NO_BAR') AS trading_status,
@@ -243,6 +245,8 @@ class IndicatorComputeService:
             is_suspended=bool(current_row.get("is_suspended")),
             close_price=current_row.get("close_price"),
             up_limit_price=current_row.get("up_limit_price"),
+            volume=current_row.get("volume"),
+            amount=current_row.get("amount"),
         )
 
         results: list[dict[str, Any]] = []

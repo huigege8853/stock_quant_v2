@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from stock_quant_v2.analytics_domain.constants import FEATURE_SET_CODES, FEATURE_VERSION_V1
+from stock_quant_v2.analytics_domain.constants import FEATURE_CODES, FEATURE_SET_CODES, FEATURE_VERSION_V1
 from stock_quant_v2.analytics_domain.repositories.feature_snapshot_repository import FeatureSnapshotRepository
 
 
@@ -57,10 +57,17 @@ class FeatureBuildService:
                 }
             )
 
-        deleted_rows = self.snapshot_repo.delete_by_trade_date_and_feature_set(
+        deleted_rows = self.snapshot_repo.delete_by_trade_date_feature_set_and_codes(
             trade_date=trade_date,
             feature_set_code=feature_set_code,
             feature_set_version=feature_set_version,
+            feature_codes=[
+                FEATURE_CODES["FEAT_MOM_20"],
+                FEATURE_CODES["FEAT_TREND_STRENGTH_20"],
+                FEATURE_CODES["FEAT_VOLATILITY_RANK_20"],
+                FEATURE_CODES["FEAT_TRADABILITY_SCORE"],
+                FEATURE_CODES["FEAT_TRADABLE_FLAG"],
+            ],
         )
         self.snapshot_repo.bulk_insert(rows_to_insert)
 
