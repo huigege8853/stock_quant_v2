@@ -23,6 +23,8 @@ class CoreDailyBar(Base):
     low: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     close: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     pre_close: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    pct_change: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    price_change: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
 
     volume: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))
     amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 6))

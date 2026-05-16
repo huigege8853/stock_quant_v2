@@ -25,6 +25,8 @@ class CoreRepository:
             "low": stmt.excluded.low,
             "close": stmt.excluded.close,
             "pre_close": stmt.excluded.pre_close,
+            "pct_change": stmt.excluded.pct_change,
+            "price_change": stmt.excluded.price_change,
             "volume": stmt.excluded.volume,
             "amount": stmt.excluded.amount,
             "data_version_id": stmt.excluded.data_version_id,

@@ -93,6 +93,8 @@ def staging_to_core_daily_bar_dict(stg_row: dict, instrument_id: int, data_versi
         "low": stg_row["low"],
         "close": stg_row["close"],
         "pre_close": stg_row.get("pre_close"),
+        "pct_change": stg_row.get("pct_change"),
+        "price_change": stg_row.get("price_change"),
         "volume": stg_row.get("volume"),
         "amount": stg_row.get("turnover"),
         "turnover_rate": stg_row.get("turnover_rate"),
