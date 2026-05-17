@@ -32,6 +32,42 @@ class ProductionDailyObservationReportBuilder:
     would blur research and production report semantics.
     """
 
+
+    GENERIC_THEME_TAG_NAMES: frozenset[str] = frozenset({
+        "融资融券",
+        "沪股通",
+        "深股通",
+        "昨日高振幅",
+        "昨日涨停",
+        "近期新高",
+        "近期新低",
+        "百日新高",
+        "百日新低",
+        "昨日连板",
+        "昨日首板",
+        "昨日炸板",
+        "昨日涨停表现",
+        "ST板块",
+        "破净股",
+        "富时罗素",
+        "MSCI概念",
+        "标普道琼斯A股",
+        "参股新三板",
+    })
+    GENERIC_THEME_TAG_KEYWORDS: tuple[str, ...] = (
+        "昨日",
+        "近期",
+        "百日",
+        "融资融券",
+        "沪股通",
+        "深股通",
+        "ST板块",
+        "破净",
+        "富时罗素",
+        "MSCI",
+        "标普",
+    )
+
     WATERLINE_SPECS: tuple[WaterlineSpec, ...] = (
         WaterlineSpec("meta_trading_calendar", "trade_date", critical=True),
         WaterlineSpec("core_daily_bar", "trade_date", critical=True),
@@ -1406,14 +1442,32 @@ class ProductionDailyObservationReportBuilder:
         industry_exposure: dict[str, Any],
         concept_exposure: dict[str, Any],
     ) -> dict[str, Any]:
-        rows = (industry_exposure.get("rows") or []) + (concept_exposure.get("rows") or [])
-        exposed_rows = [row for row in rows if int(row.get("selected_count") or 0) > 0 or int(row.get("holding_count") or 0) > 0]
-        strong_rows = [row for row in exposed_rows if row.get("match_status") == "STRONG_MATCH"]
-        weak_rows = [row for row in exposed_rows if row.get("match_status") == "WEAK_EXPOSURE"]
-        top_selected = None
-        if exposed_rows:
-            top_selected = max(
-                exposed_rows,
+        industry_rows = [
+            row for row in (industry_exposure.get("rows") or [])
+            if int(row.get("selected_count") or 0) > 0 or int(row.get("holding_count") or 0) > 0
+        ]
+        concept_rows = [
+            row for row in (concept_exposure.get("rows") or [])
+            if int(row.get("selected_count") or 0) > 0 or int(row.get("holding_count") or 0) > 0
+        ]
+        main_theme_rows = industry_rows + [row for row in concept_rows if not cls._is_generic_theme_tag(row)]
+        generic_rows = [row for row in concept_rows if cls._is_generic_theme_tag(row)]
+        strong_rows = [row for row in main_theme_rows if row.get("match_status") == "STRONG_MATCH"]
+        weak_rows = [row for row in main_theme_rows if row.get("match_status") == "WEAK_EXPOSURE"]
+        top_mainline = None
+        if main_theme_rows:
+            top_mainline = max(
+                main_theme_rows,
+                key=lambda row: (
+                    cls._to_decimal_value(row.get("selected_weight")) or Decimal("0"),
+                    cls._to_decimal_value(row.get("holding_weight")) or Decimal("0"),
+                    cls._to_decimal_value(row.get("market_avg_pct_change")) or Decimal("-999"),
+                ),
+            )
+        top_generic = None
+        if generic_rows:
+            top_generic = max(
+                generic_rows,
                 key=lambda row: (
                     cls._to_decimal_value(row.get("selected_weight")) or Decimal("0"),
                     cls._to_decimal_value(row.get("holding_weight")) or Decimal("0"),
@@ -1421,25 +1475,38 @@ class ProductionDailyObservationReportBuilder:
             )
         if weak_rows and not strong_rows:
             status = "WARN"
-            reason = "exposure_skews_to_weak_tags"
+            reason = "main_theme_exposure_skews_to_weak_tags"
         elif strong_rows:
             status = "PASS"
-            reason = "has_strong_tag_exposure"
-        elif exposed_rows:
+            reason = "has_strong_main_theme_exposure"
+        elif main_theme_rows:
             status = "PASS"
-            reason = "tag_exposure_neutral"
+            reason = "main_theme_exposure_neutral"
         else:
             status = "WARN"
-            reason = "no_tag_exposure"
+            reason = "no_main_theme_exposure"
         return {
             "status": status,
             "reason": reason,
             "strong_tag_count": len(strong_rows),
             "weak_tag_count": len(weak_rows),
-            "top_exposure_tag": (top_selected or {}).get("tag_name"),
-            "top_exposure_tag_type": (top_selected or {}).get("tag_type"),
-            "top_exposure_match_status": (top_selected or {}).get("match_status"),
+            "main_theme_tag_count": len(main_theme_rows),
+            "generic_tag_filtered_count": len(generic_rows),
+            "top_exposure_tag": (top_mainline or {}).get("tag_name"),
+            "top_exposure_tag_type": (top_mainline or {}).get("tag_type"),
+            "top_exposure_match_status": (top_mainline or {}).get("match_status"),
+            "top_generic_tag_filtered": (top_generic or {}).get("tag_name"),
         }
+
+    @classmethod
+    def _is_generic_theme_tag(cls, row: dict[str, Any]) -> bool:
+        tag_name = str(row.get("tag_name") or "").strip()
+        tag_type = str(row.get("tag_type") or "").strip()
+        if tag_type.startswith("SW_INDUSTRY"):
+            return False
+        if tag_name in cls.GENERIC_THEME_TAG_NAMES:
+            return True
+        return any(keyword and keyword in tag_name for keyword in cls.GENERIC_THEME_TAG_KEYWORDS)
 
     def _instrument_market_stats(self, *, report_date: date, instrument_ids: list[Any]) -> dict[str, Any]:
         cleaned_ids = [int(x) for x in instrument_ids if x is not None]
@@ -1531,8 +1598,9 @@ class ProductionDailyObservationReportBuilder:
             if match:
                 notes.append(
                     f"campaign={item.get('campaign_code')} market_match={match.get('status')} "
-                    f"reason={match.get('reason')} top_exposure={match.get('top_exposure_tag')} "
-                    f"top_exposure_match={match.get('top_exposure_match_status')}"
+                    f"reason={match.get('reason')} top_mainline={match.get('top_exposure_tag')} "
+                    f"top_mainline_match={match.get('top_exposure_match_status')} "
+                    f"generic_filtered={match.get('generic_tag_filtered_count')}"
                 )
         return notes
 
@@ -1818,13 +1886,13 @@ class ProductionDailyObservationReportBuilder:
             "",
             "### 2.8 策略与市场主线匹配小结",
             "",
-            "| campaign | status | reason | strong_tags | weak_tags | top_exposure_tag | top_exposure_match |",
-            "|---|---|---|---:|---:|---|---|",
+            "| campaign | status | reason | strong_main_tags | weak_main_tags | generic_filtered | top_mainline_tag | top_mainline_match | filtered_top_generic |",
+            "|---|---|---|---:|---:|---:|---|---|---|",
         ])
         for item in market_context.get("strategy_alignment") or []:
             summary = item.get("market_match_summary") or {}
             lines.append(
-                f"| {item.get('campaign_code')} | {summary.get('status')} | {summary.get('reason')} | {summary.get('strong_tag_count')} | {summary.get('weak_tag_count')} | {summary.get('top_exposure_tag')} | {summary.get('top_exposure_match_status')} |"
+                f"| {item.get('campaign_code')} | {summary.get('status')} | {summary.get('reason')} | {summary.get('strong_tag_count')} | {summary.get('weak_tag_count')} | {summary.get('generic_tag_filtered_count')} | {summary.get('top_exposure_tag')} | {summary.get('top_exposure_match_status')} | {summary.get('top_generic_tag_filtered') or ''} |"
             )
         lines.extend(["", "## 3. Production Paper Campaigns", ""])
         for campaign in payload.get("campaigns") or []:
