@@ -86,6 +86,11 @@ class ProductionDailyObservationReportBuilder:
             )
             for campaign in production_campaigns
         ]
+        market_context = self._build_market_context(
+            report_date=resolved_report_date,
+            campaign_reports=campaign_reports,
+            detail_limit=detail_limit,
+        )
         artifact_index = self._build_artifact_index(
             project_root=project_root,
             campaigns=production_campaigns,
@@ -113,12 +118,14 @@ class ProductionDailyObservationReportBuilder:
             "overall_status": overall_status,
             "signal_as_of_date": signal_as_of_date,
             "waterline": waterline,
+            "market_context": market_context,
             "campaigns": campaign_reports,
             "artifact_index": artifact_index,
             "checks": checks,
             "observation_notes": self._build_observation_notes(
                 overall_status=overall_status,
                 waterline=waterline,
+                market_context=market_context,
                 campaign_reports=campaign_reports,
                 artifact_index=artifact_index,
             ),
@@ -938,6 +945,397 @@ class ProductionDailyObservationReportBuilder:
             ordered.append(text_value)
         return separator.join(ordered) if ordered else None
 
+    def _build_market_context(
+        self,
+        *,
+        report_date: date,
+        campaign_reports: list[dict[str, Any]],
+        detail_limit: int,
+    ) -> dict[str, Any]:
+        """Build market-wide context for production daily observation.
+
+        This is production observation context, not a research conclusion. It uses
+        stable production base-data tables and gracefully degrades when industry or
+        concept tags are unavailable.
+        """
+        breadth = self._market_breadth(report_date=report_date)
+        index_overview = self._market_index_overview(report_date=report_date, limit=20)
+        strong_stocks = self._market_stock_extremes(report_date=report_date, order="strong", limit=min(detail_limit, 30))
+        weak_stocks = self._market_stock_extremes(report_date=report_date, order="weak", limit=min(detail_limit, 30))
+        industry_strength = self._tag_strength_summary(
+            report_date=report_date,
+            tag_type_pattern="SW_INDUSTRY_L2%",
+            limit=15,
+        )
+        concept_strength = self._tag_strength_summary(
+            report_date=report_date,
+            tag_type_pattern="%CONCEPT%",
+            limit=15,
+        )
+        strategy_alignment = self._strategy_market_alignment(
+            report_date=report_date,
+            campaign_reports=campaign_reports,
+        )
+        return {
+            "report_date": report_date,
+            "status": self._derive_market_context_status(
+                breadth=breadth,
+                index_overview=index_overview,
+                strong_stocks=strong_stocks,
+            ),
+            "summary": self._market_context_summary(
+                breadth=breadth,
+                index_overview=index_overview,
+                industry_strength=industry_strength,
+                strategy_alignment=strategy_alignment,
+            ),
+            "breadth": breadth,
+            "index_overview": index_overview,
+            "strong_stocks": strong_stocks,
+            "weak_stocks": weak_stocks,
+            "industry_strength": industry_strength,
+            "concept_strength": concept_strength,
+            "strategy_alignment": strategy_alignment,
+        }
+
+    def _market_breadth(self, *, report_date: date) -> dict[str, Any]:
+        sql = """
+        with base as (
+            select
+                b.instrument_id,
+                b.close,
+                b.pre_close,
+                b.amount,
+                b.volume,
+                b.turnover_rate,
+                b.is_suspended,
+                case
+                    when b.pct_change is null then
+                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
+                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
+                    else b.pct_change
+                end as pct_change,
+                l.up_limit,
+                l.down_limit
+            from public.core_daily_bar b
+            left join public.core_price_limit_daily l
+              on l.instrument_id = b.instrument_id
+             and l.trade_date = b.trade_date
+            where b.trade_date = :report_date
+              and coalesce(b.is_suspended, false) = false
+        )
+        select
+            count(*) as total_rows,
+            count(*) filter (where pct_change > 0) as up_rows,
+            count(*) filter (where pct_change < 0) as down_rows,
+            count(*) filter (where pct_change = 0) as flat_rows,
+            count(*) filter (where pct_change >= 0.03) as up_3pct_rows,
+            count(*) filter (where pct_change >= 0.05) as up_5pct_rows,
+            count(*) filter (where pct_change <= -0.03) as down_3pct_rows,
+            count(*) filter (where pct_change <= -0.05) as down_5pct_rows,
+            count(*) filter (where up_limit is not null and close >= up_limit) as limit_up_rows,
+            count(*) filter (where down_limit is not null and close <= down_limit) as limit_down_rows,
+            count(*) filter (where up_limit is not null and close < up_limit and close >= up_limit * 0.98) as near_limit_up_rows,
+            count(*) filter (where down_limit is not null and close > down_limit and close <= down_limit * 1.02) as near_limit_down_rows,
+            avg(pct_change) as avg_pct_change,
+            percentile_cont(0.5) within group (order by pct_change) as median_pct_change,
+            sum(amount) as total_amount
+        from base
+        """
+        row = self._one_or_none(sql, {"report_date": report_date}) or {}
+        total = self._to_decimal_value(row.get("total_rows"))
+        up = self._to_decimal_value(row.get("up_rows"))
+        down = self._to_decimal_value(row.get("down_rows"))
+        row["up_ratio"] = (up / total) if total and up is not None else None
+        row["down_ratio"] = (down / total) if total and down is not None else None
+        row["market_breadth_state"] = self._classify_breadth(row)
+        return row
+
+    def _market_index_overview(self, *, report_date: date, limit: int) -> list[dict[str, Any]]:
+        sql_with_dim = """
+        with curr as (
+            select * from public.market_index_bar where trade_date = :report_date
+        ), prev as (
+            select distinct on (market_index_id)
+                market_index_id,
+                close as prev_close
+            from public.market_index_bar
+            where trade_date < :report_date
+            order by market_index_id, trade_date desc
+        )
+        select
+            c.market_index_id,
+            coalesce(mi.index_code, mi.symbol, ('index_' || c.market_index_id::text)) as index_code,
+            coalesce(mi.display_name, mi.index_name, mi.name, ('index_' || c.market_index_id::text)) as index_name,
+            c.close,
+            p.prev_close,
+            case when p.prev_close is null or p.prev_close = 0 then null else c.close / p.prev_close - 1 end as pct_change,
+            c.volume,
+            c.turnover
+        from curr c
+        left join prev p on p.market_index_id = c.market_index_id
+        left join public.market_index mi on mi.id = c.market_index_id
+        order by c.market_index_id
+        limit :limit
+        """
+        fallback_sql = """
+        with curr as (
+            select * from public.market_index_bar where trade_date = :report_date
+        ), prev as (
+            select distinct on (market_index_id)
+                market_index_id,
+                close as prev_close
+            from public.market_index_bar
+            where trade_date < :report_date
+            order by market_index_id, trade_date desc
+        )
+        select
+            c.market_index_id,
+            ('index_' || c.market_index_id::text) as index_code,
+            ('index_' || c.market_index_id::text) as index_name,
+            c.close,
+            p.prev_close,
+            case when p.prev_close is null or p.prev_close = 0 then null else c.close / p.prev_close - 1 end as pct_change,
+            c.volume,
+            c.turnover
+        from curr c
+        left join prev p on p.market_index_id = c.market_index_id
+        order by c.market_index_id
+        limit :limit
+        """
+        try:
+            return self._rows(sql_with_dim, {"report_date": report_date, "limit": limit})
+        except Exception:
+            self._rollback_session_safely()
+            try:
+                return self._rows(fallback_sql, {"report_date": report_date, "limit": limit})
+            except Exception:
+                self._rollback_session_safely()
+                return []
+
+    def _market_stock_extremes(self, *, report_date: date, order: str, limit: int) -> list[dict[str, Any]]:
+        direction = "desc" if order == "strong" else "asc"
+        sql = f"""
+        select
+            b.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            b.close,
+            b.pre_close,
+            case
+                    when b.pct_change is null then
+                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
+                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
+                    else b.pct_change
+                end as pct_change,
+            b.amount,
+            b.volume,
+            b.turnover_rate,
+            l.up_limit,
+            l.down_limit,
+            case when l.up_limit is not null and b.close >= l.up_limit then true else false end as is_limit_up,
+            case when l.down_limit is not null and b.close <= l.down_limit then true else false end as is_limit_down
+        from public.core_daily_bar b
+        left join public.meta_instrument mi on mi.id = b.instrument_id
+        left join public.core_price_limit_daily l
+          on l.instrument_id = b.instrument_id
+         and l.trade_date = b.trade_date
+        where b.trade_date = :report_date
+          and coalesce(b.is_suspended, false) = false
+          and b.pre_close is not null
+          and b.pre_close <> 0
+        order by pct_change {direction} nulls last, b.amount desc nulls last
+        limit :limit
+        """
+        return self._rows(sql, {"report_date": report_date, "limit": limit})
+
+    def _tag_strength_summary(self, *, report_date: date, tag_type_pattern: str, limit: int) -> dict[str, Any]:
+        sql = """
+        with stock_ret as (
+            select
+                b.instrument_id,
+                b.close,
+                case
+                    when b.pct_change is null then
+                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
+                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
+                    else b.pct_change
+                end as pct_change,
+                b.amount,
+                l.up_limit,
+                l.down_limit
+            from public.core_daily_bar b
+            left join public.core_price_limit_daily l
+              on l.instrument_id = b.instrument_id
+             and l.trade_date = b.trade_date
+            where b.trade_date = :report_date
+              and coalesce(b.is_suspended, false) = false
+        ), tag_rows as (
+            select
+                t.tag_type,
+                t.tag_code,
+                t.tag_name,
+                sr.instrument_id,
+                sr.close,
+                sr.pct_change,
+                sr.amount,
+                sr.up_limit,
+                sr.down_limit
+            from stock_ret sr
+            join public.instrument_tag it
+              on it.instrument_id = sr.instrument_id
+             and it.effective_from <= :report_date
+             and (it.effective_to is null or it.effective_to >= :report_date)
+            join public.tag t on t.id = it.tag_id
+            where t.is_active = true
+              and t.tag_type like :tag_type_pattern
+        ), agg as (
+            select
+                tag_type,
+                tag_code,
+                tag_name,
+                count(*) as instrument_count,
+                count(*) filter (where pct_change > 0) as up_rows,
+                count(*) filter (where pct_change < 0) as down_rows,
+                avg(pct_change) as avg_pct_change,
+                percentile_cont(0.5) within group (order by pct_change) as median_pct_change,
+                sum(amount) as total_amount,
+                count(*) filter (where up_limit is not null and close >= up_limit) as limit_up_rows,
+                count(*) filter (where down_limit is not null and close <= down_limit) as limit_down_rows
+            from tag_rows
+            group by tag_type, tag_code, tag_name
+            having count(*) >= 5
+        )
+        select *
+        from agg
+        order by avg_pct_change desc nulls last, total_amount desc nulls last
+        limit :limit
+        """
+        try:
+            rows = self._rows(sql, {"report_date": report_date, "tag_type_pattern": tag_type_pattern, "limit": limit})
+        except Exception as exc:
+            self._rollback_session_safely()
+            return {"status": "WARN", "reason": f"query_failed:{type(exc).__name__}:{exc}", "rows": []}
+        if not rows:
+            return {"status": "WARN", "reason": "no_matching_tag_data", "rows": []}
+        return {"status": "PASS", "reason": f"rows={len(rows)}", "rows": rows}
+
+    def _strategy_market_alignment(self, *, report_date: date, campaign_reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for campaign in campaign_reports:
+            selected_ids = [item.get("instrument_id") for item in campaign.get("selected_instruments") or [] if item.get("instrument_id") is not None]
+            holding_ids = [item.get("instrument_id") for item in campaign.get("positions_preview") or [] if item.get("instrument_id") is not None]
+            rows.append({
+                "campaign_code": campaign.get("campaign_code"),
+                "portfolio_id": campaign.get("portfolio_id"),
+                "selected_market_stats": self._instrument_market_stats(report_date=report_date, instrument_ids=selected_ids),
+                "holding_market_stats": self._instrument_market_stats(report_date=report_date, instrument_ids=holding_ids),
+            })
+        return rows
+
+    def _instrument_market_stats(self, *, report_date: date, instrument_ids: list[Any]) -> dict[str, Any]:
+        cleaned_ids = [int(x) for x in instrument_ids if x is not None]
+        if not cleaned_ids:
+            return {"instrument_count": 0, "status": "WARN", "reason": "no_instruments"}
+        sql = """
+        select
+            count(*) as instrument_count,
+            count(*) filter (where pct_change > 0) as up_rows,
+            count(*) filter (where pct_change < 0) as down_rows,
+            avg(pct_change) as avg_pct_change,
+            count(*) filter (where up_limit is not null and close >= up_limit) as limit_up_rows,
+            count(*) filter (where down_limit is not null and close <= down_limit) as limit_down_rows,
+            sum(amount) as total_amount
+        from (
+            select
+                b.instrument_id,
+                b.close,
+                b.amount,
+                case
+                    when b.pct_change is null then
+                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
+                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
+                    else b.pct_change
+                end as pct_change,
+                l.up_limit,
+                l.down_limit
+            from public.core_daily_bar b
+            left join public.core_price_limit_daily l
+              on l.instrument_id = b.instrument_id
+             and l.trade_date = b.trade_date
+            where b.trade_date = :report_date
+              and b.instrument_id = any(:instrument_ids)
+        ) x
+        """
+        row = self._one_or_none(sql, {"report_date": report_date, "instrument_ids": cleaned_ids}) or {}
+        row["status"] = "PASS" if row.get("instrument_count") else "WARN"
+        row["reason"] = "market_stats_ready" if row.get("instrument_count") else "no_market_rows"
+        return row
+
+    @classmethod
+    def _derive_market_context_status(
+        cls,
+        *,
+        breadth: dict[str, Any],
+        index_overview: list[dict[str, Any]],
+        strong_stocks: list[dict[str, Any]],
+    ) -> str:
+        if not breadth or not breadth.get("total_rows"):
+            return "FAIL"
+        if not index_overview or not strong_stocks:
+            return "WARN"
+        return "PASS"
+
+    @classmethod
+    def _market_context_summary(
+        cls,
+        *,
+        breadth: dict[str, Any],
+        index_overview: list[dict[str, Any]],
+        industry_strength: dict[str, Any],
+        strategy_alignment: list[dict[str, Any]],
+    ) -> list[str]:
+        notes: list[str] = []
+        if breadth:
+            notes.append(
+                "market_breadth="
+                f"{breadth.get('market_breadth_state')} "
+                f"up_ratio={cls._fmt_percent(breadth.get('up_ratio'), 2)} "
+                f"limit_up={breadth.get('limit_up_rows')} limit_down={breadth.get('limit_down_rows')}"
+            )
+        if index_overview:
+            lead = index_overview[0]
+            notes.append(
+                f"index_sample={lead.get('index_name') or lead.get('index_code')} pct_change={cls._fmt_percent(lead.get('pct_change'), 2)}"
+            )
+        if industry_strength.get("status") == "PASS" and industry_strength.get("rows"):
+            lead = industry_strength["rows"][0]
+            notes.append(
+                f"strong_industry={lead.get('tag_name')} avg_pct_change={cls._fmt_percent(lead.get('avg_pct_change'), 2)}"
+            )
+        for item in strategy_alignment:
+            selected = item.get("selected_market_stats") or {}
+            holding = item.get("holding_market_stats") or {}
+            notes.append(
+                f"campaign={item.get('campaign_code')} selected_avg_return={cls._fmt_percent(selected.get('avg_pct_change'), 2)} "
+                f"holding_avg_return={cls._fmt_percent(holding.get('avg_pct_change'), 2)}"
+            )
+        return notes
+
+    @staticmethod
+    def _classify_breadth(breadth: dict[str, Any]) -> str:
+        up_ratio = ProductionDailyObservationReportBuilder._to_decimal_value(breadth.get("up_ratio"))
+        limit_up = ProductionDailyObservationReportBuilder._optional_int(breadth.get("limit_up_rows")) or 0
+        limit_down = ProductionDailyObservationReportBuilder._optional_int(breadth.get("limit_down_rows")) or 0
+        if up_ratio is None:
+            return "UNKNOWN"
+        if up_ratio >= Decimal("0.60") and limit_up >= limit_down:
+            return "BREADTH_STRONG"
+        if up_ratio <= Decimal("0.40") or limit_down > limit_up * 2:
+            return "BREADTH_WEAK"
+        return "BREADTH_NEUTRAL"
+
     def _campaign_artifacts(self, project_root: Path, campaign_code: str) -> list[dict[str, Any]]:
         if not campaign_code:
             return []
@@ -1048,6 +1446,7 @@ class ProductionDailyObservationReportBuilder:
         *,
         overall_status: str,
         waterline: list[dict[str, Any]],
+        market_context: dict[str, Any],
         campaign_reports: list[dict[str, Any]],
         artifact_index: list[dict[str, Any]],
     ) -> list[str]:
@@ -1058,6 +1457,10 @@ class ProductionDailyObservationReportBuilder:
         warn_or_fail = [row for row in waterline if row.get("status") != "PASS"]
         if warn_or_fail:
             notes.append("存在水位 WARN/FAIL，需优先检查：" + ", ".join(str(x.get("table_name")) for x in warn_or_fail[:10]))
+        market_status = (market_context or {}).get("status")
+        notes.append(f"market_context_status={market_status}。")
+        for note in (market_context or {}).get("summary") or []:
+            notes.append(str(note))
         for campaign in campaign_reports:
             notes.append(
                 f"campaign={campaign.get('campaign_code')} portfolio_id={campaign.get('portfolio_id')} status={campaign.get('status')} reason={campaign.get('reason')}"
@@ -1077,7 +1480,7 @@ class ProductionDailyObservationReportBuilder:
                 worst = losers[0]
                 code = worst.get("instrument_code") or worst.get("symbol") or worst.get("instrument_id")
                 notes.append(
-                    f"campaign={campaign.get('campaign_code')} worst_holding={code} total_pnl={worst.get('total_pnl')}"
+                    f"campaign={campaign.get('campaign_code')} worst_holding={code} total_pnl={cls._fmt_money(worst.get('total_pnl'))}"
                 )
         if not artifact_index:
             notes.append("未发现相关 M6.5/M8 产物索引，需检查 daily run 是否生成报告产物。")
@@ -1107,7 +1510,83 @@ class ProductionDailyObservationReportBuilder:
             lines.append(
                 f"| {row.get('table_name')} | {row.get('freshness_basis')} | {self._json_default(row.get('expected_date'))} | {self._json_default(row.get('max_date'))} | {row.get('rows')} | {row.get('max_run_id')} | {row.get('status')} | {row.get('reason')} |"
             )
-        lines.extend(["", "## 2. Production Paper Campaigns", ""])
+        market_context = payload.get("market_context") or {}
+        breadth = market_context.get("breadth") or {}
+        lines.extend([
+            "",
+            "## 2. 市场环境观察",
+            "",
+            f"- market_context_status: `{market_context.get('status')}`",
+            f"- market_breadth_state: `{breadth.get('market_breadth_state')}`",
+            f"- total_rows: `{breadth.get('total_rows')}` / up: `{breadth.get('up_rows')}` / down: `{breadth.get('down_rows')}` / flat: `{breadth.get('flat_rows')}`",
+            f"- up_ratio: `{self._fmt_percent(breadth.get('up_ratio'), 2)}` / down_ratio: `{self._fmt_percent(breadth.get('down_ratio'), 2)}`",
+            f"- limit_up: `{breadth.get('limit_up_rows')}` / limit_down: `{breadth.get('limit_down_rows')}` / near_limit_up: `{breadth.get('near_limit_up_rows')}` / near_limit_down: `{breadth.get('near_limit_down_rows')}`",
+            f"- avg_pct_change: `{self._fmt_percent(breadth.get('avg_pct_change'), 2)}` / median_pct_change: `{self._fmt_percent(breadth.get('median_pct_change'), 2)}` / total_amount: `{self._fmt_money(breadth.get('total_amount'))}`",
+            "",
+            "### 2.1 指数概况",
+            "",
+            "| index | close | pct_change | turnover |",
+            "|---|---:|---:|---:|",
+        ])
+        for item in (market_context.get("index_overview") or [])[:12]:
+            index_name = item.get("index_name") or item.get("index_code") or item.get("market_index_id")
+            lines.append(f"| {index_name} | {self._fmt_money(item.get('close'))} | {self._fmt_percent(item.get('pct_change'), 2)} | {self._fmt_money(item.get('turnover'))} |")
+        lines.extend([
+            "",
+            "### 2.2 强势股 Top",
+            "",
+            "| code | name | pct_change | close | amount | limit_up |",
+            "|---|---|---:|---:|---:|---|",
+        ])
+        for item in (market_context.get("strong_stocks") or [])[:20]:
+            code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+            lines.append(f"| {code} | {item.get('display_name')} | {self._fmt_percent(item.get('pct_change'), 2)} | {self._fmt_money(item.get('close'))} | {self._fmt_money(item.get('amount'))} | {item.get('is_limit_up')} |")
+        lines.extend([
+            "",
+            "### 2.3 弱势股 Top",
+            "",
+            "| code | name | pct_change | close | amount | limit_down |",
+            "|---|---|---:|---:|---:|---|",
+        ])
+        for item in (market_context.get("weak_stocks") or [])[:20]:
+            code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+            lines.append(f"| {code} | {item.get('display_name')} | {self._fmt_percent(item.get('pct_change'), 2)} | {self._fmt_money(item.get('close'))} | {self._fmt_money(item.get('amount'))} | {item.get('is_limit_down')} |")
+        lines.extend([
+            "",
+            "### 2.4 行业强弱",
+            "",
+            f"- status: `{(market_context.get('industry_strength') or {}).get('status')}` / reason: `{(market_context.get('industry_strength') or {}).get('reason')}`",
+            "",
+            "| industry | count | up | down | avg_pct_change | median_pct_change | limit_up | amount |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for item in ((market_context.get("industry_strength") or {}).get("rows") or [])[:15]:
+            lines.append(f"| {item.get('tag_name')} | {item.get('instrument_count')} | {item.get('up_rows')} | {item.get('down_rows')} | {self._fmt_percent(item.get('avg_pct_change'), 2)} | {self._fmt_percent(item.get('median_pct_change'), 2)} | {item.get('limit_up_rows')} | {self._fmt_money(item.get('total_amount'))} |")
+        lines.extend([
+            "",
+            "### 2.5 概念 / 题材数据状态",
+            "",
+            f"- status: `{(market_context.get('concept_strength') or {}).get('status')}` / reason: `{(market_context.get('concept_strength') or {}).get('reason')}`",
+            "",
+            "| concept | count | up | down | avg_pct_change | limit_up | amount |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for item in ((market_context.get("concept_strength") or {}).get("rows") or [])[:15]:
+            lines.append(f"| {item.get('tag_name')} | {item.get('instrument_count')} | {item.get('up_rows')} | {item.get('down_rows')} | {self._fmt_percent(item.get('avg_pct_change'), 2)} | {item.get('limit_up_rows')} | {self._fmt_money(item.get('total_amount'))} |")
+        lines.extend([
+            "",
+            "### 2.6 策略与市场匹配度",
+            "",
+            "| campaign | selected_count | selected_avg_return | selected_up | selected_down | selected_limit_up | holding_count | holding_avg_return | holding_up | holding_down |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for item in market_context.get("strategy_alignment") or []:
+            selected = item.get("selected_market_stats") or {}
+            holding = item.get("holding_market_stats") or {}
+            lines.append(
+                f"| {item.get('campaign_code')} | {selected.get('instrument_count')} | {self._fmt_percent(selected.get('avg_pct_change'), 2)} | {selected.get('up_rows')} | {selected.get('down_rows')} | {selected.get('limit_up_rows')} | {holding.get('instrument_count')} | {self._fmt_percent(holding.get('avg_pct_change'), 2)} | {holding.get('up_rows')} | {holding.get('down_rows')} |"
+            )
+        lines.extend(["", "## 3. Production Paper Campaigns", ""])
         for campaign in payload.get("campaigns") or []:
             snapshot = campaign.get("snapshot") or {}
             selection = campaign.get("selection_summary") or {}
@@ -1215,13 +1694,13 @@ class ProductionDailyObservationReportBuilder:
                     code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                     lines.append(f"| {label} | {code} | {item.get('display_name')} | {self._fmt_money(item.get('market_value'))} | {self._fmt_money(item.get('total_pnl'))} |")
             lines.append("")
-        lines.extend(["## 3. 风险 / 异常检查", "", "| check | status | reason |", "|---|---|---|"])
+        lines.extend(["## 4. 风险 / 异常检查", "", "| check | status | reason |", "|---|---|---|"])
         for check in payload.get("checks") or []:
             lines.append(f"| {check.get('check_name')} | {check.get('status')} | {check.get('reason')} |")
-        lines.extend(["", "## 4. 产物索引", "", "| campaign | type | path | exists |", "|---|---|---|---|"])
+        lines.extend(["", "## 5. 产物索引", "", "| campaign | type | path | exists |", "|---|---|---|---|"])
         for row in payload.get("artifact_index") or []:
             lines.append(f"| {row.get('campaign_code')} | {row.get('artifact_type')} | `{row.get('path')}` | {row.get('exists')} |")
-        lines.extend(["", "## 5. 观察提示", ""])
+        lines.extend(["", "## 6. 观察提示", ""])
         for note in payload.get("observation_notes") or []:
             lines.append(f"- {note}")
         lines.append("")
@@ -1232,9 +1711,21 @@ class ProductionDailyObservationReportBuilder:
         rows.append({"section": "metadata", "source": "campaign_config", "value": payload.get("campaign_config_path")})
         for item in payload.get("waterline") or []:
             rows.append({"section": "waterline", "source": item.get("table_name"), "value": item.get("max_date"), "status": item.get("status")})
+        market_context = payload.get("market_context") or {}
+        rows.append({"section": "market_context", "source": "market_breadth", "value": (market_context.get("breadth") or {}).get("market_breadth_state"), "status": market_context.get("status")})
+        rows.append({"section": "market_context", "source": "industry_strength", "value": (market_context.get("industry_strength") or {}).get("reason"), "status": (market_context.get("industry_strength") or {}).get("status")})
+        rows.append({"section": "market_context", "source": "concept_strength", "value": (market_context.get("concept_strength") or {}).get("reason"), "status": (market_context.get("concept_strength") or {}).get("status")})
         for campaign in payload.get("campaigns") or []:
             rows.append({"section": "campaign", "source": campaign.get("campaign_code"), "value": campaign.get("portfolio_id"), "status": campaign.get("status")})
         return rows
+
+
+    def _rollback_session_safely(self) -> None:
+        """Rollback failed read transaction so later observation queries can continue."""
+        try:
+            self.session.rollback()
+        except Exception:
+            pass
 
     def _rows(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         result = self.session.execute(text(sql), params).mappings().all()
@@ -1248,6 +1739,7 @@ class ProductionDailyObservationReportBuilder:
         try:
             return self.session.execute(text(sql), params or {}).scalar()
         except Exception:
+            self._rollback_session_safely()
             return None
 
     def _write_csv(self, path: Path, rows: list[dict[str, Any]]) -> None:
