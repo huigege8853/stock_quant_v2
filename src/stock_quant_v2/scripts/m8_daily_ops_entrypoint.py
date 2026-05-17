@@ -141,6 +141,21 @@ def _run_m9_finalizer(name: str, module_name: str, report_date: str) -> int:
     return exit_code
 
 
+
+
+def _resolve_m9_finalizer_profile() -> str:
+    raw = env_str("M8_DAILY_FINALIZER_PROFILE", "legacy")
+    normalized = str(raw or "legacy").strip().lower()
+    if normalized in {"off", "none", "disabled", "disable", "0", "false", "no"}:
+        return "off"
+    if normalized in {"legacy", "m9", "research"}:
+        return "legacy"
+    raise ValueError(
+        "Invalid M8_DAILY_FINALIZER_PROFILE: "
+        f"{raw!r}. Use 'off' for production DailyRun or 'legacy' for old M9 finalizers."
+    )
+
+
 def _run_m9_finalizers_best_effort(report_date: str) -> list[dict[str, object]]:
     print("[M8] Running M9.1.1 daily finalizer reports best-effort.", flush=True)
     print(f"[M8] M9.1.1 daily finalizer report_date = {report_date}", flush=True)
@@ -202,11 +217,18 @@ def main() -> None:
     finally:
         session.close()
 
-    # M9 reports explain the state produced by M8. They are best-effort finalizers:
-    # they should run even when the daily ops entrypoint fails, but they must not
-    # hide or replace the original M8 exit state.
-    report_date = _resolve_m9_report_date(result)
-    _run_m9_finalizers_best_effort(report_date)
+    # Legacy M9 reports explain the state produced by M8. In production DailyRun,
+    # the top-level chain now owns production_daily_observation_report, so these
+    # research-named finalizers are disabled through M8_DAILY_FINALIZER_PROFILE=off.
+    finalizer_profile = _resolve_m9_finalizer_profile()
+    if finalizer_profile == "legacy":
+        report_date = _resolve_m9_report_date(result)
+        _run_m9_finalizers_best_effort(report_date)
+    else:
+        print(
+            f"[M8] Skipping legacy M9 finalizers (M8_DAILY_FINALIZER_PROFILE={finalizer_profile}).",
+            flush=True,
+        )
 
     if pending_error is not None:
         raise pending_error
