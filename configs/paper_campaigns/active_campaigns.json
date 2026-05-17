@@ -14,5 +14,26 @@
     "target_count": 30,
     "replace_existing": false,
     "allow_main_portfolio": false
+  },
+  {
+    "campaign_code": "sim_regime_sector_industry_v1sm_20d_202605_r5",
+    "campaign_name": "production paper-campaign: regime_sector_industry_selection_v1 v1_state_machine 20D r5",
+    "strategy_code": "regime_sector_industry_selection_v1",
+    "strategy_version_code": "v1_regime_state_machine",
+    "account_code": "paper_campaign_regime_sector_industry_v1sm_20d_202605_r5",
+    "portfolio_code": "paper_campaign_regime_sector_industry_v1sm_20d_202605_r5",
+    "portfolio_id": 4,
+    "initial_cash": 10000000,
+    "planned_trading_days": 20,
+    "start_trade_date": "2026-05-15",
+    "status": "ACTIVE",
+    "run_mode": "auto",
+    "target_count": 30,
+    "replace_existing": false,
+    "allow_main_portfolio": false,
+    "run_m9_finalizers": false,
+    "execution_context": "production_paper_campaign",
+    "validation_stage": "Stage 6.18g",
+    "validation_scope": "M4 signal -> M6.5 production paper-campaign -> reports only"
   }
 ]

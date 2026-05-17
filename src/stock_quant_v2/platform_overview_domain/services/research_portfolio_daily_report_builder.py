@@ -2775,16 +2775,16 @@ class ProductionObservationReportExporter:
         if not status:
             status = "READY_NO_REGIME" if has_db_market else "MISSING"
 
-        universe_count = _to_decimal(breadth.get("universe_count"))
-        advancers = _to_decimal(breadth.get("advancers"))
-        decliners = _to_decimal(breadth.get("decliners"))
+        universe_count = _safe_decimal(breadth.get("universe_count"))
+        advancers = _safe_decimal(breadth.get("advancers"))
+        decliners = _safe_decimal(breadth.get("decliners"))
         advancer_ratio = None
         decliner_ratio = None
         if universe_count and universe_count != 0:
             advancer_ratio = advancers / universe_count if advancers is not None else None
             decliner_ratio = decliners / universe_count if decliners is not None else None
 
-        turnover = _to_decimal(breadth.get("total_turnover_amount_cny"))
+        turnover = _safe_decimal(breadth.get("total_turnover_amount_cny"))
         turnover_billion = turnover / Decimal("100000000") if turnover is not None else None
 
         market_index_pct = index_bar.get("pct_chg")
