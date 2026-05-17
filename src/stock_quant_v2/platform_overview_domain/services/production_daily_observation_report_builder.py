@@ -1010,10 +1010,9 @@ class ProductionDailyObservationReportBuilder:
                 b.turnover_rate,
                 b.is_suspended,
                 case
-                    when b.pct_change is null then
-                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
-                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
-                    else b.pct_change
+                    when b.pct_change is not null then b.pct_change / 100.0
+                    when b.pre_close is null or b.pre_close = 0 then null
+                    else b.close / b.pre_close - 1
                 end as pct_change,
                 l.up_limit,
                 l.down_limit
@@ -1124,10 +1123,9 @@ class ProductionDailyObservationReportBuilder:
             b.close,
             b.pre_close,
             case
-                    when b.pct_change is null then
-                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
-                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
-                    else b.pct_change
+                    when b.pct_change is not null then b.pct_change / 100.0
+                    when b.pre_close is null or b.pre_close = 0 then null
+                    else b.close / b.pre_close - 1
                 end as pct_change,
             b.amount,
             b.volume,
@@ -1157,10 +1155,9 @@ class ProductionDailyObservationReportBuilder:
                 b.instrument_id,
                 b.close,
                 case
-                    when b.pct_change is null then
-                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
-                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
-                    else b.pct_change
+                    when b.pct_change is not null then b.pct_change / 100.0
+                    when b.pre_close is null or b.pre_close = 0 then null
+                    else b.close / b.pre_close - 1
                 end as pct_change,
                 b.amount,
                 l.up_limit,
@@ -1253,10 +1250,9 @@ class ProductionDailyObservationReportBuilder:
                 b.close,
                 b.amount,
                 case
-                    when b.pct_change is null then
-                        case when b.pre_close is null or b.pre_close = 0 then null else b.close / b.pre_close - 1 end
-                    when abs(b.pct_change) > 1 then b.pct_change / 100.0
-                    else b.pct_change
+                    when b.pct_change is not null then b.pct_change / 100.0
+                    when b.pre_close is null or b.pre_close = 0 then null
+                    else b.close / b.pre_close - 1
                 end as pct_change,
                 l.up_limit,
                 l.down_limit
