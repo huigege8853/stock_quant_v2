@@ -304,6 +304,7 @@ class ProductionDailyObservationReportBuilder:
             "trade_summary": None,
             "trade_details": [],
             "ledger_summary": [],
+            "runtime_observation": {},
             "snapshot": None,
             "positions_preview": [],
             "top_gainers": [],
@@ -370,6 +371,15 @@ class ProductionDailyObservationReportBuilder:
                 order="loss",
                 limit=5,
             )
+
+        section["runtime_observation"] = self._campaign_runtime_observation(
+            project_root=project_root,
+            campaign_code=str(campaign.get("campaign_code") or ""),
+            report_date=report_date,
+            selection_summary=section.get("selection_summary") or {},
+            trade_summary=section.get("trade_summary") or {},
+            snapshot=section.get("snapshot") or {},
+        )
 
         section["campaign_risk_checks"] = self._campaign_risk_checks(section)
 
@@ -622,8 +632,117 @@ class ProductionDailyObservationReportBuilder:
             },
         )
         for row in rows:
+            reason_parts = self._trade_reason_parts(row)
+            row["trade_reason_parts"] = reason_parts
+            row["trade_reason_summary"] = self._trade_reason_summary(reason_parts)
             row["trade_reason"] = self._trade_reason(row)
         return rows
+
+    def _campaign_runtime_observation(
+        self,
+        *,
+        project_root: Path,
+        campaign_code: str,
+        report_date: date,
+        selection_summary: dict[str, Any],
+        trade_summary: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        orders = trade_summary.get("orders") if isinstance(trade_summary, dict) else {}
+        fills = trade_summary.get("fills") if isinstance(trade_summary, dict) else {}
+        daily_artifact = project_root / "artifacts/m6_5/paper_campaign_daily" / f"{campaign_code}_{report_date.isoformat()}.json"
+        artifact_payload: dict[str, Any] = {}
+        artifact_campaign: dict[str, Any] = {}
+        if daily_artifact.exists():
+            try:
+                artifact_payload = json.loads(daily_artifact.read_text(encoding="utf-8"))
+                artifact_campaign = self._find_campaign_payload(artifact_payload, campaign_code) or {}
+            except Exception as exc:
+                artifact_payload = {"parse_error": f"{type(exc).__name__}:{exc}"}
+
+        snapshot_date = self._to_date(snapshot.get("snapshot_date"))
+        effective_date = self._to_date(selection_summary.get("effective_date"))
+        fill_date = self._to_date((fills or {}).get("fill_date"))
+        order_date = self._to_date((orders or {}).get("effective_date"))
+        date_candidates = [x for x in (snapshot_date, effective_date, fill_date, order_date) if x is not None]
+        latest_campaign_date = max(date_candidates) if date_candidates else None
+
+        if latest_campaign_date == report_date:
+            campaign_data_status = "CURRENT_REPORT_DATE"
+        elif latest_campaign_date is None:
+            campaign_data_status = "NO_RUNTIME_DATA"
+        else:
+            campaign_data_status = f"LATEST_CAMPAIGN_DATE_{latest_campaign_date.isoformat()}"
+
+        artifact_action = self._first_present(
+            artifact_campaign,
+            artifact_payload,
+            keys=("action", "planned_action", "runtime_action"),
+        )
+        artifact_status = self._first_present(
+            artifact_campaign,
+            artifact_payload,
+            keys=("status", "overall_status", "daily_status"),
+        )
+        artifact_reason = self._first_present(
+            artifact_campaign,
+            artifact_payload,
+            keys=("reason", "message", "status_reason"),
+        )
+
+        if not daily_artifact.exists():
+            runtime_action = "NO_DAILY_ARTIFACT"
+        elif artifact_action:
+            runtime_action = str(artifact_action)
+        elif latest_campaign_date == report_date:
+            runtime_action = "OBSERVED_REPORT_DATE_DATA"
+        else:
+            runtime_action = "ARTIFACT_PRESENT"
+
+        return {
+            "runtime_action": runtime_action,
+            "campaign_data_status": campaign_data_status,
+            "latest_campaign_date": latest_campaign_date,
+            "daily_artifact_path": str(daily_artifact.relative_to(project_root)) if daily_artifact.exists() else str(daily_artifact),
+            "daily_artifact_exists": daily_artifact.exists(),
+            "daily_artifact_status": artifact_status,
+            "daily_artifact_reason": artifact_reason,
+            "target_run_id": selection_summary.get("target_run_id"),
+            "order_run_id": (orders or {}).get("order_run_id"),
+            "fill_run_id": (fills or {}).get("fill_run_id"),
+            "snapshot_run_id": snapshot.get("snapshot_run_id"),
+            "position_run_id": snapshot.get("position_run_id") or snapshot.get("snapshot_run_id"),
+            "note": "Campaign run ids are portfolio/campaign scoped. Waterline max_run_id is table-global and may belong to another portfolio or runtime step.",
+        }
+
+    @classmethod
+    def _find_campaign_payload(cls, value: Any, campaign_code: str) -> dict[str, Any] | None:
+        if not campaign_code:
+            return None
+        if isinstance(value, dict):
+            if str(value.get("campaign_code") or "") == campaign_code:
+                return value
+            for child in value.values():
+                found = cls._find_campaign_payload(child, campaign_code)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = cls._find_campaign_payload(child, campaign_code)
+                if found is not None:
+                    return found
+        return None
+
+    @staticmethod
+    def _first_present(*payloads: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            for key in keys:
+                value = payload.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
 
     def _ledger_summary(self, *, portfolio_id: int, report_date: date) -> list[dict[str, Any]]:
         sql = """
@@ -750,19 +869,74 @@ class ProductionDailyObservationReportBuilder:
 
     @staticmethod
     def _trade_reason(row: dict[str, Any]) -> str:
-        parts: list[str] = []
+        parts = ProductionDailyObservationReportBuilder._trade_reason_parts(row)
+        values: list[str] = []
+        for key in ("strategy_reason", "sizing_reason", "price_reason", "fill_reason"):
+            value = parts.get(key)
+            if value:
+                values.append(str(value))
+        return ";".join(values) if values else "not_available"
+
+    @staticmethod
+    def _trade_reason_parts(row: dict[str, Any]) -> dict[str, str | None]:
+        raw_reasons: list[str] = []
         for key in ("target_reason_code", "signal_reason_code"):
             value = row.get(key)
             if value:
-                parts.append(str(value))
-        status_reason = row.get("target_status_reason")
+                raw_reasons.append(str(value))
+        status_reason = str(row.get("target_status_reason") or "")
         if status_reason:
-            parts.append(str(status_reason))
-        if row.get("fill_rule"):
-            parts.append(f"fill_rule={row.get('fill_rule')}")
+            raw_reasons.extend([part for part in status_reason.split(";") if part])
+
+        strategy_reason = ProductionDailyObservationReportBuilder._dedupe_join(
+            part for part in raw_reasons
+            if part and not part.startswith(("M7_", "price_", "raw_target_", "cash_buffer_", "lot_size="))
+        )
+        sizing_reason = ProductionDailyObservationReportBuilder._dedupe_join(
+            part for part in raw_reasons
+            if part.startswith(("M7_", "raw_target_", "cash_buffer_", "lot_size="))
+        )
+        price_context = ProductionDailyObservationReportBuilder._dedupe_join(
+            part for part in raw_reasons if part.startswith("price_")
+        )
         if row.get("price_source"):
-            parts.append(f"price_source={row.get('price_source')}")
-        return ";".join(parts) if parts else "not_available"
+            price_context = ProductionDailyObservationReportBuilder._dedupe_join(
+                [price_context, f"fill_price_source={row.get('price_source')}"]
+            )
+        fill_reason = ProductionDailyObservationReportBuilder._dedupe_join(
+            [
+                f"fill_rule={row.get('fill_rule')}" if row.get("fill_rule") else None,
+                f"fill_status={row.get('fill_status')}" if row.get("fill_status") else None,
+                f"order_status={row.get('order_status')}" if row.get("order_status") else None,
+            ]
+        )
+        return {
+            "strategy_reason": strategy_reason,
+            "sizing_reason": sizing_reason,
+            "price_reason": price_context,
+            "fill_reason": fill_reason,
+        }
+
+    @staticmethod
+    def _trade_reason_summary(parts: dict[str, Any]) -> str:
+        strategy = parts.get("strategy_reason") or "strategy_reason=not_available"
+        sizing = parts.get("sizing_reason") or "sizing_reason=not_available"
+        fill = parts.get("fill_reason") or "fill_reason=not_available"
+        return f"{strategy}; {sizing}; {fill}"
+
+    @staticmethod
+    def _dedupe_join(values: Any, separator: str = ";") -> str | None:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for value in values:
+            if value is None:
+                continue
+            text_value = str(value).strip()
+            if not text_value or text_value in seen:
+                continue
+            seen.add(text_value)
+            ordered.append(text_value)
+        return separator.join(ordered) if ordered else None
 
     def _campaign_artifacts(self, project_root: Path, campaign_code: str) -> list[dict[str, Any]]:
         if not campaign_code:
@@ -868,8 +1042,9 @@ class ProductionDailyObservationReportBuilder:
             return "WARN"
         return "PASS"
 
-    @staticmethod
+    @classmethod
     def _build_observation_notes(
+        cls,
         *,
         overall_status: str,
         waterline: list[dict[str, Any]],
@@ -887,10 +1062,15 @@ class ProductionDailyObservationReportBuilder:
             notes.append(
                 f"campaign={campaign.get('campaign_code')} portfolio_id={campaign.get('portfolio_id')} status={campaign.get('status')} reason={campaign.get('reason')}"
             )
+            runtime = campaign.get("runtime_observation") or {}
+            if runtime:
+                notes.append(
+                    f"campaign={campaign.get('campaign_code')} runtime_action={runtime.get('runtime_action')} campaign_data_status={runtime.get('campaign_data_status')} latest_campaign_date={runtime.get('latest_campaign_date')}"
+                )
             risk = campaign.get("risk_metrics") or {}
             if risk:
                 notes.append(
-                    f"campaign={campaign.get('campaign_code')} max_position_weight={risk.get('max_position_weight')} stock_exposure={risk.get('stock_exposure')} total_position_pnl={risk.get('total_position_pnl')}"
+                    f"campaign={campaign.get('campaign_code')} max_position_weight={cls._fmt_percent(risk.get('max_position_weight'), 2)} stock_exposure={cls._fmt_percent(risk.get('stock_exposure'), 2)} total_position_pnl={cls._fmt_money(risk.get('total_position_pnl'))}"
                 )
             losers = campaign.get("top_losers") or []
             if losers:
@@ -950,16 +1130,26 @@ class ProductionDailyObservationReportBuilder:
                 f"- fill_run_id: `{(fills or {}).get('fill_run_id')}` / fill_count: `{(fills or {}).get('fill_count')}`",
                 f"- snapshot_run_id: `{snapshot.get('snapshot_run_id')}` / position_run_id: `{snapshot.get('position_run_id') or snapshot.get('snapshot_run_id')}` / snapshot_date: `{snapshot.get('snapshot_date')}`",
                 f"- holding_count: `{snapshot.get('holding_count')}`",
-                f"- cash_balance: `{snapshot.get('cash_balance')}`",
-                f"- market_value: `{snapshot.get('market_value')}`",
-                f"- total_equity: `{snapshot.get('total_equity')}`",
-                f"- daily_return: `{snapshot.get('daily_return')}`",
-                f"- turnover_rate: `{snapshot.get('turnover_rate')}`",
+                f"- cash_balance: `{self._fmt_money(snapshot.get('cash_balance'))}`",
+                f"- market_value: `{self._fmt_money(snapshot.get('market_value'))}`",
+                f"- total_equity: `{self._fmt_money(snapshot.get('total_equity'))}`",
+                f"- daily_return: `{self._fmt_percent(snapshot.get('daily_return'), 4)}`",
+                f"- turnover_rate: `{self._fmt_percent(snapshot.get('turnover_rate'), 2)}`",
+                "",
+                "#### Daily runtime action",
+                "",
+            ])
+            runtime = campaign.get("runtime_observation") or {}
+            lines.extend([
+                f"- runtime_action: `{runtime.get('runtime_action')}` / campaign_data_status: `{runtime.get('campaign_data_status')}`",
+                f"- latest_campaign_date: `{self._json_default(runtime.get('latest_campaign_date'))}` / daily_artifact_exists: `{runtime.get('daily_artifact_exists')}`",
+                f"- target_run_id: `{runtime.get('target_run_id')}` / order_run_id: `{runtime.get('order_run_id')}` / fill_run_id: `{runtime.get('fill_run_id')}` / snapshot_run_id: `{runtime.get('snapshot_run_id')}` / position_run_id: `{runtime.get('position_run_id')}`",
+                f"- note: {runtime.get('note')}",
                 "",
                 "#### 交易增强摘要",
                 "",
-                f"- order_total_quantity: `{(orders or {}).get('total_order_quantity')}` / estimated_gross_amount: `{(orders or {}).get('total_estimated_gross_amount')}` / estimated_fee: `{(orders or {}).get('total_estimated_fee')}`",
-                f"- fill_total_quantity: `{(fills or {}).get('total_fill_quantity')}` / gross_amount: `{(fills or {}).get('gross_amount')}` / total_fee: `{(fills or {}).get('total_fee_amount')}` / cash_delta: `{(fills or {}).get('cash_delta')}`",
+                f"- order_total_quantity: `{self._fmt_quantity((orders or {}).get('total_order_quantity'))}` / estimated_gross_amount: `{self._fmt_money((orders or {}).get('total_estimated_gross_amount'))}` / estimated_fee: `{self._fmt_money((orders or {}).get('total_estimated_fee'))}`",
+                f"- fill_total_quantity: `{self._fmt_quantity((fills or {}).get('total_fill_quantity'))}` / gross_amount: `{self._fmt_money((fills or {}).get('gross_amount'))}` / total_fee: `{self._fmt_money((fills or {}).get('total_fee_amount'))}` / cash_delta: `{self._fmt_money((fills or {}).get('cash_delta'))}`",
                 "",
                 "#### 仓位风险摘要",
                 "",
@@ -967,8 +1157,8 @@ class ProductionDailyObservationReportBuilder:
             risk = campaign.get("risk_metrics") or {}
             lines.extend([
                 f"- position_rows: `{risk.get('position_rows')}` / open_position_rows: `{risk.get('open_position_rows')}`",
-                f"- stock_exposure: `{risk.get('stock_exposure')}` / max_position_weight: `{risk.get('max_position_weight')}`",
-                f"- total_position_pnl: `{risk.get('total_position_pnl')}` / max_position_pnl: `{risk.get('max_position_pnl')}` / min_position_pnl: `{risk.get('min_position_pnl')}`",
+                f"- stock_exposure: `{self._fmt_percent(risk.get('stock_exposure'), 2)}` / max_position_weight: `{self._fmt_percent(risk.get('max_position_weight'), 2)}`",
+                f"- total_position_pnl: `{self._fmt_money(risk.get('total_position_pnl'))}` / max_position_pnl: `{self._fmt_money(risk.get('max_position_pnl'))}` / min_position_pnl: `{self._fmt_money(risk.get('min_position_pnl'))}`",
                 f"- profitable_position_rows: `{risk.get('profitable_position_rows')}` / losing_position_rows: `{risk.get('losing_position_rows')}`",
                 "",
                 "#### Campaign 风险检查",
@@ -988,19 +1178,19 @@ class ProductionDailyObservationReportBuilder:
             for item in (campaign.get("selected_instruments") or [])[:30]:
                 code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                 lines.append(
-                    f"| {item.get('rank_no')} | {code} | {item.get('display_name')} | {item.get('target_weight')} | {item.get('score')} | {item.get('source_rank')} | {item.get('target_reason_code') or item.get('signal_reason_code')} |"
+                    f"| {item.get('rank_no')} | {code} | {item.get('display_name')} | {self._fmt_percent(item.get('target_weight'), 2)} | {self._fmt_decimal(item.get('score'), 4)} | {item.get('source_rank')} | {item.get('target_reason_code') or item.get('signal_reason_code')} |"
                 )
             lines.extend([
                 "",
                 "#### 交易明细预览",
                 "",
-                "| side | code | name | order_qty | fill_qty | fill_price | gross_amount | fee | order_status | fill_status | reason |",
-                "|---|---|---|---:|---:|---:|---:|---:|---|---|---|",
+                "| side | code | name | order_qty | fill_qty | fill_price | gross_amount | fee | order_status | fill_status | strategy_reason | sizing_reason | price_reason | fill_reason |",
+                "|---|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|---|",
             ])
             for item in (campaign.get("trade_details") or [])[:30]:
                 code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                 lines.append(
-                    f"| {item.get('order_side')} | {code} | {item.get('display_name')} | {item.get('order_quantity')} | {item.get('fill_quantity')} | {item.get('fill_price')} | {item.get('gross_amount')} | {item.get('total_fee_amount')} | {item.get('order_status')} | {item.get('fill_status')} | {item.get('trade_reason')} |"
+                    f"| {item.get('order_side')} | {code} | {item.get('display_name')} | {self._fmt_quantity(item.get('order_quantity'))} | {self._fmt_quantity(item.get('fill_quantity'))} | {self._fmt_money(item.get('fill_price'))} | {self._fmt_money(item.get('gross_amount'))} | {self._fmt_money(item.get('total_fee_amount'))} | {item.get('order_status')} | {item.get('fill_status')} | {(item.get('trade_reason_parts') or {}).get('strategy_reason')} | {(item.get('trade_reason_parts') or {}).get('sizing_reason')} | {(item.get('trade_reason_parts') or {}).get('price_reason')} | {(item.get('trade_reason_parts') or {}).get('fill_reason')} |"
                 )
             lines.extend([
                 "",
@@ -1011,19 +1201,19 @@ class ProductionDailyObservationReportBuilder:
             ])
             for item in campaign.get("ledger_summary") or []:
                 lines.append(
-                    f"| {item.get('event_type')} | {item.get('reason_code')} | {item.get('rows')} | {item.get('total_quantity_delta')} | {item.get('total_cash_delta')} | {item.get('total_amount_delta')} |"
+                    f"| {item.get('event_type')} | {item.get('reason_code')} | {item.get('rows')} | {self._fmt_quantity(item.get('total_quantity_delta'))} | {self._fmt_money(item.get('total_cash_delta'))} | {self._fmt_money(item.get('total_amount_delta'))} |"
                 )
             lines.extend(["", "#### 持仓预览", "", "| code | name | quantity | weight | avg_cost | market_price | market_value | total_pnl | status |", "|---|---|---:|---:|---:|---:|---:|---:|---|"])
             for item in (campaign.get("positions_preview") or [])[:30]:
                 code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                 lines.append(
-                    f"| {code} | {item.get('display_name')} | {item.get('quantity')} | {item.get('position_weight')} | {item.get('avg_cost')} | {item.get('market_price')} | {item.get('market_value')} | {item.get('total_pnl')} | {item.get('position_status')} |"
+                    f"| {code} | {item.get('display_name')} | {self._fmt_quantity(item.get('quantity'))} | {self._fmt_percent(item.get('position_weight'), 2)} | {self._fmt_money(item.get('avg_cost'))} | {self._fmt_money(item.get('market_price'))} | {self._fmt_money(item.get('market_value'))} | {self._fmt_money(item.get('total_pnl'))} | {item.get('position_status')} |"
                 )
             lines.extend(["", "#### 盈亏 Top 观察", "", "| type | code | name | market_value | total_pnl |", "|---|---|---|---:|---:|"])
             for label, rows in (("top_gain", campaign.get("top_gainers") or []), ("top_loss", campaign.get("top_losers") or [])):
                 for item in rows[:5]:
                     code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
-                    lines.append(f"| {label} | {code} | {item.get('display_name')} | {item.get('market_value')} | {item.get('total_pnl')} |")
+                    lines.append(f"| {label} | {code} | {item.get('display_name')} | {self._fmt_money(item.get('market_value'))} | {self._fmt_money(item.get('total_pnl'))} |")
             lines.append("")
         lines.extend(["## 3. 风险 / 异常检查", "", "| check | status | reason |", "|---|---|---|"])
         for check in payload.get("checks") or []:
@@ -1076,6 +1266,30 @@ class ProductionDailyObservationReportBuilder:
             writer.writeheader()
             for row in rows:
                 writer.writerow({key: self._csv_cell(row.get(key)) for key in fields})
+
+    @classmethod
+    def _fmt_decimal(cls, value: Any, places: int = 2) -> str:
+        decimal_value = cls._to_decimal_value(value)
+        if decimal_value is None:
+            return ""
+        quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+        return f"{decimal_value.quantize(quant):,}"
+
+    @classmethod
+    def _fmt_money(cls, value: Any) -> str:
+        return cls._fmt_decimal(value, 2)
+
+    @classmethod
+    def _fmt_quantity(cls, value: Any) -> str:
+        return cls._fmt_decimal(value, 0)
+
+    @classmethod
+    def _fmt_percent(cls, value: Any, places: int = 2) -> str:
+        decimal_value = cls._to_decimal_value(value)
+        if decimal_value is None:
+            return ""
+        quant = Decimal("1").scaleb(-places)
+        return f"{(decimal_value * Decimal('100')).quantize(quant)}%"
 
     @classmethod
     def _csv_cell(cls, value: Any) -> str:
