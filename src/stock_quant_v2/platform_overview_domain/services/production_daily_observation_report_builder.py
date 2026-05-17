@@ -302,8 +302,14 @@ class ProductionDailyObservationReportBuilder:
             "selection_summary": None,
             "selected_instruments": [],
             "trade_summary": None,
+            "trade_details": [],
+            "ledger_summary": [],
             "snapshot": None,
             "positions_preview": [],
+            "top_gainers": [],
+            "top_losers": [],
+            "risk_metrics": {},
+            "campaign_risk_checks": [],
             "artifact_files": self._campaign_artifacts(project_root, str(campaign.get("campaign_code") or "")),
         }
         if portfolio_id is None:
@@ -323,6 +329,20 @@ class ProductionDailyObservationReportBuilder:
                 limit=detail_limit,
             )
         section["trade_summary"] = self._latest_trade_summary(portfolio_id=portfolio_id, report_date=report_date)
+        trade_summary = section.get("trade_summary") or {}
+        orders = trade_summary.get("orders") if isinstance(trade_summary, dict) else {}
+        fills = trade_summary.get("fills") if isinstance(trade_summary, dict) else {}
+        order_run_id = (orders or {}).get("order_run_id")
+        fill_run_id = (fills or {}).get("fill_run_id")
+        if order_run_id is not None:
+            section["trade_details"] = self._trade_details(
+                portfolio_id=portfolio_id,
+                order_run_id=int(order_run_id),
+                fill_run_id=self._optional_int(fill_run_id),
+                limit=detail_limit,
+            )
+        section["ledger_summary"] = self._ledger_summary(portfolio_id=portfolio_id, report_date=report_date)
+
         section["snapshot"] = self._latest_snapshot(portfolio_id=portfolio_id, report_date=report_date)
         snapshot = section.get("snapshot") or {}
         position_run_id = snapshot.get("position_run_id") or snapshot.get("snapshot_run_id")
@@ -330,8 +350,28 @@ class ProductionDailyObservationReportBuilder:
             section["positions_preview"] = self._positions_preview(
                 portfolio_id=portfolio_id,
                 position_run_id=int(position_run_id),
+                total_equity=snapshot.get("total_equity"),
                 limit=detail_limit,
             )
+            section["risk_metrics"] = self._position_risk_metrics(
+                portfolio_id=portfolio_id,
+                position_run_id=int(position_run_id),
+                total_equity=snapshot.get("total_equity"),
+            )
+            section["top_gainers"] = self._position_extremes(
+                portfolio_id=portfolio_id,
+                position_run_id=int(position_run_id),
+                order="gain",
+                limit=5,
+            )
+            section["top_losers"] = self._position_extremes(
+                portfolio_id=portfolio_id,
+                position_run_id=int(position_run_id),
+                order="loss",
+                limit=5,
+            )
+
+        section["campaign_risk_checks"] = self._campaign_risk_checks(section)
 
         checks = []
         if section["selection_summary"]:
@@ -340,6 +380,7 @@ class ProductionDailyObservationReportBuilder:
             checks.append("snapshot")
         if section["trade_summary"]:
             checks.append("trade")
+        risk_statuses = [str(item.get("status") or "WARN") for item in section.get("campaign_risk_checks") or []]
         if len(checks) >= 2:
             section["status"] = "PASS"
             section["reason"] = "production_campaign_observable"
@@ -349,6 +390,13 @@ class ProductionDailyObservationReportBuilder:
         else:
             section["status"] = "FAIL"
             section["reason"] = "no_recent_campaign_runtime_data"
+
+        if section["status"] == "PASS" and any(status == "WARN" for status in risk_statuses):
+            section["status"] = "WARN"
+            section["reason"] = "production_campaign_observable_with_risk_warning"
+        if any(status == "FAIL" for status in risk_statuses):
+            section["status"] = "FAIL"
+            section["reason"] = "production_campaign_risk_check_failed"
         return section
 
     def _latest_selection_summary(self, *, portfolio_id: int, report_date: date, target_count: int) -> dict[str, Any] | None:
@@ -413,7 +461,11 @@ class ProductionDailyObservationReportBuilder:
                count(*) as order_count,
                count(*) filter (where upper(order_side) = 'BUY') as buy_order_count,
                count(*) filter (where upper(order_side) = 'SELL') as sell_order_count,
-               count(*) filter (where upper(status) not in ('CREATED','ACCEPTED','FILLED')) as abnormal_order_count
+               count(*) filter (where upper(status) not in ('CREATED','ACCEPTED','FILLED')) as abnormal_order_count,
+               sum(order_quantity) as total_order_quantity,
+               sum(estimated_gross_amount) as total_estimated_gross_amount,
+               sum(estimated_fee) as total_estimated_fee,
+               sum(estimated_net_amount) as total_estimated_net_amount
         from public.trading_paper_order
         where portfolio_id = :portfolio_id
           and effective_date <= :report_date
@@ -426,10 +478,12 @@ class ProductionDailyObservationReportBuilder:
         fill_sql = """
         select run_id as fill_run_id, max(fill_date) as fill_date,
                count(*) as fill_count,
-               count(*) filter (where upper(fill_status) not in ('FILLED','SUCCESS')) as abnormal_fill_count,
+               count(*) filter (where upper(fill_status) not in ('FILLED','SUCCESS','COMPLETED')) as abnormal_fill_count,
+               sum(fill_quantity) as total_fill_quantity,
                sum(gross_amount) as gross_amount,
                sum(total_fee_amount) as total_fee_amount,
-               sum(net_amount) as net_amount
+               sum(net_amount) as net_amount,
+               sum(cash_delta) as cash_delta
         from public.trading_paper_fill
         where portfolio_id = :portfolio_id
           and fill_date <= :report_date
@@ -479,7 +533,7 @@ class ProductionDailyObservationReportBuilder:
         """
         return self._one_or_none(sql, {"portfolio_id": portfolio_id, "report_date": report_date})
 
-    def _positions_preview(self, *, portfolio_id: int, position_run_id: int, limit: int) -> list[dict[str, Any]]:
+    def _positions_preview(self, *, portfolio_id: int, position_run_id: int, total_equity: Any, limit: int) -> list[dict[str, Any]]:
         sql = """
         select
             p.instrument_id,
@@ -501,7 +555,214 @@ class ProductionDailyObservationReportBuilder:
         order by p.market_value desc nulls last, p.instrument_id
         limit :limit
         """
+        rows = self._rows(sql, {"portfolio_id": portfolio_id, "position_run_id": position_run_id, "limit": limit})
+        for row in rows:
+            row["position_weight"] = self._safe_ratio(row.get("market_value"), total_equity)
+        return rows
+
+    def _trade_details(self, *, portfolio_id: int, order_run_id: int, fill_run_id: int | None, limit: int) -> list[dict[str, Any]]:
+        sql = """
+        select
+            o.id as order_id,
+            o.run_id as order_run_id,
+            o.order_date,
+            o.effective_date,
+            o.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            o.order_side,
+            o.order_type,
+            o.price_fill_rule,
+            o.target_quantity,
+            o.order_quantity,
+            o.estimated_price,
+            o.estimated_gross_amount,
+            o.estimated_fee,
+            o.estimated_net_amount,
+            o.status as order_status,
+            o.reject_reason,
+            f.id as fill_id,
+            f.run_id as fill_run_id,
+            f.fill_date,
+            f.fill_price,
+            f.fill_quantity,
+            f.gross_amount,
+            f.total_fee_amount,
+            f.net_amount,
+            f.cash_delta,
+            f.price_source,
+            f.fill_rule,
+            f.fill_status,
+            t.rank_no,
+            t.target_weight,
+            t.reason_code as target_reason_code,
+            t.status_reason as target_status_reason,
+            ss.rank_in_batch as source_rank,
+            ss.reason_code as signal_reason_code
+        from public.trading_paper_order o
+        left join public.trading_paper_fill f
+          on f.order_id = o.id
+         and (:fill_run_id is null or f.run_id = :fill_run_id)
+        left join public.trading_paper_target_position t on t.id = o.target_position_id
+        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.meta_instrument mi on mi.id = o.instrument_id
+        where o.portfolio_id = :portfolio_id
+          and o.run_id = :order_run_id
+        order by o.id
+        limit :limit
+        """
+        rows = self._rows(
+            sql,
+            {
+                "portfolio_id": portfolio_id,
+                "order_run_id": order_run_id,
+                "fill_run_id": fill_run_id,
+                "limit": limit,
+            },
+        )
+        for row in rows:
+            row["trade_reason"] = self._trade_reason(row)
+        return rows
+
+    def _ledger_summary(self, *, portfolio_id: int, report_date: date) -> list[dict[str, Any]]:
+        sql = """
+        select
+            event_type,
+            reason_code,
+            count(*) as rows,
+            sum(quantity_delta) as total_quantity_delta,
+            sum(cash_delta) as total_cash_delta,
+            sum(amount_delta) as total_amount_delta
+        from public.trading_paper_trade_ledger
+        where portfolio_id = :portfolio_id
+          and event_date = :report_date
+        group by event_type, reason_code
+        order by event_type, reason_code
+        """
+        return self._rows(sql, {"portfolio_id": portfolio_id, "report_date": report_date})
+
+    def _position_risk_metrics(self, *, portfolio_id: int, position_run_id: int, total_equity: Any) -> dict[str, Any]:
+        sql = """
+        select
+            count(*) as position_rows,
+            count(*) filter (where upper(position_status) = 'OPEN') as open_position_rows,
+            sum(case when total_pnl > 0 then 1 else 0 end) as profitable_position_rows,
+            sum(case when total_pnl < 0 then 1 else 0 end) as losing_position_rows,
+            max(market_value) as max_market_value,
+            sum(market_value) as total_market_value,
+            sum(total_pnl) as total_position_pnl,
+            min(total_pnl) as min_position_pnl,
+            max(total_pnl) as max_position_pnl
+        from public.trading_paper_position
+        where portfolio_id = :portfolio_id
+          and run_id = :position_run_id
+        """
+        row = self._one_or_none(sql, {"portfolio_id": portfolio_id, "position_run_id": position_run_id}) or {}
+        row["max_position_weight"] = self._safe_ratio(row.get("max_market_value"), total_equity)
+        row["stock_exposure"] = self._safe_ratio(row.get("total_market_value"), total_equity)
+        return row
+
+    def _position_extremes(self, *, portfolio_id: int, position_run_id: int, order: str, limit: int) -> list[dict[str, Any]]:
+        direction = "desc" if order == "gain" else "asc"
+        sql = f"""
+        select
+            p.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            p.quantity,
+            p.market_value,
+            p.total_pnl,
+            p.position_status
+        from public.trading_paper_position p
+        left join public.meta_instrument mi on mi.id = p.instrument_id
+        where p.portfolio_id = :portfolio_id
+          and p.run_id = :position_run_id
+        order by p.total_pnl {direction} nulls last, p.market_value desc nulls last
+        limit :limit
+        """
         return self._rows(sql, {"portfolio_id": portfolio_id, "position_run_id": position_run_id, "limit": limit})
+
+    def _campaign_risk_checks(self, section: dict[str, Any]) -> list[dict[str, Any]]:
+        selection = section.get("selection_summary") or {}
+        trade = section.get("trade_summary") or {}
+        orders = trade.get("orders") if isinstance(trade, dict) else {}
+        fills = trade.get("fills") if isinstance(trade, dict) else {}
+        snapshot = section.get("snapshot") or {}
+        risk = section.get("risk_metrics") or {}
+
+        selected_count = self._optional_int(selection.get("selected_count"))
+        order_count = self._optional_int((orders or {}).get("order_count"))
+        fill_count = self._optional_int((fills or {}).get("fill_count"))
+        holding_count = self._optional_int(snapshot.get("holding_count"))
+        rank_out = self._optional_int(selection.get("rank_out_of_scope_rows")) or 0
+        abnormal_order_count = self._optional_int((orders or {}).get("abnormal_order_count")) or 0
+        abnormal_fill_count = self._optional_int((fills or {}).get("abnormal_fill_count")) or 0
+        cash_balance = self._to_decimal_value(snapshot.get("cash_balance"))
+        turnover_rate = self._to_decimal_value(snapshot.get("turnover_rate"))
+        max_position_weight = self._to_decimal_value(risk.get("max_position_weight"))
+
+        checks: list[dict[str, Any]] = []
+        checks.append({
+            "check_name": "rank_scope",
+            "status": "PASS" if rank_out == 0 else "FAIL",
+            "reason": f"rank_out_of_scope_rows={rank_out}",
+        })
+        order_fill_match = order_count is not None and order_count == fill_count
+        checks.append({
+            "check_name": "order_fill_consistency",
+            "status": "PASS" if order_fill_match else "WARN",
+            "reason": f"order={order_count},fill={fill_count}",
+        })
+        holding_target_match = selected_count is not None and holding_count == selected_count
+        checks.append({
+            "check_name": "holding_count_vs_selected_count",
+            "status": "PASS" if holding_target_match else "WARN",
+            "reason": f"selected={selected_count},holding={holding_count}",
+        })
+        checks.append({
+            "check_name": "abnormal_orders",
+            "status": "PASS" if abnormal_order_count == 0 else "FAIL",
+            "reason": f"abnormal_order_count={abnormal_order_count}",
+        })
+        checks.append({
+            "check_name": "abnormal_fills",
+            "status": "PASS" if abnormal_fill_count == 0 else "FAIL",
+            "reason": f"abnormal_fill_count={abnormal_fill_count}",
+        })
+        checks.append({
+            "check_name": "cash_non_negative",
+            "status": "PASS" if cash_balance is None or cash_balance >= Decimal("0") else "FAIL",
+            "reason": f"cash_balance={snapshot.get('cash_balance')}",
+        })
+        checks.append({
+            "check_name": "max_single_position_weight",
+            "status": "WARN" if max_position_weight is not None and max_position_weight > Decimal("0.10") else "PASS",
+            "reason": f"max_position_weight={risk.get('max_position_weight')}",
+        })
+        checks.append({
+            "check_name": "turnover_rate",
+            "status": "WARN" if turnover_rate is not None and turnover_rate > Decimal("1.20") else "PASS",
+            "reason": f"turnover_rate={snapshot.get('turnover_rate')}",
+        })
+        return checks
+
+    @staticmethod
+    def _trade_reason(row: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("target_reason_code", "signal_reason_code"):
+            value = row.get(key)
+            if value:
+                parts.append(str(value))
+        status_reason = row.get("target_status_reason")
+        if status_reason:
+            parts.append(str(status_reason))
+        if row.get("fill_rule"):
+            parts.append(f"fill_rule={row.get('fill_rule')}")
+        if row.get("price_source"):
+            parts.append(f"price_source={row.get('price_source')}")
+        return ";".join(parts) if parts else "not_available"
 
     def _campaign_artifacts(self, project_root: Path, campaign_code: str) -> list[dict[str, Any]]:
         if not campaign_code:
@@ -626,6 +887,18 @@ class ProductionDailyObservationReportBuilder:
             notes.append(
                 f"campaign={campaign.get('campaign_code')} portfolio_id={campaign.get('portfolio_id')} status={campaign.get('status')} reason={campaign.get('reason')}"
             )
+            risk = campaign.get("risk_metrics") or {}
+            if risk:
+                notes.append(
+                    f"campaign={campaign.get('campaign_code')} max_position_weight={risk.get('max_position_weight')} stock_exposure={risk.get('stock_exposure')} total_position_pnl={risk.get('total_position_pnl')}"
+                )
+            losers = campaign.get("top_losers") or []
+            if losers:
+                worst = losers[0]
+                code = worst.get("instrument_code") or worst.get("symbol") or worst.get("instrument_id")
+                notes.append(
+                    f"campaign={campaign.get('campaign_code')} worst_holding={code} total_pnl={worst.get('total_pnl')}"
+                )
         if not artifact_index:
             notes.append("未发现相关 M6.5/M8 产物索引，需检查 daily run 是否生成报告产物。")
         return notes
@@ -683,6 +956,30 @@ class ProductionDailyObservationReportBuilder:
                 f"- daily_return: `{snapshot.get('daily_return')}`",
                 f"- turnover_rate: `{snapshot.get('turnover_rate')}`",
                 "",
+                "#### 交易增强摘要",
+                "",
+                f"- order_total_quantity: `{(orders or {}).get('total_order_quantity')}` / estimated_gross_amount: `{(orders or {}).get('total_estimated_gross_amount')}` / estimated_fee: `{(orders or {}).get('total_estimated_fee')}`",
+                f"- fill_total_quantity: `{(fills or {}).get('total_fill_quantity')}` / gross_amount: `{(fills or {}).get('gross_amount')}` / total_fee: `{(fills or {}).get('total_fee_amount')}` / cash_delta: `{(fills or {}).get('cash_delta')}`",
+                "",
+                "#### 仓位风险摘要",
+                "",
+            ])
+            risk = campaign.get("risk_metrics") or {}
+            lines.extend([
+                f"- position_rows: `{risk.get('position_rows')}` / open_position_rows: `{risk.get('open_position_rows')}`",
+                f"- stock_exposure: `{risk.get('stock_exposure')}` / max_position_weight: `{risk.get('max_position_weight')}`",
+                f"- total_position_pnl: `{risk.get('total_position_pnl')}` / max_position_pnl: `{risk.get('max_position_pnl')}` / min_position_pnl: `{risk.get('min_position_pnl')}`",
+                f"- profitable_position_rows: `{risk.get('profitable_position_rows')}` / losing_position_rows: `{risk.get('losing_position_rows')}`",
+                "",
+                "#### Campaign 风险检查",
+                "",
+                "| check | status | reason |",
+                "|---|---|---|",
+            ])
+            for check in campaign.get("campaign_risk_checks") or []:
+                lines.append(f"| {check.get('check_name')} | {check.get('status')} | {check.get('reason')} |")
+            lines.extend([
+                "",
                 "#### 入选股票预览",
                 "",
                 "| rank | code | name | weight | score | source_rank | reason |",
@@ -693,12 +990,40 @@ class ProductionDailyObservationReportBuilder:
                 lines.append(
                     f"| {item.get('rank_no')} | {code} | {item.get('display_name')} | {item.get('target_weight')} | {item.get('score')} | {item.get('source_rank')} | {item.get('target_reason_code') or item.get('signal_reason_code')} |"
                 )
-            lines.extend(["", "#### 持仓预览", "", "| code | name | quantity | avg_cost | market_price | market_value | total_pnl | status |", "|---|---|---:|---:|---:|---:|---:|---|"])
+            lines.extend([
+                "",
+                "#### 交易明细预览",
+                "",
+                "| side | code | name | order_qty | fill_qty | fill_price | gross_amount | fee | order_status | fill_status | reason |",
+                "|---|---|---|---:|---:|---:|---:|---:|---|---|---|",
+            ])
+            for item in (campaign.get("trade_details") or [])[:30]:
+                code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+                lines.append(
+                    f"| {item.get('order_side')} | {code} | {item.get('display_name')} | {item.get('order_quantity')} | {item.get('fill_quantity')} | {item.get('fill_price')} | {item.get('gross_amount')} | {item.get('total_fee_amount')} | {item.get('order_status')} | {item.get('fill_status')} | {item.get('trade_reason')} |"
+                )
+            lines.extend([
+                "",
+                "#### 交易流水摘要",
+                "",
+                "| event_type | reason_code | rows | quantity_delta | cash_delta | amount_delta |",
+                "|---|---|---:|---:|---:|---:|",
+            ])
+            for item in campaign.get("ledger_summary") or []:
+                lines.append(
+                    f"| {item.get('event_type')} | {item.get('reason_code')} | {item.get('rows')} | {item.get('total_quantity_delta')} | {item.get('total_cash_delta')} | {item.get('total_amount_delta')} |"
+                )
+            lines.extend(["", "#### 持仓预览", "", "| code | name | quantity | weight | avg_cost | market_price | market_value | total_pnl | status |", "|---|---|---:|---:|---:|---:|---:|---:|---|"])
             for item in (campaign.get("positions_preview") or [])[:30]:
                 code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                 lines.append(
-                    f"| {code} | {item.get('display_name')} | {item.get('quantity')} | {item.get('avg_cost')} | {item.get('market_price')} | {item.get('market_value')} | {item.get('total_pnl')} | {item.get('position_status')} |"
+                    f"| {code} | {item.get('display_name')} | {item.get('quantity')} | {item.get('position_weight')} | {item.get('avg_cost')} | {item.get('market_price')} | {item.get('market_value')} | {item.get('total_pnl')} | {item.get('position_status')} |"
                 )
+            lines.extend(["", "#### 盈亏 Top 观察", "", "| type | code | name | market_value | total_pnl |", "|---|---|---|---:|---:|"])
+            for label, rows in (("top_gain", campaign.get("top_gainers") or []), ("top_loss", campaign.get("top_losers") or [])):
+                for item in rows[:5]:
+                    code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+                    lines.append(f"| {label} | {code} | {item.get('display_name')} | {item.get('market_value')} | {item.get('total_pnl')} |")
             lines.append("")
         lines.extend(["## 3. 风险 / 异常检查", "", "| check | status | reason |", "|---|---|---|"])
         for check in payload.get("checks") or []:
@@ -759,6 +1084,25 @@ class ProductionDailyObservationReportBuilder:
         if isinstance(value, (dict, list)):
             return json.dumps(value, ensure_ascii=False, default=cls._json_default)
         return str(cls._json_default(value))
+
+    @staticmethod
+    def _to_decimal_value(value: Any) -> Decimal | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
+
+    @classmethod
+    def _safe_ratio(cls, numerator: Any, denominator: Any) -> Decimal | None:
+        num = cls._to_decimal_value(numerator)
+        den = cls._to_decimal_value(denominator)
+        if num is None or den is None or den == 0:
+            return None
+        return num / den
 
     @staticmethod
     def _json_default(value: Any) -> Any:
