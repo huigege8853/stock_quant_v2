@@ -302,9 +302,25 @@ class SignalToTargetService:
     ) -> list[dict]:
         columns = self._get_table_columns("strategy_signal")
 
+        rank_col = self._pick_first_existing_column(
+            columns,
+            ["rank_in_batch", "rank_no", "signal_rank", "selection_rank"],
+        )
         score_col = self._pick_first_existing_column(
             columns,
-            ["score", "signal_score", "final_score", "selection_score", "alpha_score"],
+            [
+                "raw_score",
+                "normalized_score",
+                "score",
+                "signal_score",
+                "final_score",
+                "selection_score",
+                "alpha_score",
+            ],
+        )
+        confidence_col = self._pick_first_existing_column(
+            columns,
+            ["confidence_score", "confidence", "signal_confidence"],
         )
         reason_col = self._pick_first_existing_column(
             columns,
@@ -325,7 +341,9 @@ class SignalToTargetService:
             as_of_date=as_of_date,
             effective_date=effective_date,
             limit=limit,
+            rank_col=rank_col,
             score_col=score_col,
+            confidence_col=confidence_col,
             reason_col=reason_col,
             as_of_col=as_of_col,
             effective_col=effective_col,
@@ -340,7 +358,9 @@ class SignalToTargetService:
             as_of_date=as_of_date,
             effective_date=effective_date,
             limit=limit,
+            rank_col=rank_col,
             score_col=score_col,
+            confidence_col=confidence_col,
             reason_col=reason_col,
             as_of_col=as_of_col,
             effective_col=effective_col,
@@ -462,7 +482,9 @@ class SignalToTargetService:
         as_of_date: date,
         effective_date: date,
         limit: int,
+        rank_col: str | None,
         score_col: str | None,
+        confidence_col: str | None,
         reason_col: str | None,
         as_of_col: str | None,
         effective_col: str | None,
@@ -494,7 +516,15 @@ class SignalToTargetService:
                 f"({reason_col} = 'TOP_N_SELECTED' or {reason_col} like '%TOP_N_SELECTED%')"
             )
 
-        order_by = f"{score_col} desc nulls last, id asc" if score_col else "id asc"
+        order_terms: list[str] = []
+        if rank_col:
+            order_terms.append(f"{rank_col} asc nulls last")
+        if score_col:
+            order_terms.append(f"{score_col} desc nulls last")
+        if confidence_col and confidence_col != score_col:
+            order_terms.append(f"{confidence_col} desc nulls last")
+        order_terms.extend(["instrument_id asc", "id asc"])
+        order_by = ", ".join(order_terms)
 
         sql = text(
             f"""
