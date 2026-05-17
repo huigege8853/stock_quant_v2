@@ -15,6 +15,7 @@ from stock_quant_v2.paper_campaign_domain.dto.paper_campaign_models import (
     CampaignDailyResult,
     CampaignExecutionPlan,
     CampaignModuleExecution,
+    CampaignSummaryResult,
     PaperCampaignConfig,
 )
 from stock_quant_v2.paper_campaign_domain.services.paper_campaign_calendar_service import (
@@ -86,11 +87,103 @@ class PaperCampaignRunner:
         config_path: Path,
         campaign_code: str,
     ) -> dict[str, Any]:
+        campaign = self._resolve_campaign(config_path=config_path, campaign_code=campaign_code)
+        summary = self._build_one_summary(campaign=campaign)
+        return {
+            "module": "M6.5",
+            "query": "build_paper_campaign_summary",
+            "overall_status": "PASS",
+            "summary": _jsonable(summary),
+        }
+
+    def build_summaries(
+        self,
+        *,
+        config_path: Path,
+        execution_context: str | None = "production_paper_campaign",
+        only_active: bool = True,
+    ) -> dict[str, Any]:
+        """Build summaries for active production paper campaigns.
+
+        This is intentionally used by the production daily runtime path.  It
+        keeps research/manual campaigns out of the automatic daily summary step
+        by filtering on the campaign metadata field
+        ``execution_context=production_paper_campaign``.
+        """
+
+        campaigns = PaperCampaignConfigLoader(config_path).load()
+        selected: list[PaperCampaignConfig] = []
+        skipped: list[dict[str, Any]] = []
+
+        for campaign in campaigns:
+            campaign_execution_context = str(campaign.extra.get("execution_context") or "").strip()
+            if only_active and campaign.status != "ACTIVE":
+                skipped.append(
+                    {
+                        "campaign_code": campaign.campaign_code,
+                        "reason": f"status={campaign.status}",
+                    }
+                )
+                continue
+            if execution_context and campaign_execution_context != execution_context:
+                skipped.append(
+                    {
+                        "campaign_code": campaign.campaign_code,
+                        "reason": f"execution_context={campaign_execution_context or 'missing'}",
+                    }
+                )
+                continue
+            selected.append(campaign)
+
+        results: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for campaign in selected:
+            try:
+                summary = self._build_one_summary(campaign=campaign)
+                results.append(
+                    {
+                        "campaign_code": campaign.campaign_code,
+                        "status": "SUCCESS",
+                        "summary": _jsonable(summary),
+                    }
+                )
+            except Exception as exc:
+                item = {
+                    "campaign_code": campaign.campaign_code,
+                    "status": "FAILED",
+                    "reason": str(exc),
+                }
+                failed.append(item)
+                results.append(item)
+
+        return {
+            "module": "M6.5",
+            "query": "build_paper_campaign_summaries",
+            "overall_status": "FAIL" if failed else "PASS",
+            "config_path": str(config_path),
+            "execution_context": execution_context,
+            "only_active": only_active,
+            "campaign_count": len(campaigns),
+            "selected_count": len(selected),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+            "results": results,
+            "skipped": skipped,
+        }
+
+    @staticmethod
+    def _resolve_campaign(
+        *,
+        config_path: Path,
+        campaign_code: str,
+    ) -> PaperCampaignConfig:
         campaigns = PaperCampaignConfigLoader(config_path).load()
         matches = [c for c in campaigns if c.campaign_code == campaign_code]
         if not matches:
             raise RuntimeError(f"campaign not found in config: {campaign_code}")
-        campaign = matches[0]
+        return matches[0]
+
+    def _build_one_summary(self, *, campaign: PaperCampaignConfig) -> CampaignSummaryResult:
         daily_payloads = self.report_builder.list_daily_payloads(campaign.campaign_code)
 
         portfolio_id = None
@@ -108,17 +201,11 @@ class PaperCampaignRunner:
                 calendar = PaperCampaignCalendarService(session)
                 snapshot_rows = calendar.read_snapshots(portfolio_id=portfolio_id, start_date=start, end_date=end)
 
-        summary = self.report_builder.write_summary(
+        return self.report_builder.write_summary(
             campaign=campaign,
             daily_payloads=daily_payloads,
             snapshot_rows=snapshot_rows,
         )
-        return {
-            "module": "M6.5",
-            "query": "build_paper_campaign_summary",
-            "overall_status": "PASS",
-            "summary": _jsonable(summary),
-        }
 
     def _run_one_campaign_daily(
         self,

@@ -378,6 +378,16 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         args.m6_5_campaign_config
         or _env_first("SQV2_M6_5_CAMPAIGN_CONFIG", "M6_5_CAMPAIGN_CONFIG")
     )
+    args.enable_m6_5_campaign_summary = _resolve_bool_option(
+        args.enable_m6_5_campaign_summary,
+        ("SQV2_DAILY_ENABLE_M6_5_CAMPAIGN_SUMMARY", "SQV2_ENABLE_M6_5_CAMPAIGN_SUMMARY"),
+        bool(args.enable_m6_5_campaign),
+    )
+    args.m6_5_campaign_summary_execution_context = _resolve_string_option(
+        args.m6_5_campaign_summary_execution_context,
+        ("SQV2_M6_5_CAMPAIGN_SUMMARY_EXECUTION_CONTEXT",),
+        "production_paper_campaign",
+    )
     return args
 
 
@@ -733,6 +743,24 @@ def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
             )
         )
 
+        if getattr(args, "enable_m6_5_campaign_summary", False):
+            summary_args: list[str] = [
+                "--all-active",
+                "--execution-context",
+                str(args.m6_5_campaign_summary_execution_context),
+            ]
+            if getattr(args, "m6_5_campaign_config", None):
+                summary_args.extend(["--config", str(args.m6_5_campaign_config)])
+            steps.append(
+                ChainStep(
+                    "m6_5_production_paper_campaign_summary",
+                    "stock_quant_v2.scripts.bootstrap_m6_5_paper_campaign_summary",
+                    extra_args=tuple(summary_args),
+                    optional=True,
+                    soft_fail=True,
+                )
+            )
+
     if not args.skip_m8_daily_ops:
         steps.append(
             ChainStep(
@@ -1050,6 +1078,23 @@ def build_parser() -> argparse.ArgumentParser:
             "Env: SQV2_M6_5_CAMPAIGN_CONFIG."
         ),
     )
+    parser.add_argument(
+        "--enable-m6-5-campaign-summary",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable automatic M6.5 production paper-campaign summary after the daily campaign runner. "
+            "Default follows --enable-m6-5-campaign. Env: SQV2_DAILY_ENABLE_M6_5_CAMPAIGN_SUMMARY."
+        ),
+    )
+    parser.add_argument(
+        "--m6-5-campaign-summary-execution-context",
+        default=None,
+        help=(
+            "Campaign execution_context filter for automatic M6.5 summary. "
+            "Default: production_paper_campaign. Env: SQV2_M6_5_CAMPAIGN_SUMMARY_EXECUTION_CONTEXT."
+        ),
+    )
     return parser
 
 
@@ -1101,6 +1146,16 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
         print("[DAILY] enable_m6_5_campaign = True", flush=True)
         if getattr(args, "m6_5_campaign_config", None):
             print(f"[DAILY] m6_5_campaign_config = {args.m6_5_campaign_config}", flush=True)
+        print(
+            f"[DAILY] enable_m6_5_campaign_summary = {args.enable_m6_5_campaign_summary}",
+            flush=True,
+        )
+        if getattr(args, "enable_m6_5_campaign_summary", False):
+            print(
+                "[DAILY] m6_5_campaign_summary_execution_context = "
+                f"{args.m6_5_campaign_summary_execution_context}",
+                flush=True,
+            )
     if env.get("M8_REPORT_DATE"):
         print(f"[DAILY] M8_REPORT_DATE = {env['M8_REPORT_DATE']}", flush=True)
 
