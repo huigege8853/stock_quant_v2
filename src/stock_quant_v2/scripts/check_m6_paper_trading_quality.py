@@ -388,6 +388,65 @@ def _run_checks(session: Session, chain: dict[str, int]) -> dict:
         {"signal_run_id": signal_run_id},
     )
 
+    linked_signal_count = _single_value(
+        session,
+        """
+        select count(*)
+        from trading_paper_target_position t
+        join strategy_signal s
+          on s.id = t.strategy_signal_id
+        where t.run_id = :target_run_id
+          and t.portfolio_id = :portfolio_id
+          and t.source_signal_run_id = :signal_run_id
+          and s.run_id = :signal_run_id
+        """,
+        {
+            "target_run_id": target_run_id,
+            "portfolio_id": portfolio_id,
+            "signal_run_id": signal_run_id,
+        },
+    )
+
+    rank_out_of_scope_count = _single_value(
+        session,
+        """
+        select count(*)
+        from trading_paper_target_position t
+        join strategy_signal s
+          on s.id = t.strategy_signal_id
+        where t.run_id = :target_run_id
+          and t.portfolio_id = :portfolio_id
+          and t.source_signal_run_id = :signal_run_id
+          and s.run_id = :signal_run_id
+          and (s.rank_in_batch is null or s.rank_in_batch > :target_count)
+        """,
+        {
+            "target_run_id": target_run_id,
+            "portfolio_id": portfolio_id,
+            "signal_run_id": signal_run_id,
+            "target_count": target_count,
+        },
+    )
+
+    max_selected_source_rank = _single_value(
+        session,
+        """
+        select coalesce(max(s.rank_in_batch), 0)
+        from trading_paper_target_position t
+        join strategy_signal s
+          on s.id = t.strategy_signal_id
+        where t.run_id = :target_run_id
+          and t.portfolio_id = :portfolio_id
+          and t.source_signal_run_id = :signal_run_id
+          and s.run_id = :signal_run_id
+        """,
+        {
+            "target_run_id": target_run_id,
+            "portfolio_id": portfolio_id,
+            "signal_run_id": signal_run_id,
+        },
+    )
+
     checks["target_count_check"] = target_count == 30
     checks["target_status_check"] = target_status_counts == {"ORDERED": 30}
     checks["order_count_check"] = order_count == 30
@@ -401,7 +460,13 @@ def _run_checks(session: Session, chain: dict[str, int]) -> dict:
     checks["cash_formula_check"] = cash_diff == Decimal("0.00000000")
     checks["equity_formula_check"] = equity_diff == Decimal("0.00000000")
     checks["cash_non_negative_check"] = cash_balance >= 0
-    checks["signal_source_exists_check"] = signal_count == 30
+    # New M4 v1.1 strategy signals may publish a larger candidate pool
+    # (for example 100 rows) and then use a screen bridge to select 30 rows
+    # for paper trading. Therefore the signal source check must verify source
+    # existence and target linkage, not require strategy_signal rows == 30.
+    checks["signal_source_exists_check"] = signal_count >= target_count
+    checks["target_signal_link_check"] = linked_signal_count == target_count
+    checks["target_signal_rank_scope_check"] = rank_out_of_scope_count == 0
 
     overall_status = "PASS" if all(checks.values()) else "FAIL"
 
@@ -417,6 +482,9 @@ def _run_checks(session: Session, chain: dict[str, int]) -> dict:
             "holding_count": holding_count,
             "source_signal_run_id": signal_run_id,
             "source_signal_count": signal_count,
+            "target_signal_link_count": linked_signal_count,
+            "target_signal_rank_out_of_scope_count": rank_out_of_scope_count,
+            "max_selected_source_rank": max_selected_source_rank,
         },
         "status_counts": {
             "target": target_status_counts,
