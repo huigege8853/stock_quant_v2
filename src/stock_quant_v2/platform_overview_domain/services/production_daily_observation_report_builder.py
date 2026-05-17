@@ -19,6 +19,7 @@ class WaterlineSpec:
     date_column: str
     run_id_column: str | None = None
     critical: bool = False
+    freshness_basis: str = "report_date"
 
 
 class ProductionDailyObservationReportBuilder:
@@ -35,12 +36,12 @@ class ProductionDailyObservationReportBuilder:
         WaterlineSpec("meta_trading_calendar", "trade_date", critical=True),
         WaterlineSpec("core_daily_bar", "trade_date", critical=True),
         WaterlineSpec("core_adjust_factor", "trade_date", critical=True),
-        WaterlineSpec("core_price_limit_daily", "trade_date"),
-        WaterlineSpec("market_index_bar", "trade_date"),
-        WaterlineSpec("analytics_feature_snapshot", "trade_date"),
-        WaterlineSpec("analytics_instrument_factor_snapshot", "trade_date"),
-        WaterlineSpec("analytics_instrument_indicator_snapshot", "trade_date"),
-        WaterlineSpec("strategy_signal", "as_of_date", "run_id", critical=True),
+        WaterlineSpec("core_price_limit_daily", "trade_date", freshness_basis="signal_as_of_date"),
+        WaterlineSpec("market_index_bar", "trade_date", freshness_basis="signal_as_of_date"),
+        WaterlineSpec("analytics_feature_snapshot", "trade_date", freshness_basis="signal_as_of_date"),
+        WaterlineSpec("analytics_instrument_factor_snapshot", "trade_date", freshness_basis="signal_as_of_date"),
+        WaterlineSpec("analytics_instrument_indicator_snapshot", "trade_date", freshness_basis="signal_as_of_date"),
+        WaterlineSpec("strategy_signal", "as_of_date", "run_id", critical=True, freshness_basis="signal_as_of_date"),
         WaterlineSpec("trading_paper_target_position", "effective_date", "run_id"),
         WaterlineSpec("trading_paper_order", "effective_date", "run_id"),
         WaterlineSpec("trading_paper_fill", "fill_date", "run_id"),
@@ -71,7 +72,11 @@ class ProductionDailyObservationReportBuilder:
         campaigns_all = self._load_campaigns(campaign_config_path)
         production_campaigns = self._filter_campaigns(campaigns_all, execution_context=execution_context)
 
-        waterline = self._build_waterline(resolved_report_date)
+        signal_as_of_date = self._resolve_signal_as_of_date(resolved_report_date)
+        waterline = self._build_waterline(
+            report_date=resolved_report_date,
+            signal_as_of_date=signal_as_of_date,
+        )
         campaign_reports = [
             self._build_campaign_section(
                 project_root=project_root,
@@ -106,6 +111,7 @@ class ProductionDailyObservationReportBuilder:
             "campaign_count": len(campaigns_all),
             "production_campaign_count": len(production_campaigns),
             "overall_status": overall_status,
+            "signal_as_of_date": signal_as_of_date,
             "waterline": waterline,
             "campaigns": campaign_reports,
             "artifact_index": artifact_index,
@@ -203,7 +209,33 @@ class ProductionDailyObservationReportBuilder:
             selected.append(campaign)
         return selected
 
-    def _build_waterline(self, report_date: date) -> list[dict[str, Any]]:
+    def _resolve_signal_as_of_date(self, report_date: date) -> date:
+        previous_trade_date = self._safe_scalar(
+            """
+            select previous_trade_date
+            from public.meta_trading_calendar
+            where trade_date = :report_date
+            limit 1
+            """,
+            {"report_date": report_date},
+        )
+        resolved = self._to_date(previous_trade_date)
+        if resolved is not None:
+            return resolved
+
+        fallback = self._safe_scalar(
+            """
+            select max(trade_date)
+            from public.meta_trading_calendar
+            where is_open = true
+              and trade_date < :report_date
+            """,
+            {"report_date": report_date},
+        )
+        resolved = self._to_date(fallback)
+        return resolved or report_date
+
+    def _build_waterline(self, *, report_date: date, signal_as_of_date: date) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for spec in self.WATERLINE_SPECS:
             row: dict[str, Any] = {
@@ -211,6 +243,8 @@ class ProductionDailyObservationReportBuilder:
                 "date_column": spec.date_column,
                 "run_id_column": spec.run_id_column,
                 "critical": spec.critical,
+                "freshness_basis": spec.freshness_basis,
+                "expected_date": signal_as_of_date if spec.freshness_basis == "signal_as_of_date" else report_date,
                 "rows": None,
                 "max_date": None,
                 "max_run_id": None,
@@ -228,15 +262,16 @@ class ProductionDailyObservationReportBuilder:
                 if spec.run_id_column:
                     row["max_run_id"] = db_row.get("max_run_id")
                 max_date = row["max_date"]
+                expected_date = row["expected_date"]
                 if max_date is None:
                     row["status"] = "FAIL" if spec.critical else "WARN"
                     row["reason"] = "no_date"
-                elif max_date >= report_date:
+                elif max_date >= expected_date:
                     row["status"] = "PASS"
-                    row["reason"] = "fresh_enough"
+                    row["reason"] = f"fresh_for_{spec.freshness_basis}:{max_date}>={expected_date}"
                 else:
                     row["status"] = "FAIL" if spec.critical else "WARN"
-                    row["reason"] = f"max_date_before_report_date:{max_date}<{report_date}"
+                    row["reason"] = f"max_date_before_{spec.freshness_basis}:{max_date}<{expected_date}"
             except Exception as exc:
                 row["status"] = "FAIL" if spec.critical else "WARN"
                 row["reason"] = f"query_failed:{type(exc).__name__}:{exc}"
@@ -289,7 +324,8 @@ class ProductionDailyObservationReportBuilder:
             )
         section["trade_summary"] = self._latest_trade_summary(portfolio_id=portfolio_id, report_date=report_date)
         section["snapshot"] = self._latest_snapshot(portfolio_id=portfolio_id, report_date=report_date)
-        position_run_id = ((section.get("snapshot") or {}).get("position_run_id"))
+        snapshot = section.get("snapshot") or {}
+        position_run_id = snapshot.get("position_run_id") or snapshot.get("snapshot_run_id")
         if position_run_id is not None:
             section["positions_preview"] = self._positions_preview(
                 portfolio_id=portfolio_id,
@@ -604,18 +640,19 @@ class ProductionDailyObservationReportBuilder:
             f"- execution_context: `{payload.get('execution_context')}`",
             f"- report_context: `{payload.get('report_context')}`",
             f"- paper_campaign_context: `{payload.get('paper_campaign_context')}`",
+            f"- signal_as_of_date: `{self._json_default(payload.get('signal_as_of_date'))}`",
             f"- overall_status: `{payload.get('overall_status')}`",
             "",
             "> 这是一份生产端 daily run 观察报告，不是研究报告，不是 M8 full ops 报告，也不是正式实盘交易报告。",
             "",
             "## 1. 数据水位",
             "",
-            "| table | max_date | rows | max_run_id | status | reason |",
-            "|---|---:|---:|---:|---|---|",
+            "| table | basis | expected_date | max_date | rows | max_run_id | status | reason |",
+            "|---|---|---:|---:|---:|---:|---|---|",
         ])
         for row in payload.get("waterline") or []:
             lines.append(
-                f"| {row.get('table_name')} | {self._json_default(row.get('max_date'))} | {row.get('rows')} | {row.get('max_run_id')} | {row.get('status')} | {row.get('reason')} |"
+                f"| {row.get('table_name')} | {row.get('freshness_basis')} | {self._json_default(row.get('expected_date'))} | {self._json_default(row.get('max_date'))} | {row.get('rows')} | {row.get('max_run_id')} | {row.get('status')} | {row.get('reason')} |"
             )
         lines.extend(["", "## 2. Production Paper Campaigns", ""])
         for campaign in payload.get("campaigns") or []:
@@ -638,7 +675,7 @@ class ProductionDailyObservationReportBuilder:
                 f"- rank_out_of_scope_rows: `{selection.get('rank_out_of_scope_rows')}`",
                 f"- order_run_id: `{(orders or {}).get('order_run_id')}` / order_count: `{(orders or {}).get('order_count')}` / buy: `{(orders or {}).get('buy_order_count')}` / sell: `{(orders or {}).get('sell_order_count')}`",
                 f"- fill_run_id: `{(fills or {}).get('fill_run_id')}` / fill_count: `{(fills or {}).get('fill_count')}`",
-                f"- snapshot_run_id: `{snapshot.get('snapshot_run_id')}` / snapshot_date: `{snapshot.get('snapshot_date')}`",
+                f"- snapshot_run_id: `{snapshot.get('snapshot_run_id')}` / position_run_id: `{snapshot.get('position_run_id') or snapshot.get('snapshot_run_id')}` / snapshot_date: `{snapshot.get('snapshot_date')}`",
                 f"- holding_count: `{snapshot.get('holding_count')}`",
                 f"- cash_balance: `{snapshot.get('cash_balance')}`",
                 f"- market_value: `{snapshot.get('market_value')}`",
