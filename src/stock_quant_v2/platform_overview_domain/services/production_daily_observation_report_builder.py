@@ -1221,15 +1221,225 @@ class ProductionDailyObservationReportBuilder:
     def _strategy_market_alignment(self, *, report_date: date, campaign_reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for campaign in campaign_reports:
-            selected_ids = [item.get("instrument_id") for item in campaign.get("selected_instruments") or [] if item.get("instrument_id") is not None]
-            holding_ids = [item.get("instrument_id") for item in campaign.get("positions_preview") or [] if item.get("instrument_id") is not None]
+            selected_items = campaign.get("selected_instruments") or []
+            holding_items = campaign.get("positions_preview") or []
+            selected_ids = [item.get("instrument_id") for item in selected_items if item.get("instrument_id") is not None]
+            holding_ids = [item.get("instrument_id") for item in holding_items if item.get("instrument_id") is not None]
+            industry_exposure = self._campaign_tag_exposure(
+                report_date=report_date,
+                selected_items=selected_items,
+                holding_items=holding_items,
+                tag_type_pattern="SW_INDUSTRY_L2%",
+                limit=12,
+            )
+            concept_exposure = self._campaign_tag_exposure(
+                report_date=report_date,
+                selected_items=selected_items,
+                holding_items=holding_items,
+                tag_type_pattern="%CONCEPT%",
+                limit=12,
+            )
             rows.append({
                 "campaign_code": campaign.get("campaign_code"),
                 "portfolio_id": campaign.get("portfolio_id"),
                 "selected_market_stats": self._instrument_market_stats(report_date=report_date, instrument_ids=selected_ids),
                 "holding_market_stats": self._instrument_market_stats(report_date=report_date, instrument_ids=holding_ids),
+                "industry_exposure": industry_exposure,
+                "concept_exposure": concept_exposure,
+                "market_match_summary": self._campaign_market_match_summary(
+                    industry_exposure=industry_exposure,
+                    concept_exposure=concept_exposure,
+                ),
             })
         return rows
+
+    def _campaign_tag_exposure(
+        self,
+        *,
+        report_date: date,
+        selected_items: list[dict[str, Any]],
+        holding_items: list[dict[str, Any]],
+        tag_type_pattern: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Aggregate selected/holding exposure by market tag.
+
+        This intentionally uses the existing public.tag / public.instrument_tag
+        schema only: tag_type, tag_code, tag_name, taxonomy_source, is_active.
+        It avoids category/tag_source columns because they do not exist in the
+        current production schema.
+        """
+        selected_weights: dict[int, Decimal] = {}
+        for item in selected_items:
+            instrument_id = item.get("instrument_id")
+            if instrument_id is None:
+                continue
+            value = self._to_decimal_value(item.get("target_weight")) or Decimal("0")
+            selected_weights[int(instrument_id)] = selected_weights.get(int(instrument_id), Decimal("0")) + value
+
+        holding_weights: dict[int, Decimal] = {}
+        holding_values: dict[int, Decimal] = {}
+        holding_pnl: dict[int, Decimal] = {}
+        for item in holding_items:
+            instrument_id = item.get("instrument_id")
+            if instrument_id is None:
+                continue
+            iid = int(instrument_id)
+            holding_weights[iid] = holding_weights.get(iid, Decimal("0")) + (self._to_decimal_value(item.get("position_weight")) or Decimal("0"))
+            holding_values[iid] = holding_values.get(iid, Decimal("0")) + (self._to_decimal_value(item.get("market_value")) or Decimal("0"))
+            holding_pnl[iid] = holding_pnl.get(iid, Decimal("0")) + (self._to_decimal_value(item.get("total_pnl")) or Decimal("0"))
+
+        instrument_ids = sorted(set(selected_weights) | set(holding_weights))
+        if not instrument_ids:
+            return {"status": "WARN", "reason": "no_selected_or_holding_instruments", "rows": []}
+
+        tag_sql = """
+        select
+            it.instrument_id,
+            t.tag_type,
+            t.tag_code,
+            t.tag_name
+        from public.instrument_tag it
+        join public.tag t on t.id = it.tag_id
+        where it.instrument_id = any(:instrument_ids)
+          and t.is_active = true
+          and t.tag_type like :tag_type_pattern
+          and it.effective_from <= :report_date
+          and (it.effective_to is null or it.effective_to >= :report_date)
+        """
+        try:
+            tag_rows = self._rows(
+                tag_sql,
+                {
+                    "instrument_ids": instrument_ids,
+                    "tag_type_pattern": tag_type_pattern,
+                    "report_date": report_date,
+                },
+            )
+        except Exception as exc:
+            self._rollback_session_safely()
+            return {"status": "WARN", "reason": f"query_failed:{type(exc).__name__}:{exc}", "rows": []}
+
+        if not tag_rows:
+            return {"status": "WARN", "reason": "no_matching_tag_data", "rows": []}
+
+        market_strength = self._tag_strength_summary(
+            report_date=report_date,
+            tag_type_pattern=tag_type_pattern,
+            limit=1000,
+        )
+        market_map: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for row in market_strength.get("rows") or []:
+            key = (row.get("tag_type"), row.get("tag_code"), row.get("tag_name"))
+            market_map[key] = row
+
+        grouped: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for row in tag_rows:
+            iid = int(row.get("instrument_id"))
+            key = (row.get("tag_type"), row.get("tag_code"), row.get("tag_name"))
+            item = grouped.setdefault(
+                key,
+                {
+                    "tag_type": row.get("tag_type"),
+                    "tag_code": row.get("tag_code"),
+                    "tag_name": row.get("tag_name"),
+                    "selected_count": 0,
+                    "selected_weight": Decimal("0"),
+                    "holding_count": 0,
+                    "holding_weight": Decimal("0"),
+                    "holding_market_value": Decimal("0"),
+                    "holding_total_pnl": Decimal("0"),
+                },
+            )
+            if iid in selected_weights:
+                item["selected_count"] += 1
+                item["selected_weight"] += selected_weights[iid]
+            if iid in holding_weights:
+                item["holding_count"] += 1
+                item["holding_weight"] += holding_weights[iid]
+                item["holding_market_value"] += holding_values.get(iid, Decimal("0"))
+                item["holding_total_pnl"] += holding_pnl.get(iid, Decimal("0"))
+
+        rows: list[dict[str, Any]] = []
+        for key, item in grouped.items():
+            market = market_map.get(key) or {}
+            item["market_instrument_count"] = market.get("instrument_count")
+            item["market_avg_pct_change"] = market.get("avg_pct_change")
+            item["market_median_pct_change"] = market.get("median_pct_change")
+            item["market_limit_up_rows"] = market.get("limit_up_rows")
+            item["market_total_amount"] = market.get("total_amount")
+            item["match_status"] = self._classify_tag_match(item)
+            rows.append(item)
+
+        rows.sort(
+            key=lambda x: (
+                self._to_decimal_value(x.get("selected_weight")) or Decimal("0"),
+                self._to_decimal_value(x.get("holding_weight")) or Decimal("0"),
+                self._to_decimal_value(x.get("market_avg_pct_change")) or Decimal("-999"),
+            ),
+            reverse=True,
+        )
+        limited_rows = rows[:limit]
+        if not limited_rows:
+            return {"status": "WARN", "reason": "no_aggregated_tag_rows", "rows": []}
+        return {"status": "PASS", "reason": f"rows={len(limited_rows)}", "rows": limited_rows}
+
+    @classmethod
+    def _classify_tag_match(cls, row: dict[str, Any]) -> str:
+        avg_return = cls._to_decimal_value(row.get("market_avg_pct_change"))
+        selected_count = int(row.get("selected_count") or 0)
+        holding_count = int(row.get("holding_count") or 0)
+        if avg_return is None:
+            return "DATA_NOT_READY"
+        if selected_count <= 0 and holding_count <= 0:
+            return "NO_EXPOSURE"
+        if avg_return >= Decimal("0.01"):
+            return "STRONG_MATCH"
+        if avg_return <= Decimal("-0.01"):
+            return "WEAK_EXPOSURE"
+        return "NEUTRAL"
+
+    @classmethod
+    def _campaign_market_match_summary(
+        cls,
+        *,
+        industry_exposure: dict[str, Any],
+        concept_exposure: dict[str, Any],
+    ) -> dict[str, Any]:
+        rows = (industry_exposure.get("rows") or []) + (concept_exposure.get("rows") or [])
+        exposed_rows = [row for row in rows if int(row.get("selected_count") or 0) > 0 or int(row.get("holding_count") or 0) > 0]
+        strong_rows = [row for row in exposed_rows if row.get("match_status") == "STRONG_MATCH"]
+        weak_rows = [row for row in exposed_rows if row.get("match_status") == "WEAK_EXPOSURE"]
+        top_selected = None
+        if exposed_rows:
+            top_selected = max(
+                exposed_rows,
+                key=lambda row: (
+                    cls._to_decimal_value(row.get("selected_weight")) or Decimal("0"),
+                    cls._to_decimal_value(row.get("holding_weight")) or Decimal("0"),
+                ),
+            )
+        if weak_rows and not strong_rows:
+            status = "WARN"
+            reason = "exposure_skews_to_weak_tags"
+        elif strong_rows:
+            status = "PASS"
+            reason = "has_strong_tag_exposure"
+        elif exposed_rows:
+            status = "PASS"
+            reason = "tag_exposure_neutral"
+        else:
+            status = "WARN"
+            reason = "no_tag_exposure"
+        return {
+            "status": status,
+            "reason": reason,
+            "strong_tag_count": len(strong_rows),
+            "weak_tag_count": len(weak_rows),
+            "top_exposure_tag": (top_selected or {}).get("tag_name"),
+            "top_exposure_tag_type": (top_selected or {}).get("tag_type"),
+            "top_exposure_match_status": (top_selected or {}).get("match_status"),
+        }
 
     def _instrument_market_stats(self, *, report_date: date, instrument_ids: list[Any]) -> dict[str, Any]:
         cleaned_ids = [int(x) for x in instrument_ids if x is not None]
@@ -1317,6 +1527,13 @@ class ProductionDailyObservationReportBuilder:
                 f"campaign={item.get('campaign_code')} selected_avg_return={cls._fmt_percent(selected.get('avg_pct_change'), 2)} "
                 f"holding_avg_return={cls._fmt_percent(holding.get('avg_pct_change'), 2)}"
             )
+            match = item.get("market_match_summary") or {}
+            if match:
+                notes.append(
+                    f"campaign={item.get('campaign_code')} market_match={match.get('status')} "
+                    f"reason={match.get('reason')} top_exposure={match.get('top_exposure_tag')} "
+                    f"top_exposure_match={match.get('top_exposure_match_status')}"
+                )
         return notes
 
     @staticmethod
@@ -1581,6 +1798,33 @@ class ProductionDailyObservationReportBuilder:
             holding = item.get("holding_market_stats") or {}
             lines.append(
                 f"| {item.get('campaign_code')} | {selected.get('instrument_count')} | {self._fmt_percent(selected.get('avg_pct_change'), 2)} | {selected.get('up_rows')} | {selected.get('down_rows')} | {selected.get('limit_up_rows')} | {holding.get('instrument_count')} | {self._fmt_percent(holding.get('avg_pct_change'), 2)} | {holding.get('up_rows')} | {holding.get('down_rows')} |"
+            )
+        lines.extend([
+            "",
+            "### 2.7 策略 / 持仓行业与概念暴露",
+            "",
+            "| campaign | group | tag | selected_count | selected_weight | holding_count | holding_weight | holding_pnl | market_avg_return | market_limit_up | match_status |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ])
+        for item in market_context.get("strategy_alignment") or []:
+            campaign_code = item.get("campaign_code")
+            for group_name, exposure_key in (("industry", "industry_exposure"), ("concept", "concept_exposure")):
+                exposure = item.get(exposure_key) or {}
+                for row in (exposure.get("rows") or [])[:12]:
+                    lines.append(
+                        f"| {campaign_code} | {group_name} | {row.get('tag_name')} | {row.get('selected_count')} | {self._fmt_percent(row.get('selected_weight'), 2)} | {row.get('holding_count')} | {self._fmt_percent(row.get('holding_weight'), 2)} | {self._fmt_money(row.get('holding_total_pnl'))} | {self._fmt_percent(row.get('market_avg_pct_change'), 2)} | {row.get('market_limit_up_rows')} | {row.get('match_status')} |"
+                    )
+        lines.extend([
+            "",
+            "### 2.8 策略与市场主线匹配小结",
+            "",
+            "| campaign | status | reason | strong_tags | weak_tags | top_exposure_tag | top_exposure_match |",
+            "|---|---|---|---:|---:|---|---|",
+        ])
+        for item in market_context.get("strategy_alignment") or []:
+            summary = item.get("market_match_summary") or {}
+            lines.append(
+                f"| {item.get('campaign_code')} | {summary.get('status')} | {summary.get('reason')} | {summary.get('strong_tag_count')} | {summary.get('weak_tag_count')} | {summary.get('top_exposure_tag')} | {summary.get('top_exposure_match_status')} |"
             )
         lines.extend(["", "## 3. Production Paper Campaigns", ""])
         for campaign in payload.get("campaigns") or []:
