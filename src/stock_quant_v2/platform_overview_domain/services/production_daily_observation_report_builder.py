@@ -215,6 +215,13 @@ class ProductionDailyObservationReportBuilder:
         }
         payload["daily_conclusion"] = self._build_daily_conclusion_summary(payload)
         payload["next_trade_plan_sla"] = self._build_next_trade_plan_sla(payload)
+        payload["buy_price_quality"] = self._build_buy_price_quality(payload)
+        payload["daily_diff"] = self._build_daily_diff(
+            project_root=project_root,
+            output_root=output_root,
+            report_date=resolved_report_date,
+            current_payload=payload,
+        )
         payload["artifact_integrity"] = self._build_artifact_integrity(
             project_root=project_root,
             artifact_index=artifact_index,
@@ -2309,6 +2316,427 @@ class ProductionDailyObservationReportBuilder:
         }
 
     @classmethod
+    def _build_buy_price_quality(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """Observe NEXT_OPEN buy price quality from existing order/fill rows.
+
+        This is an operational observation only. It compares the order estimated
+        price (currently derived from the signal-side close in the existing
+        execution chain) with the actual simulated fill price (NEXT_OPEN). It
+        does not introduce a new buy-point engine or change execution behavior.
+        """
+        campaign_rows: list[dict[str, Any]] = []
+        for campaign in payload.get("campaigns") or []:
+            buy_rows = [
+                row for row in (campaign.get("trade_details") or [])
+                if str(row.get("order_side") or "").upper() == "BUY"
+            ]
+            quality_rows: list[dict[str, Any]] = []
+            total_gap_cost = Decimal("0")
+            total_estimated_amount = Decimal("0")
+            gap_ratio_sum = Decimal("0")
+            computed_count = 0
+            favorable_count = 0
+            unfavorable_count = 0
+            flat_count = 0
+
+            for row in buy_rows:
+                estimated_price = cls._to_decimal_value(row.get("estimated_price"))
+                fill_price = cls._to_decimal_value(row.get("fill_price"))
+                quantity = cls._to_decimal_value(row.get("fill_quantity") or row.get("order_quantity") or row.get("target_quantity"))
+                if estimated_price is None or fill_price is None or estimated_price == 0 or quantity is None:
+                    continue
+                gap_amount = fill_price - estimated_price
+                gap_ratio = gap_amount / estimated_price
+                estimated_gap_cost = gap_amount * quantity
+                estimated_amount = estimated_price * quantity
+                total_gap_cost += estimated_gap_cost
+                total_estimated_amount += estimated_amount
+                gap_ratio_sum += gap_ratio
+                computed_count += 1
+                if gap_ratio > 0:
+                    unfavorable_count += 1
+                elif gap_ratio < 0:
+                    favorable_count += 1
+                else:
+                    flat_count += 1
+                quality_row = {
+                    "campaign_code": campaign.get("campaign_code"),
+                    "rank_no": row.get("rank_no"),
+                    "instrument_id": row.get("instrument_id"),
+                    "instrument_code": row.get("instrument_code"),
+                    "symbol": row.get("symbol"),
+                    "display_name": row.get("display_name"),
+                    "estimated_price": estimated_price,
+                    "fill_price": fill_price,
+                    "quantity": quantity,
+                    "gap_amount": gap_amount,
+                    "gap_ratio": gap_ratio,
+                    "estimated_gap_cost": estimated_gap_cost,
+                    "order_status": row.get("order_status"),
+                    "fill_status": row.get("fill_status"),
+                    "entry_policy": row.get("entry_policy"),
+                    "price_source": row.get("price_source"),
+                    "fill_rule": row.get("fill_rule"),
+                }
+                quality_rows.append(quality_row)
+
+            avg_gap_ratio = (gap_ratio_sum / Decimal(computed_count)) if computed_count else None
+            weighted_gap_ratio = cls._safe_ratio(total_gap_cost, total_estimated_amount) if computed_count else None
+            warning_reasons: list[str] = []
+            if not buy_rows:
+                status = "WARN"
+                reason = "no_buy_order_rows"
+            elif computed_count == 0:
+                status = "WARN"
+                reason = "no_buy_rows_with_estimated_and_fill_price"
+            else:
+                if (avg_gap_ratio is not None and avg_gap_ratio > Decimal("0.005")) or (
+                    weighted_gap_ratio is not None and weighted_gap_ratio > Decimal("0.005")
+                ):
+                    warning_reasons.append("avg_or_weighted_unfavorable_gap_gt_0_5pct")
+                if unfavorable_count > favorable_count and total_gap_cost > 0:
+                    warning_reasons.append("unfavorable_gap_count_gt_favorable")
+                status = "WARN" if warning_reasons else "PASS"
+                reason = ";".join(warning_reasons) if warning_reasons else "buy_price_quality_observable"
+
+            worst_rows = sorted(
+                quality_rows,
+                key=lambda item: cls._to_decimal_value(item.get("gap_ratio")) or Decimal("-999"),
+                reverse=True,
+            )[:5]
+            best_rows = sorted(
+                quality_rows,
+                key=lambda item: cls._to_decimal_value(item.get("gap_ratio")) or Decimal("999"),
+            )[:5]
+            campaign_rows.append({
+                "campaign_code": campaign.get("campaign_code"),
+                "portfolio_id": campaign.get("portfolio_id"),
+                "status": status,
+                "reason": reason,
+                "scope": "production_observation_next_open_price_quality_not_buy_point_engine",
+                "buy_order_count": len(buy_rows),
+                "computed_count": computed_count,
+                "favorable_gap_count": favorable_count,
+                "unfavorable_gap_count": unfavorable_count,
+                "flat_gap_count": flat_count,
+                "avg_gap_ratio": avg_gap_ratio,
+                "weighted_gap_ratio": weighted_gap_ratio,
+                "estimated_gap_cost": total_gap_cost if computed_count else None,
+                "estimated_signal_amount": total_estimated_amount if computed_count else None,
+                "worst_gap_top": worst_rows,
+                "best_gap_top": best_rows,
+            })
+
+        statuses = [row.get("status") for row in campaign_rows]
+        status = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
+        if not campaign_rows:
+            status = "WARN"
+            reason = "no_campaigns_for_buy_price_quality"
+        else:
+            reason = f"campaign_count={len(campaign_rows)},warn={statuses.count('WARN')}"
+        return {
+            "status": status,
+            "reason": reason,
+            "scope": "production_observation_price_gap_from_estimated_signal_price_to_next_open_fill",
+            "campaigns": campaign_rows,
+        }
+
+    def _build_daily_diff(
+        self,
+        *,
+        project_root: Path,
+        output_root: Path,
+        report_date: date,
+        current_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous_payload, previous_path, previous_lookup_reason = self._load_previous_report_payload(
+            output_root=output_root,
+            report_date=report_date,
+        )
+        if previous_payload is None:
+            return {
+                "status": "WARN",
+                "reason": previous_lookup_reason,
+                "previous_report_date": None,
+                "previous_report_path": str(previous_path) if previous_path else None,
+                "expected_previous_report_date": self._resolve_signal_as_of_date(report_date),
+                "scope": "production_daily_diff_observation",
+                "rows": [],
+                "summary": [],
+            }
+
+        rows: list[dict[str, Any]] = []
+        summary: list[str] = []
+
+        def add_metric(metric: str, current: Any, previous: Any, delta: Any = None, status: str = "PASS", reason: str = "") -> None:
+            rows.append({
+                "metric": metric,
+                "current_value": current,
+                "previous_value": previous,
+                "delta": delta,
+                "status": status,
+                "reason": reason,
+            })
+
+        def _missing_observation_status(metric_name: str, current: Any, previous: Any, default_reason: str) -> tuple[str, str]:
+            current_missing = current in (None, "")
+            previous_missing = previous in (None, "")
+            if current_missing and previous_missing:
+                return "WARN", f"{metric_name}_missing_in_current_and_previous"
+            if current_missing:
+                return "WARN", f"{metric_name}_missing_in_current"
+            if previous_missing:
+                return "WARN", f"{metric_name}_missing_in_previous"
+            return "PASS", default_reason
+
+        previous_report_date = self._to_date(previous_payload.get("report_date")) or previous_payload.get("report_date")
+        expected_previous_report_date = self._resolve_signal_as_of_date(report_date)
+        previous_date_status = "PASS"
+        previous_date_reason = "previous_report_date_matches_expected_previous_trade_date"
+        if previous_report_date is None:
+            previous_date_status = "WARN"
+            previous_date_reason = "previous_report_date_missing"
+        elif expected_previous_report_date is not None and previous_report_date != expected_previous_report_date:
+            previous_date_status = "WARN"
+            previous_date_reason = f"previous_report_date_not_expected_previous_trade_date:{self._json_default(previous_report_date)}!={self._json_default(expected_previous_report_date)}"
+        add_metric(
+            "previous_report_freshness",
+            report_date,
+            previous_report_date,
+            None,
+            previous_date_status,
+            previous_date_reason,
+        )
+
+        current_status = current_payload.get("overall_status")
+        previous_status = previous_payload.get("overall_status")
+        add_metric(
+            "overall_status",
+            current_status,
+            previous_status,
+            None,
+            "WARN" if current_status != previous_status else "PASS",
+            "overall_status_changed" if current_status != previous_status else "overall_status_unchanged",
+        )
+
+        current_feature = current_payload.get("feature_readiness") or {}
+        previous_feature = previous_payload.get("feature_readiness") or {}
+        for metric_name, key in (
+            ("feature_valid_instrument_count", "valid_instrument_count"),
+            ("feature_universe_size", "universe_size"),
+            ("feature_excluded_instrument_count", "excluded_instrument_count"),
+            ("feature_missing_feature_count", "missing_feature_count"),
+        ):
+            current_value = self._optional_int(current_feature.get(key))
+            previous_value = self._optional_int(previous_feature.get(key))
+            delta_value = (current_value - previous_value) if current_value is not None and previous_value is not None else None
+            metric_status, metric_reason = _missing_observation_status(metric_name, current_value, previous_value, "delta_observed")
+            if metric_status == "PASS" and metric_name == "feature_valid_instrument_count" and delta_value is not None and delta_value <= -500:
+                metric_status = "WARN"
+                metric_reason = "feature_valid_count_drop_ge_500"
+            add_metric(metric_name, current_value, previous_value, delta_value, metric_status, metric_reason)
+
+        current_campaign = self._first_campaign_payload(current_payload)
+        previous_campaign = self._first_campaign_payload(previous_payload)
+        current_snapshot = current_campaign.get("snapshot") or {}
+        previous_snapshot = previous_campaign.get("snapshot") or {}
+        current_risk = current_campaign.get("risk_metrics") or {}
+        previous_risk = previous_campaign.get("risk_metrics") or {}
+
+        for metric_name, getter in (
+            ("daily_return", lambda p, c, r, s: s.get("daily_return")),
+            ("daily_pnl", lambda p, c, r, s: s.get("daily_pnl")),
+            ("total_equity", lambda p, c, r, s: s.get("total_equity")),
+            ("cash_ratio", lambda p, c, r, s: r.get("cash_ratio") if r.get("cash_ratio") not in (None, "") else self._safe_ratio(s.get("cash_balance"), s.get("total_equity"))),
+            ("stock_exposure", lambda p, c, r, s: r.get("stock_exposure") if r.get("stock_exposure") not in (None, "") else self._derive_stock_exposure_from_snapshot(s)),
+        ):
+            current_value = getter(current_payload, current_campaign, current_risk, current_snapshot)
+            previous_value = getter(previous_payload, previous_campaign, previous_risk, previous_snapshot)
+            current_dec = self._to_decimal_value(current_value)
+            previous_dec = self._to_decimal_value(previous_value)
+            delta_value = (current_dec - previous_dec) if current_dec is not None and previous_dec is not None else None
+            metric_status, metric_reason = _missing_observation_status(metric_name, current_value, previous_value, "delta_observed")
+            if metric_status == "PASS" and metric_name == "stock_exposure" and delta_value is not None and abs(delta_value) >= Decimal("0.20"):
+                metric_status = "WARN"
+                metric_reason = "stock_exposure_abs_change_ge_20pct"
+            add_metric(metric_name, current_value, previous_value, delta_value, metric_status, metric_reason)
+
+        current_selected = self._instrument_code_set(current_campaign.get("selected_instruments") or [])
+        previous_selected = self._instrument_code_set(previous_campaign.get("selected_instruments") or [])
+        selected_overlap = current_selected & previous_selected
+        selected_overlap_ratio = self._safe_ratio(len(selected_overlap), len(previous_selected)) if previous_selected else None
+        if not current_selected or not previous_selected:
+            selected_status = "WARN"
+            selected_reason = "selected_overlap_not_available"
+        elif selected_overlap_ratio is not None and selected_overlap_ratio < Decimal("0.50"):
+            selected_status = "WARN"
+            selected_reason = f"overlap_ratio={self._fmt_percent(selected_overlap_ratio, 2)}"
+        else:
+            selected_status = "PASS"
+            selected_reason = f"overlap_ratio={self._fmt_percent(selected_overlap_ratio, 2) if selected_overlap_ratio is not None else 'UNKNOWN'}"
+        add_metric(
+            "selected_overlap_with_previous_day",
+            len(current_selected),
+            len(previous_selected),
+            len(selected_overlap),
+            selected_status,
+            selected_reason,
+        )
+
+        current_holding = self._instrument_code_set(current_campaign.get("positions_preview") or [])
+        previous_holding = self._instrument_code_set(previous_campaign.get("positions_preview") or [])
+        holding_overlap = current_holding & previous_holding
+        holding_overlap_ratio = self._safe_ratio(len(holding_overlap), len(previous_holding)) if previous_holding else None
+        if not current_holding or not previous_holding:
+            holding_status = "WARN"
+            holding_reason = "holding_overlap_not_available"
+        elif holding_overlap_ratio is not None and holding_overlap_ratio < Decimal("0.50"):
+            holding_status = "WARN"
+            holding_reason = f"overlap_ratio={self._fmt_percent(holding_overlap_ratio, 2)}"
+        else:
+            holding_status = "PASS"
+            holding_reason = f"overlap_ratio={self._fmt_percent(holding_overlap_ratio, 2) if holding_overlap_ratio is not None else 'UNKNOWN'}"
+        add_metric(
+            "holding_overlap_with_previous_day",
+            len(current_holding),
+            len(previous_holding),
+            len(holding_overlap),
+            holding_status,
+            holding_reason,
+        )
+
+        current_mainline = self._top_mainline_summary(current_payload)
+        previous_mainline = self._top_mainline_summary(previous_payload)
+        mainline_changed = current_mainline.get("tag") != previous_mainline.get("tag")
+        if not current_mainline.get("tag") or not previous_mainline.get("tag"):
+            mainline_status = "WARN"
+            mainline_reason = f"current_match={current_mainline.get('match')};previous_match={previous_mainline.get('match')};top_mainline_not_available"
+        else:
+            mainline_status = "WARN" if mainline_changed else "PASS"
+            mainline_reason = (
+                f"current_match={current_mainline.get('match')};previous_match={previous_mainline.get('match')};"
+                + ("top_mainline_changed" if mainline_changed else "top_mainline_unchanged")
+            )
+        add_metric(
+            "top_mainline_tag",
+            current_mainline.get("tag"),
+            previous_mainline.get("tag"),
+            None,
+            mainline_status,
+            mainline_reason,
+        )
+
+        current_runtime = (current_campaign.get("runtime_observation") or {}).get("runtime_action")
+        previous_runtime = (previous_campaign.get("runtime_observation") or {}).get("runtime_action")
+        runtime_status = "WARN" if current_runtime != previous_runtime else "PASS"
+        runtime_reason = "runtime_action_changed" if current_runtime != previous_runtime else "runtime_action_unchanged"
+        if current_runtime in (None, "", "NO_DAILY_ARTIFACT"):
+            runtime_status = "WARN"
+            runtime_reason = "current_runtime_action_not_observable"
+        add_metric(
+            "runtime_action",
+            current_runtime,
+            previous_runtime,
+            None,
+            runtime_status,
+            runtime_reason,
+        )
+
+        warn_rows = [row for row in rows if row.get("status") == "WARN"]
+        if selected_overlap_ratio is not None:
+            summary.append(f"selected_overlap={self._fmt_percent(selected_overlap_ratio, 2)}")
+        if holding_overlap_ratio is not None:
+            summary.append(f"holding_overlap={self._fmt_percent(holding_overlap_ratio, 2)}")
+        if current_mainline.get("tag"):
+            summary.append(f"top_mainline={current_mainline.get('tag')}({current_mainline.get('match')})")
+        status = "WARN" if warn_rows else "PASS"
+        reason = f"previous_report_date={self._json_default(previous_report_date)},expected_previous_report_date={self._json_default(expected_previous_report_date)},warn={len(warn_rows)}"
+        return {
+            "status": status,
+            "reason": reason,
+            "previous_report_date": previous_report_date,
+            "previous_report_path": str(previous_path) if previous_path else None,
+            "expected_previous_report_date": expected_previous_report_date,
+            "lookup_reason": previous_lookup_reason,
+            "scope": "production_daily_diff_observation",
+            "rows": rows,
+            "summary": summary,
+        }
+
+    def _load_previous_report_payload(
+        self,
+        *,
+        output_root: Path,
+        report_date: date,
+    ) -> tuple[dict[str, Any] | None, Path | None, str]:
+        previous_trade_date = self._resolve_signal_as_of_date(report_date)
+        candidates: list[Path] = []
+        if previous_trade_date and previous_trade_date != report_date:
+            candidates.append(output_root / previous_trade_date.isoformat() / f"production_daily_observation_{previous_trade_date.isoformat()}.json")
+        candidates.append(output_root / "latest" / "production_daily_observation_latest.json")
+
+        for candidate in candidates:
+            payload = self._read_report_payload_if_previous(candidate, report_date=report_date)
+            if payload is not None:
+                return payload, candidate, "previous_report_found"
+
+        if output_root.exists():
+            dated_candidates = sorted(
+                output_root.glob("20??-??-??/production_daily_observation_20??-??-??.json"),
+                reverse=True,
+            )
+            for candidate in dated_candidates:
+                payload = self._read_report_payload_if_previous(candidate, report_date=report_date)
+                if payload is not None:
+                    return payload, candidate, "previous_report_found_by_scan"
+        return None, candidates[0] if candidates else None, "previous_report_not_found"
+
+    def _read_report_payload_if_previous(self, path: Path, *, report_date: date) -> dict[str, Any] | None:
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload_report_date = self._to_date(payload.get("report_date"))
+        if payload_report_date is None or payload_report_date >= report_date:
+            return None
+        return payload
+
+    @classmethod
+    def _first_campaign_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        campaigns = payload.get("campaigns") or []
+        return campaigns[0] if campaigns and isinstance(campaigns[0], dict) else {}
+
+    @classmethod
+    def _instrument_code_set(cls, rows: list[dict[str, Any]]) -> set[str]:
+        values: set[str] = set()
+        for row in rows:
+            value = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+            if value is not None:
+                values.add(str(value))
+        return values
+
+    @classmethod
+    def _top_mainline_summary(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        alignments = ((payload.get("market_context") or {}).get("strategy_alignment") or [])
+        first_alignment = alignments[0] if alignments and isinstance(alignments[0], dict) else {}
+        match = (first_alignment.get("market_match_summary") or {}) if isinstance(first_alignment, dict) else {}
+        return {
+            "tag": match.get("top_exposure_tag"),
+            "match": match.get("top_exposure_match_status"),
+        }
+
+    @classmethod
+    def _derive_stock_exposure_from_snapshot(cls, snapshot: dict[str, Any]) -> Decimal | None:
+        cash_ratio = cls._safe_ratio(snapshot.get("cash_balance"), snapshot.get("total_equity"))
+        if cash_ratio is None:
+            return None
+        return Decimal("1") - cash_ratio
+
+    @classmethod
     def _build_report_self_check(cls, payload: dict[str, Any]) -> dict[str, Any]:
         rows: list[dict[str, Any]] = []
 
@@ -2331,11 +2759,24 @@ class ProductionDailyObservationReportBuilder:
         )
         portfolio_rows = [row for row in daily_conclusion if row.get("item") == "组合表现"]
         portfolio_summary = str((portfolio_rows[0] or {}).get("summary") if portfolio_rows else "")
-        cash_ratio_blank = "cash_ratio=," in portfolio_summary or "cash_ratio=." in portfolio_summary or "cash_ratio=, " in portfolio_summary
+        missing_portfolio_metric_tokens = [
+            token
+            for token in [
+                "daily_return=UNKNOWN",
+                "daily_pnl=UNKNOWN",
+                "cash_ratio=UNKNOWN",
+                "stock_exposure=UNKNOWN",
+                "cash_ratio=,",
+                "cash_ratio=.",
+                "cash_ratio=, ",
+            ]
+            if token in portfolio_summary
+        ]
         add(
             "daily_conclusion_cash_ratio_not_blank",
-            "PASS" if portfolio_rows and not cash_ratio_blank else "WARN",
-            portfolio_summary or "portfolio_summary_missing",
+            "PASS" if portfolio_rows and not missing_portfolio_metric_tokens else "WARN",
+            (portfolio_summary or "portfolio_summary_missing")
+            + (";missing_tokens=" + ",".join(missing_portfolio_metric_tokens) if missing_portfolio_metric_tokens else ""),
         )
 
         next_trade_plan = payload.get("next_trade_plan") or {}
@@ -2372,6 +2813,20 @@ class ProductionDailyObservationReportBuilder:
             "active_campaign_section_present",
             "PASS" if campaigns else "FAIL",
             f"campaign_count={len(campaigns)}",
+        )
+
+        buy_price_quality = payload.get("buy_price_quality") or {}
+        add(
+            "buy_price_quality_section_present",
+            "PASS" if buy_price_quality.get("campaigns") else "WARN",
+            str(buy_price_quality.get("reason") or "buy_price_quality_missing"),
+        )
+
+        daily_diff = payload.get("daily_diff") or {}
+        add(
+            "daily_diff_section_present",
+            "PASS" if daily_diff.get("rows") else "WARN",
+            str(daily_diff.get("reason") or "daily_diff_missing"),
         )
 
         statuses = [row.get("status") for row in rows]
@@ -2472,6 +2927,14 @@ class ProductionDailyObservationReportBuilder:
         elif artifact_integrity.get("status") == "WARN":
             add("P1", "WARN", "artifact_integrity", str(artifact_integrity.get("reason") or ""), "检查产物是否缺失、为空或 latest 未更新。")
 
+        daily_diff = payload.get("daily_diff") or {}
+        if daily_diff.get("status") == "WARN":
+            add("P2", "WARN", "daily_diff", str(daily_diff.get("reason") or ""), "查看昨日对比，确认是否为正常换仓/主线变化。")
+
+        buy_price_quality = payload.get("buy_price_quality") or {}
+        if buy_price_quality.get("status") == "WARN":
+            add("P2", "WARN", "buy_price_quality", str(buy_price_quality.get("reason") or ""), "查看不利开盘跳空 Top，判断 NEXT_OPEN 成本影响。")
+
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         if breadth.get("market_breadth_state") == "BREADTH_WEAK":
@@ -2500,6 +2963,8 @@ class ProductionDailyObservationReportBuilder:
         next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
         report_self_check = payload.get("report_self_check") or {}
         artifact_integrity = payload.get("artifact_integrity") or {}
+        daily_diff = payload.get("daily_diff") or {}
+        buy_price_quality = payload.get("buy_price_quality") or {}
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         campaigns = payload.get("campaigns") or []
@@ -2529,6 +2994,8 @@ class ProductionDailyObservationReportBuilder:
             "next_trade_plan_basis": next_trade_plan_sla.get("plan_basis"),
             "report_self_check_status": report_self_check.get("status"),
             "artifact_integrity_status": artifact_integrity.get("status"),
+            "daily_diff_status": daily_diff.get("status"),
+            "buy_price_quality_status": buy_price_quality.get("status"),
             "market_breadth_state": breadth.get("market_breadth_state"),
             "cash_ratio": cash_ratio,
             "stock_exposure": stock_exposure,
@@ -2538,13 +3005,16 @@ class ProductionDailyObservationReportBuilder:
     @classmethod
     def _build_manual_review_checklist(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
         next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
+        daily_diff = payload.get("daily_diff") or {}
+        buy_price_quality = payload.get("buy_price_quality") or {}
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         checklist = [
             {"priority": "P1", "checked": False, "item": "git_commit 是否真实可追溯", "reason": str(payload.get("git_commit_status"))},
             {"priority": "P1", "checked": False, "item": "next_trade_plan 是否已落表", "reason": str(next_trade_plan_sla.get("blocker") or "")},
             {"priority": "P2", "checked": False, "item": "market breadth 是否持续偏弱", "reason": str(breadth.get("market_breadth_state") or "UNKNOWN")},
-            {"priority": "P2", "checked": False, "item": "组合是否连续跑输市场", "reason": "需要 Daily Diff 阶段补充连续观察。"},
+            {"priority": "P2", "checked": False, "item": "昨日对比是否异常", "reason": str(daily_diff.get("reason") or "daily_diff_missing")},
+            {"priority": "P2", "checked": False, "item": "NEXT_OPEN 买入价格质量是否异常", "reason": str(buy_price_quality.get("reason") or "buy_price_quality_missing")},
             {"priority": "P2", "checked": False, "item": "主线是否连续 NEUTRAL/WEAK", "reason": "需要主线错位连续观察阶段补充。"},
             {"priority": "P2", "checked": False, "item": "是否有接近退出条件的持仓", "reason": "当前仅为生产观察骨架，正式退出规则未落表。"},
             {"priority": "P1", "checked": False, "item": "是否有订单/成交异常", "reason": "查看 Production Paper Campaigns 和风险 / 异常检查。"},
@@ -3791,6 +4261,8 @@ class ProductionDailyObservationReportBuilder:
             f"| next_trade_plan | `{control_panel.get('next_trade_plan_status')}` / `{control_panel.get('next_trade_plan_basis')}` |",
             f"| report_self_check | `{control_panel.get('report_self_check_status')}` |",
             f"| artifact_integrity | `{control_panel.get('artifact_integrity_status')}` |",
+            f"| daily_diff | `{control_panel.get('daily_diff_status')}` |",
+            f"| buy_price_quality | `{control_panel.get('buy_price_quality_status')}` |",
             f"| market_breadth_state | `{control_panel.get('market_breadth_state')}` |",
             f"| cash_ratio | `{self._fmt_percent(control_panel.get('cash_ratio'), 2) or 'UNKNOWN'}` |",
             f"| stock_exposure | `{self._fmt_percent(control_panel.get('stock_exposure'), 2) or 'UNKNOWN'}` |",
@@ -3878,6 +4350,128 @@ class ProductionDailyObservationReportBuilder:
                 f"{self._md_cell(row.get('reason'))} |"
             )
         return lines
+
+    def _render_daily_diff(self, daily_diff: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.8 昨日对比 / Daily Diff",
+            "",
+            f"- status: `{daily_diff.get('status')}` / reason: `{self._md_cell(daily_diff.get('reason'))}`",
+            f"- previous_report_date: `{self._json_default(daily_diff.get('previous_report_date'))}` / previous_report_path: `{self._md_cell(daily_diff.get('previous_report_path'))}`",
+        ]
+        summary = daily_diff.get("summary") or []
+        if summary:
+            lines.append("- summary: " + "; ".join(self._md_cell(item) for item in summary))
+        lines.extend([
+            "",
+            "| metric | current | previous | delta / overlap | status | reason |",
+            "|---|---:|---:|---:|---|---|",
+        ])
+        rows = daily_diff.get("rows") or []
+        if not rows:
+            lines.append("| previous_report | None | None | None | WARN | previous_report_not_found_or_not_parseable |")
+            return lines
+        for row in rows[:30]:
+            lines.append(
+                "| "
+                f"{self._md_cell(row.get('metric'))} | "
+                f"{self._format_diff_value(row.get('current_value'))} | "
+                f"{self._format_diff_value(row.get('previous_value'))} | "
+                f"{self._format_diff_value(row.get('delta'))} | "
+                f"{self._md_cell(row.get('status'))} | "
+                f"{self._md_cell(row.get('reason'))} |"
+            )
+        return lines
+
+    def _render_buy_price_quality(self, buy_price_quality: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.9 买入价格质量 / NEXT_OPEN Gap Quality",
+            "",
+            f"- status: `{buy_price_quality.get('status')}` / reason: `{self._md_cell(buy_price_quality.get('reason'))}`",
+            f"- scope: `{self._md_cell(buy_price_quality.get('scope'))}`",
+            "",
+            "| campaign | status | buy | computed | favorable | unfavorable | avg_gap | weighted_gap | estimated_gap_cost | reason |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        campaigns = buy_price_quality.get("campaigns") or []
+        if not campaigns:
+            lines.append("| None | WARN | 0 | 0 | 0 | 0 |  |  |  | no_campaign_quality_rows |")
+            return lines
+        for row in campaigns:
+            lines.append(
+                "| "
+                f"{self._md_cell(row.get('campaign_code'))} | "
+                f"{self._md_cell(row.get('status'))} | "
+                f"{row.get('buy_order_count')} | "
+                f"{row.get('computed_count')} | "
+                f"{row.get('favorable_gap_count')} | "
+                f"{row.get('unfavorable_gap_count')} | "
+                f"{self._fmt_percent(row.get('avg_gap_ratio'), 2)} | "
+                f"{self._fmt_percent(row.get('weighted_gap_ratio'), 2)} | "
+                f"{self._fmt_money(row.get('estimated_gap_cost'))} | "
+                f"{self._md_cell(row.get('reason'))} |"
+            )
+            worst_rows = row.get("worst_gap_top") or []
+            best_rows = row.get("best_gap_top") or []
+            if worst_rows:
+                lines.extend([
+                    "",
+                    f"### 0.9 Campaign: {self._md_cell(row.get('campaign_code'))} 不利跳空 Top",
+                    "",
+                    "| rank | code | name | estimated_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost |",
+                    "|---:|---|---|---:|---:|---:|---:|---:|---:|",
+                ])
+                for detail in worst_rows[:5]:
+                    lines.append(
+                        "| "
+                        f"{detail.get('rank_no')} | "
+                        f"{self._md_cell(detail.get('instrument_code') or detail.get('symbol'))} | "
+                        f"{self._md_cell(detail.get('display_name'))} | "
+                        f"{self._fmt_decimal(detail.get('estimated_price'), 4)} | "
+                        f"{self._fmt_decimal(detail.get('fill_price'), 4)} | "
+                        f"{self._fmt_quantity(detail.get('quantity'))} | "
+                        f"{self._fmt_decimal(detail.get('gap_amount'), 4)} | "
+                        f"{self._fmt_percent(detail.get('gap_ratio'), 2)} | "
+                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} |"
+                    )
+            if best_rows:
+                lines.extend([
+                    "",
+                    f"### 0.9 Campaign: {self._md_cell(row.get('campaign_code'))} 有利跳空 Top",
+                    "",
+                    "| rank | code | name | estimated_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost |",
+                    "|---:|---|---|---:|---:|---:|---:|---:|---:|",
+                ])
+                for detail in best_rows[:5]:
+                    lines.append(
+                        "| "
+                        f"{detail.get('rank_no')} | "
+                        f"{self._md_cell(detail.get('instrument_code') or detail.get('symbol'))} | "
+                        f"{self._md_cell(detail.get('display_name'))} | "
+                        f"{self._fmt_decimal(detail.get('estimated_price'), 4)} | "
+                        f"{self._fmt_decimal(detail.get('fill_price'), 4)} | "
+                        f"{self._fmt_quantity(detail.get('quantity'))} | "
+                        f"{self._fmt_decimal(detail.get('gap_amount'), 4)} | "
+                        f"{self._fmt_percent(detail.get('gap_ratio'), 2)} | "
+                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} |"
+                    )
+        return lines
+
+    @classmethod
+    def _format_diff_value(cls, value: Any) -> str:
+        if value is None or value == "":
+            return ""
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return f"{value:,}"
+        if isinstance(value, Decimal):
+            return cls._fmt_decimal(value, 6)
+        value_decimal = cls._to_decimal_value(value)
+        if value_decimal is not None:
+            return cls._fmt_decimal(value_decimal, 6)
+        return cls._md_cell(value)
 
     def _render_manual_review_checklist(self, checklist: list[dict[str, Any]]) -> list[str]:
         lines = ["", "## 6.1 今日人工复盘清单 / Manual Review Checklist", ""]
@@ -4312,6 +4906,8 @@ class ProductionDailyObservationReportBuilder:
         lines.extend(self._render_next_trade_plan_sla(payload.get("next_trade_plan_sla") or {}))
         lines.extend(self._render_report_self_check(payload.get("report_self_check") or {}))
         lines.extend(self._render_artifact_integrity(payload.get("artifact_integrity") or {}))
+        lines.extend(self._render_daily_diff(payload.get("daily_diff") or {}))
+        lines.extend(self._render_buy_price_quality(payload.get("buy_price_quality") or {}))
 
         lines.extend([
             "",
