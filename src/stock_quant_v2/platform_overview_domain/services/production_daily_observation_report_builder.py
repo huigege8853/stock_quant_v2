@@ -3021,6 +3021,167 @@ class ProductionDailyObservationReportBuilder:
             notes.append("未发现相关 M6.5/M8 产物索引，需检查 daily run 是否生成报告产物。")
         return notes
 
+
+    def _render_strategy_trade_decision_explanation(
+        self,
+        campaign: dict[str, Any],
+        trade_explain: dict[str, Any],
+    ) -> list[str]:
+        """Render a production-observation answer to: which strategy selected, did it enter, and which names hit buy/sell/hold/skip.
+
+        This is deliberately not a formal independent buy/sell signal engine. It explains the
+        observed production paper-campaign decision chain: strategy selection -> target -> order -> fill -> position.
+        """
+        selection = campaign.get("selection_summary") or {}
+        selected_rows = campaign.get("selected_instruments") or []
+        trade_rows = campaign.get("trade_details") or []
+        position_rows = campaign.get("positions_preview") or []
+        runtime = campaign.get("runtime_observation") or {}
+        lifecycle = campaign.get("trade_lifecycle") or {}
+
+        buy_rows = [row for row in trade_rows if str(row.get("order_side") or "").upper() == "BUY"]
+        sell_rows = [row for row in trade_rows if str(row.get("order_side") or "").upper() == "SELL"]
+        ordered_ids = {row.get("instrument_id") for row in trade_rows if row.get("instrument_id") is not None}
+        skip_rows = [row for row in selected_rows if row.get("instrument_id") not in ordered_ids]
+        hold_rows = [row for row in position_rows if str(row.get("position_status") or "").upper() == "OPEN"]
+
+        route_names = self._dedupe_strings(
+            [
+                row.get("target_reason_code") or row.get("signal_reason_code")
+                for row in selected_rows[:30]
+            ]
+        )
+        strategy_line = (
+            f"今日使用 `{campaign.get('strategy_code')}` / `{campaign.get('strategy_version_code')}`，"
+            f"在 `{self._dedupe_join(route_names[:3]) or 'not_available'}` 路由/原因下，"
+            f"从 `{selection.get('candidate_count')}` 只候选股中选出 `{selection.get('selected_count')}` 只，"
+            f"target_rank_range=`{selection.get('min_target_rank')}`-`{selection.get('max_target_rank')}`，"
+            f"score_range=`{self._fmt_decimal(selection.get('min_target_score'), 4)}`-`{self._fmt_decimal(selection.get('max_target_score'), 4)}`。"
+        )
+        buy_status = "BUY_EXECUTED" if buy_rows else "NO_BUY_EXECUTED"
+        sell_status = "SELL_EXECUTED" if sell_rows else "NO_SELL_ORDER_OBSERVED"
+        entry_policy = trade_explain.get("entry_policy") or "not_available"
+        exit_policy = trade_explain.get("exit_policy") or "not_available"
+
+        lines: list[str] = [
+            "#### 策略选股与买卖点解释",
+            "",
+            f"- scope: `production_strategy_trade_decision_observation_not_independent_buy_sell_engine`",
+            f"- 问题1_用什么策略选: {strategy_line}",
+            f"- 问题2_到买点了吗: `{buy_status}`；当前定义为生产模拟入场执行条件，即策略入选 + target 生成 + BUY order + NEXT_OPEN/CORE_DAILY_BAR_OPEN 成交，不等同于独立技术买点信号。",
+            f"- 问题3_当天买卖点股票: BUY_EXECUTED=`{len(buy_rows)}` / SELL_EXECUTED=`{len(sell_rows)}` / HOLD_OBSERVED=`{len(hold_rows)}` / SKIP=`{len(skip_rows)}`。",
+            f"- entry_policy: `{entry_policy}` / exit_policy: `{exit_policy}` / lifecycle_context: `{lifecycle.get('lifecycle_context') or runtime.get('runtime_action')}`",
+            "",
+            "##### 今日达到买入执行条件的股票",
+            "",
+        ]
+        if not buy_rows:
+            lines.extend(["- 当日无 BUY order / fill 记录。", ""])
+        else:
+            lines.extend([
+                "| rank | code | name | target_weight | order_qty | fill_qty | fill_price | entry_policy | strategy_reason | execution_reason |",
+                "|---:|---|---|---:|---:|---:|---:|---|---|---|",
+            ])
+            for row in buy_rows[:30]:
+                code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+                reason_parts = row.get("trade_reason_parts") or {}
+                strategy_reason = reason_parts.get("strategy_reason") or row.get("target_reason_code") or row.get("signal_reason_code")
+                execution_reason = self._dedupe_join(
+                    [
+                        reason_parts.get("sizing_reason"),
+                        reason_parts.get("price_reason"),
+                        reason_parts.get("fill_reason"),
+                    ],
+                    separator="; ",
+                )
+                lines.append(
+                    "| "
+                    f"{row.get('rank_no') or ''} | "
+                    f"{self._md_cell(code)} | "
+                    f"{self._md_cell(row.get('display_name'))} | "
+                    f"{self._fmt_percent(row.get('target_weight'), 2)} | "
+                    f"{self._fmt_quantity(row.get('order_quantity'))} | "
+                    f"{self._fmt_quantity(row.get('fill_quantity'))} | "
+                    f"{self._fmt_money(row.get('fill_price'))} | "
+                    f"{self._md_cell(row.get('entry_policy'))} | "
+                    f"{self._md_cell(strategy_reason)} | "
+                    f"{self._md_cell(execution_reason)} |"
+                )
+            lines.append("")
+
+        lines.extend([
+            "##### 今日达到卖出执行条件的股票",
+            "",
+        ])
+        if not sell_rows:
+            lines.extend([
+                "- 当日无 SELL order。当前报告只能观察到已发生卖出订单；正式卖点规则（20 交易日退出、利润回撤、止损、卖出信号）尚未落表，因此不硬判定触发/未触发。",
+                "",
+            ])
+        else:
+            lines.extend([
+                "| code | name | target_weight | order_qty | fill_qty | fill_price | exit_policy | sell_reason | execution_reason |",
+                "|---|---|---:|---:|---:|---:|---|---|---|",
+            ])
+            for row in sell_rows[:30]:
+                code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+                reason_parts = row.get("trade_reason_parts") or {}
+                sell_reason = reason_parts.get("strategy_reason") or row.get("target_reason_code") or row.get("signal_reason_code")
+                execution_reason = self._dedupe_join(
+                    [reason_parts.get("sizing_reason"), reason_parts.get("price_reason"), reason_parts.get("fill_reason")],
+                    separator="; ",
+                )
+                lines.append(
+                    "| "
+                    f"{self._md_cell(code)} | {self._md_cell(row.get('display_name'))} | "
+                    f"{self._fmt_percent(row.get('target_weight'), 2)} | {self._fmt_quantity(row.get('order_quantity'))} | "
+                    f"{self._fmt_quantity(row.get('fill_quantity'))} | {self._fmt_money(row.get('fill_price'))} | "
+                    f"{self._md_cell(row.get('exit_policy'))} | {self._md_cell(sell_reason)} | {self._md_cell(execution_reason)} |"
+                )
+            lines.append("")
+
+        lines.extend([
+            "##### 今日继续持有的股票观察",
+            "",
+            "- HOLD_OBSERVED 表示收盘后 position_status=OPEN，可能与当日 BUY_EXECUTED 重叠；它解释的是为什么继续纳入持仓观察，不代表正式卖点规则未触发。",
+        ])
+        if hold_rows:
+            lines.extend([
+                "",
+                "| code | name | weight | total_pnl | status | hold_reason |",
+                "|---|---|---:|---:|---|---|",
+            ])
+            for row in hold_rows[:15]:
+                code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+                lines.append(
+                    "| "
+                    f"{self._md_cell(code)} | {self._md_cell(row.get('display_name'))} | "
+                    f"{self._fmt_percent(row.get('position_weight'), 2)} | {self._fmt_money(row.get('total_pnl'))} | "
+                    f"{self._md_cell(row.get('position_status'))} | position_status=OPEN; no_sell_order_observed |"
+                )
+        else:
+            lines.append("- 当前没有 OPEN 持仓。")
+        lines.append("")
+
+        lines.extend([
+            "##### 今日跳过 / 未成交 / 异常股票",
+            "",
+        ])
+        if not skip_rows:
+            lines.extend(["- SKIP=0；当日目标均进入订单/成交链路，未观察到目标生成后跳过。", ""])
+        else:
+            lines.extend([
+                "| rank | code | name | target_weight | skip_reason |",
+                "|---:|---|---|---:|---|",
+            ])
+            for row in skip_rows[:30]:
+                code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+                lines.append(
+                    f"| {row.get('rank_no') or ''} | {self._md_cell(code)} | {self._md_cell(row.get('display_name'))} | {self._fmt_percent(row.get('target_weight'), 2)} | target_without_order_or_rejected |"
+                )
+            lines.append("")
+        return lines
+
     def _render_trade_lifecycle_observation(self, lifecycle: dict[str, Any]) -> list[str]:
         if not lifecycle:
             return [
@@ -3335,6 +3496,7 @@ class ProductionDailyObservationReportBuilder:
                 f"| SKIP | {trade_explain.get('skip_count')} | target_without_order_or_rejected | {'存在目标未形成订单或异常订单，需检查原因。' if (trade_explain.get('skip_count') or 0) else '当日目标均已进入订单/成交链路。'} |",
                 "",
             ])
+            lines.extend(self._render_strategy_trade_decision_explanation(campaign, trade_explain))
             lines.extend(self._render_trade_lifecycle_observation(campaign.get("trade_lifecycle") or {}))
             lines.extend([
                 "#### 交易增强摘要",
