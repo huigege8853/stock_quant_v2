@@ -143,6 +143,10 @@ class ProductionDailyObservationReportBuilder:
             campaign_reports=campaign_reports,
             detail_limit=detail_limit,
         )
+        return_attribution = self._build_return_attribution(
+            campaign_reports=campaign_reports,
+            market_context=market_context,
+        )
         artifact_index = self._build_artifact_index(
             project_root=project_root,
             campaigns=production_campaigns,
@@ -187,6 +191,7 @@ class ProductionDailyObservationReportBuilder:
             "data_refresh_summary": data_refresh_summary,
             "feature_readiness": feature_readiness,
             "market_context": market_context,
+            "return_attribution": return_attribution,
             "campaigns": campaign_reports,
             "artifact_index": artifact_index,
             "checks": checks,
@@ -2147,6 +2152,196 @@ class ProductionDailyObservationReportBuilder:
         row["reason"] = "market_stats_ready" if row.get("instrument_count") else "no_market_rows"
         return row
 
+    def _build_return_attribution(
+        self,
+        *,
+        campaign_reports: list[dict[str, Any]],
+        market_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Build a production-observation return attribution skeleton.
+
+        This is intentionally a lightweight operational attribution. It uses
+        already-built campaign rows, position PnL, tag exposure PnL, and market
+        context. It does not perform research-style factor attribution or alpha
+        decomposition.
+        """
+        alignment_map = {
+            str(item.get("campaign_code") or ""): item
+            for item in (market_context.get("strategy_alignment") or [])
+            if item.get("campaign_code") is not None
+        }
+        breadth = market_context.get("breadth") or {}
+        market_avg_return = self._to_decimal_value(breadth.get("avg_pct_change"))
+        rows: list[dict[str, Any]] = []
+        for campaign in campaign_reports:
+            campaign_code = str(campaign.get("campaign_code") or "")
+            snapshot = campaign.get("snapshot") or {}
+            risk = campaign.get("risk_metrics") or {}
+            alignment = alignment_map.get(campaign_code) or {}
+            selected_stats = alignment.get("selected_market_stats") or {}
+            holding_stats = alignment.get("holding_market_stats") or {}
+            market_match = alignment.get("market_match_summary") or {}
+
+            portfolio_return = self._to_decimal_value(snapshot.get("daily_return"))
+            selected_avg_return = self._to_decimal_value(selected_stats.get("avg_pct_change"))
+            holding_avg_return = self._to_decimal_value(holding_stats.get("avg_pct_change"))
+
+            position_rows = [row for row in (campaign.get("positions_preview") or []) if row.get("total_pnl") is not None]
+            gain_rows = sorted(
+                position_rows,
+                key=lambda row: self._to_decimal_value(row.get("total_pnl")) or Decimal("0"),
+                reverse=True,
+            )[:5]
+            loss_rows = sorted(
+                position_rows,
+                key=lambda row: self._to_decimal_value(row.get("total_pnl")) or Decimal("0"),
+            )[:5]
+
+            industry_rows = (alignment.get("industry_exposure") or {}).get("rows") or []
+            concept_rows = [
+                row for row in ((alignment.get("concept_exposure") or {}).get("rows") or [])
+                if not self._is_generic_theme_tag(row)
+            ]
+            industry_top = self._attribution_top_bottom_rows(industry_rows, limit=5)
+            concept_top = self._attribution_top_bottom_rows(concept_rows, limit=5)
+
+            status = "PASS" if snapshot and position_rows else "WARN"
+            reason = "position_and_tag_attribution_ready" if status == "PASS" else "missing_position_or_snapshot_for_attribution"
+            rows.append({
+                "campaign_code": campaign.get("campaign_code"),
+                "portfolio_id": campaign.get("portfolio_id"),
+                "status": status,
+                "reason": reason,
+                "scope": "production_observation_skeleton_not_research_attribution",
+                "benchmark_context": {
+                    "portfolio_daily_return": portfolio_return,
+                    "portfolio_daily_pnl": snapshot.get("daily_pnl"),
+                    "market_avg_return": market_avg_return,
+                    "selected_avg_return": selected_avg_return,
+                    "holding_avg_return": holding_avg_return,
+                    "portfolio_vs_market": self._decimal_delta(portfolio_return, market_avg_return),
+                    "selected_vs_market": self._decimal_delta(selected_avg_return, market_avg_return),
+                    "holding_vs_market": self._decimal_delta(holding_avg_return, market_avg_return),
+                    "market_breadth_state": breadth.get("market_breadth_state"),
+                    "top_mainline_tag": market_match.get("top_exposure_tag"),
+                    "top_mainline_match": market_match.get("top_exposure_match_status"),
+                },
+                "individual_top_contributors": self._position_contribution_rows(gain_rows, snapshot=snapshot),
+                "individual_bottom_contributors": self._position_contribution_rows(loss_rows, snapshot=snapshot),
+                "industry_contribution": industry_top,
+                "concept_contribution": concept_top,
+                "observation": self._attribution_observation_text(
+                    campaign=campaign,
+                    benchmark_context={
+                        "portfolio_daily_return": portfolio_return,
+                        "market_avg_return": market_avg_return,
+                        "selected_avg_return": selected_avg_return,
+                        "holding_avg_return": holding_avg_return,
+                    },
+                    industry_rows=industry_rows,
+                    concept_rows=concept_rows,
+                    risk=risk,
+                ),
+            })
+        return rows
+
+    @classmethod
+    def _decimal_delta(cls, left: Any, right: Any) -> Decimal | None:
+        left_dec = cls._to_decimal_value(left)
+        right_dec = cls._to_decimal_value(right)
+        if left_dec is None or right_dec is None:
+            return None
+        return left_dec - right_dec
+
+    @classmethod
+    def _position_contribution_rows(cls, rows: list[dict[str, Any]], *, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        total_equity = cls._to_decimal_value(snapshot.get("total_equity"))
+        daily_pnl = cls._to_decimal_value(snapshot.get("daily_pnl"))
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            pnl = cls._to_decimal_value(row.get("total_pnl"))
+            market_value = cls._to_decimal_value(row.get("market_value"))
+            output.append({
+                "instrument_id": row.get("instrument_id"),
+                "instrument_code": row.get("instrument_code"),
+                "symbol": row.get("symbol"),
+                "display_name": row.get("display_name"),
+                "market_value": market_value,
+                "position_weight": cls._safe_ratio(market_value, total_equity),
+                "total_pnl": pnl,
+                "pnl_share": cls._safe_ratio(pnl, daily_pnl),
+                "position_status": row.get("position_status"),
+            })
+        return output
+
+    @classmethod
+    def _attribution_top_bottom_rows(cls, rows: list[dict[str, Any]], *, limit: int) -> dict[str, list[dict[str, Any]]]:
+        cleaned = [row for row in rows if row.get("holding_total_pnl") is not None]
+        top = sorted(
+            cleaned,
+            key=lambda row: cls._to_decimal_value(row.get("holding_total_pnl")) or Decimal("0"),
+            reverse=True,
+        )[:limit]
+        bottom = sorted(
+            cleaned,
+            key=lambda row: cls._to_decimal_value(row.get("holding_total_pnl")) or Decimal("0"),
+        )[:limit]
+        return {
+            "top": [cls._attribution_tag_row(row) for row in top],
+            "bottom": [cls._attribution_tag_row(row) for row in bottom],
+        }
+
+    @classmethod
+    def _attribution_tag_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tag_type": row.get("tag_type"),
+            "tag_code": row.get("tag_code"),
+            "tag_name": row.get("tag_name"),
+            "holding_count": row.get("holding_count"),
+            "holding_weight": row.get("holding_weight"),
+            "holding_market_value": row.get("holding_market_value"),
+            "holding_total_pnl": row.get("holding_total_pnl"),
+            "market_avg_pct_change": row.get("market_avg_pct_change"),
+            "match_status": row.get("match_status"),
+        }
+
+    @classmethod
+    def _attribution_observation_text(
+        cls,
+        *,
+        campaign: dict[str, Any],
+        benchmark_context: dict[str, Any],
+        industry_rows: list[dict[str, Any]],
+        concept_rows: list[dict[str, Any]],
+        risk: dict[str, Any],
+    ) -> list[str]:
+        notes: list[str] = []
+        campaign_code = campaign.get("campaign_code")
+        portfolio_return = cls._to_decimal_value(benchmark_context.get("portfolio_daily_return"))
+        market_return = cls._to_decimal_value(benchmark_context.get("market_avg_return"))
+        if portfolio_return is not None and market_return is not None:
+            delta = portfolio_return - market_return
+            notes.append(
+                f"campaign={campaign_code} portfolio_vs_market={cls._fmt_percent(delta, 2)} "
+                f"portfolio_return={cls._fmt_percent(portfolio_return, 4)} market_avg={cls._fmt_percent(market_return, 2)}"
+            )
+        strong_industry = [row.get("tag_name") for row in industry_rows if row.get("match_status") == "STRONG_MATCH"]
+        weak_industry = [row.get("tag_name") for row in industry_rows if row.get("match_status") == "WEAK_EXPOSURE"]
+        if strong_industry:
+            notes.append("强势行业暴露：" + "、".join(cls._dedupe_strings(strong_industry)[:5]))
+        if weak_industry:
+            notes.append("弱势行业暴露：" + "、".join(cls._dedupe_strings(weak_industry)[:5]))
+        strong_concept = [row.get("tag_name") for row in concept_rows if row.get("match_status") == "STRONG_MATCH" and not cls._is_generic_theme_tag(row)]
+        weak_concept = [row.get("tag_name") for row in concept_rows if row.get("match_status") == "WEAK_EXPOSURE" and not cls._is_generic_theme_tag(row)]
+        if strong_concept:
+            notes.append("强势概念暴露：" + "、".join(cls._dedupe_strings(strong_concept)[:5]))
+        if weak_concept:
+            notes.append("弱势概念暴露：" + "、".join(cls._dedupe_strings(weak_concept)[:5]))
+        total_pnl = risk.get("total_position_pnl")
+        if total_pnl is not None:
+            notes.append(f"持仓合计盈亏={cls._fmt_money(total_pnl)}，本节用于生产观察归因，不代表研究型 alpha 分解。")
+        return notes
+
     @classmethod
     def _derive_market_context_status(
         cls,
@@ -2606,6 +2801,10 @@ class ProductionDailyObservationReportBuilder:
 
     def _render_markdown(self, payload: dict[str, Any]) -> str:
         lines: list[str] = []
+        return_attribution_by_campaign = {
+            str(item.get("campaign_code") or ""): item
+            for item in (payload.get("return_attribution") or [])
+        }
         lines.extend([
             "# Production Daily Observation Report",
             "",
@@ -2943,6 +3142,62 @@ class ProductionDailyObservationReportBuilder:
                 for item in rows[:5]:
                     code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                     lines.append(f"| {label} | {code} | {item.get('display_name')} | {self._fmt_money(item.get('market_value'))} | {self._fmt_money(item.get('total_pnl'))} |")
+
+            attribution = return_attribution_by_campaign.get(str(campaign.get("campaign_code") or "")) or {}
+            benchmark = attribution.get("benchmark_context") or {}
+            lines.extend([
+                "",
+                "#### 收益归因骨架",
+                "",
+                f"- status: `{attribution.get('status')}` / reason: `{attribution.get('reason')}`",
+                f"- scope: `{attribution.get('scope')}`",
+                f"- portfolio_daily_return: `{self._fmt_percent(benchmark.get('portfolio_daily_return'), 4)}` / portfolio_daily_pnl: `{self._fmt_money(benchmark.get('portfolio_daily_pnl'))}`",
+                f"- market_avg_return: `{self._fmt_percent(benchmark.get('market_avg_return'), 2)}` / selected_avg_return: `{self._fmt_percent(benchmark.get('selected_avg_return'), 2)}` / holding_avg_return: `{self._fmt_percent(benchmark.get('holding_avg_return'), 2)}`",
+                f"- portfolio_vs_market: `{self._fmt_percent(benchmark.get('portfolio_vs_market'), 2)}` / selected_vs_market: `{self._fmt_percent(benchmark.get('selected_vs_market'), 2)}` / holding_vs_market: `{self._fmt_percent(benchmark.get('holding_vs_market'), 2)}`",
+                f"- top_mainline_tag: `{benchmark.get('top_mainline_tag')}` / top_mainline_match: `{benchmark.get('top_mainline_match')}`",
+                "",
+                "##### 个股贡献 Top / Bottom",
+                "",
+                "| type | code | name | weight | market_value | total_pnl | pnl_share | status |",
+                "|---|---|---|---:|---:|---:|---:|---|",
+            ])
+            for label, rows in (("top", attribution.get("individual_top_contributors") or []), ("bottom", attribution.get("individual_bottom_contributors") or [])):
+                for item in rows[:5]:
+                    code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+                    lines.append(
+                        f"| {label} | {code} | {item.get('display_name')} | {self._fmt_percent(item.get('position_weight'), 2)} | {self._fmt_money(item.get('market_value'))} | {self._fmt_money(item.get('total_pnl'))} | {self._fmt_percent(item.get('pnl_share'), 2)} | {item.get('position_status')} |"
+                    )
+            lines.extend([
+                "",
+                "##### 行业贡献 Top / Bottom",
+                "",
+                "| type | industry | holding_count | holding_weight | holding_pnl | market_avg_return | match_status |",
+                "|---|---|---:|---:|---:|---:|---|",
+            ])
+            industry_contribution = attribution.get("industry_contribution") or {}
+            for label, rows in (("top", industry_contribution.get("top") or []), ("bottom", industry_contribution.get("bottom") or [])):
+                for item in rows[:5]:
+                    lines.append(
+                        f"| {label} | {item.get('tag_name')} | {item.get('holding_count')} | {self._fmt_percent(item.get('holding_weight'), 2)} | {self._fmt_money(item.get('holding_total_pnl'))} | {self._fmt_percent(item.get('market_avg_pct_change'), 2)} | {item.get('match_status')} |"
+                    )
+            lines.extend([
+                "",
+                "##### 概念贡献 Top / Bottom（过滤通用标签）",
+                "",
+                "| type | concept | holding_count | holding_weight | holding_pnl | market_avg_return | match_status |",
+                "|---|---|---:|---:|---:|---:|---|",
+            ])
+            concept_contribution = attribution.get("concept_contribution") or {}
+            for label, rows in (("top", concept_contribution.get("top") or []), ("bottom", concept_contribution.get("bottom") or [])):
+                for item in rows[:5]:
+                    lines.append(
+                        f"| {label} | {item.get('tag_name')} | {item.get('holding_count')} | {self._fmt_percent(item.get('holding_weight'), 2)} | {self._fmt_money(item.get('holding_total_pnl'))} | {self._fmt_percent(item.get('market_avg_pct_change'), 2)} | {item.get('match_status')} |"
+                    )
+            observation_rows = attribution.get("observation") or []
+            if observation_rows:
+                lines.extend(["", "##### 归因观察", ""])
+                for note in observation_rows[:8]:
+                    lines.append(f"- {note}")
             lines.append("")
         lines.extend(["## 4. 风险 / 异常检查", "", "| check | status | reason |", "|---|---|---|"])
         for check in payload.get("checks") or []:
