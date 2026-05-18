@@ -214,6 +214,15 @@ class ProductionDailyObservationReportBuilder:
             ),
         }
         payload["daily_conclusion"] = self._build_daily_conclusion_summary(payload)
+        payload["next_trade_plan_sla"] = self._build_next_trade_plan_sla(payload)
+        payload["artifact_integrity"] = self._build_artifact_integrity(
+            project_root=project_root,
+            artifact_index=artifact_index,
+        )
+        payload["report_self_check"] = self._build_report_self_check(payload)
+        payload["action_priority"] = self._build_action_priority(payload)
+        payload["daily_control_panel"] = self._build_daily_control_panel(payload)
+        payload["manual_review_checklist"] = self._build_manual_review_checklist(payload)
 
         output_dir = output_root / resolved_report_date.isoformat()
         latest_dir = output_root / "latest"
@@ -1714,6 +1723,19 @@ class ProductionDailyObservationReportBuilder:
             status = "WARN"
             reason = "no_next_trade_target_or_order_materialized"
 
+        plan_basis_candidates = self._dedupe_strings(item.get("plan_basis") for item in campaign_plans)
+        non_materialized_bases = {
+            "no_next_trade_target_or_order_materialized",
+            "next_trade_date_unresolved",
+            "missing_portfolio_id",
+            "query_failed",
+            "not_checked",
+        }
+        top_plan_basis = next(
+            (basis for basis in plan_basis_candidates if basis not in non_materialized_bases),
+            reason,
+        )
+
         return {
             "scope": "production_next_trade_plan_observation_not_independent_buy_sell_engine",
             "report_date": report_date,
@@ -1721,6 +1743,7 @@ class ProductionDailyObservationReportBuilder:
             "next_trade_date": next_trade_date,
             "status": status,
             "reason": reason,
+            "plan_basis": top_plan_basis,
             "note": (
                 "本节只展示已落表的 next_trade_date target/order。"
                 "若 plan_basis=no_next_trade_target_or_order_materialized，表示当前日报生成时尚未观察到次日计划落表，"
@@ -2189,17 +2212,30 @@ class ProductionDailyObservationReportBuilder:
             f"selected={selection.get('selected_count')}, buy={buy_count}, sell={sell_count}, fill={fill_count}."
         )
 
+        cash_ratio_value: Any = risk.get("cash_ratio")
+        if cash_ratio_value in (None, ""):
+            cash_ratio_value = cls._safe_ratio(snapshot.get("cash_balance"), snapshot.get("total_equity"))
+        stock_exposure_value: Any = risk.get("stock_exposure")
+        if stock_exposure_value in (None, ""):
+            cash_ratio_decimal = cls._to_decimal_value(cash_ratio_value)
+            if cash_ratio_decimal is not None:
+                stock_exposure_value = Decimal("1") - cash_ratio_decimal
+
+        daily_return_text = cls._fmt_percent(snapshot.get("daily_return"), 4) or "UNKNOWN"
+        daily_pnl_text = cls._fmt_money(snapshot.get("daily_pnl")) or "UNKNOWN"
+        cash_ratio_text = cls._fmt_percent(cash_ratio_value, 2) or "UNKNOWN"
+        stock_exposure_text = cls._fmt_percent(stock_exposure_value, 2) or "UNKNOWN"
         portfolio_summary = (
-            f"daily_return={cls._fmt_percent(snapshot.get('daily_return'), 4)}, "
-            f"daily_pnl={cls._fmt_money(snapshot.get('daily_pnl'))}, "
-            f"cash_ratio={cls._fmt_percent(risk.get('cash_ratio'), 2)}, "
-            f"stock_exposure={cls._fmt_percent(risk.get('stock_exposure'), 2)}."
+            f"daily_return={daily_return_text}, "
+            f"daily_pnl={daily_pnl_text}, "
+            f"cash_ratio={cash_ratio_text}, "
+            f"stock_exposure={stock_exposure_text}."
         )
 
         risk_items: list[str] = []
         if str(market_state) == "BREADTH_WEAK":
             risk_items.append("市场宽度偏弱")
-        stock_exposure = cls._to_decimal_value(risk.get("stock_exposure"))
+        stock_exposure = cls._to_decimal_value(stock_exposure_value)
         if stock_exposure is not None and stock_exposure >= Decimal("0.95"):
             risk_items.append(f"股票仓位较高 {cls._fmt_percent(stock_exposure, 2)}")
         if str(used_guard.get("future_data_guard_status")) != "PASS":
@@ -2229,6 +2265,294 @@ class ProductionDailyObservationReportBuilder:
             {"item": "主要风险", "status": "WARN" if risk_items else "PASS", "summary": risk_summary},
             {"item": "次日观察重点", "status": "INFO", "summary": focus_summary},
         ]
+
+    @classmethod
+    def _build_next_trade_plan_sla(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        next_trade_plan = payload.get("next_trade_plan") or {}
+        reason = str(next_trade_plan.get("reason") or "missing_next_trade_plan")
+        plan_basis = str(next_trade_plan.get("plan_basis") or reason)
+        materialized_bases = {
+            "next_trade_date_order_plan_materialized",
+            "next_trade_date_target_plan_materialized_without_order",
+        }
+        if plan_basis in materialized_bases or reason == "next_trade_plan_materialized":
+            status = "PASS"
+            blocker = "next_trade_date_plan_materialized"
+        elif (
+            plan_basis == "query_failed"
+            or reason == "next_trade_plan_query_failed"
+            or plan_basis.startswith("query_failed:")
+            or reason.startswith("query_failed:")
+        ):
+            status = "FAIL"
+            blocker = "next_trade_plan_query_failed"
+        else:
+            status = "WARN"
+            blocker = plan_basis or reason
+
+        materialized_at = None
+        for campaign in next_trade_plan.get("campaigns") or []:
+            if campaign.get("target_run_id") or campaign.get("order_run_id"):
+                materialized_at = cls._json_default(payload.get("generated_at"))
+                break
+
+        return {
+            "status": status,
+            "reason": reason,
+            "plan_basis": plan_basis,
+            "next_trade_date": next_trade_plan.get("next_trade_date") or payload.get("next_trade_date"),
+            "expected_time": "daily runtime 18:30 后；若 next_trade_date 计划生成链路已接入，应在生产日报前完成 target/order 落表。",
+            "materialized_at": materialized_at,
+            "blocker": blocker,
+            "next_check_command": "docker exec stock-quant-scheduler bash -lc 'cd /app && grep -nE \"0.3 次日交易计划|plan_basis|Next Trade Plan SLA\" artifacts/production/daily_observation/latest/production_daily_observation_latest.md'",
+            "note": "本 SLA 仅观察 next_trade_date target/order 是否已落表，不生成或硬造买卖点。",
+        }
+
+    @classmethod
+    def _build_report_self_check(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+
+        def add(check_name: str, status: str, reason: str) -> None:
+            rows.append({"check_name": check_name, "status": status, "reason": reason})
+
+        required_fields = ["report_date", "signal_as_of_date", "overall_status", "generated_at", "production_campaign_count"]
+        missing = [field for field in required_fields if payload.get(field) in (None, "")]
+        add(
+            "metadata_required_fields",
+            "PASS" if not missing else "FAIL",
+            "all_required_fields_present" if not missing else "missing=" + ",".join(missing),
+        )
+
+        daily_conclusion = payload.get("daily_conclusion") or []
+        add(
+            "daily_conclusion_rows_present",
+            "PASS" if daily_conclusion else "WARN",
+            f"daily_conclusion_count={len(daily_conclusion)}",
+        )
+        portfolio_rows = [row for row in daily_conclusion if row.get("item") == "组合表现"]
+        portfolio_summary = str((portfolio_rows[0] or {}).get("summary") if portfolio_rows else "")
+        cash_ratio_blank = "cash_ratio=," in portfolio_summary or "cash_ratio=." in portfolio_summary or "cash_ratio=, " in portfolio_summary
+        add(
+            "daily_conclusion_cash_ratio_not_blank",
+            "PASS" if portfolio_rows and not cash_ratio_blank else "WARN",
+            portfolio_summary or "portfolio_summary_missing",
+        )
+
+        next_trade_plan = payload.get("next_trade_plan") or {}
+        add(
+            "next_trade_plan_top_plan_basis_present",
+            "PASS" if next_trade_plan.get("plan_basis") else "WARN",
+            f"plan_basis={next_trade_plan.get('plan_basis')}",
+        )
+        campaign_plan_missing = [
+            str(plan.get("campaign_code") or "unknown")
+            for plan in (next_trade_plan.get("campaigns") or [])
+            if not plan.get("plan_basis")
+        ]
+        add(
+            "next_trade_plan_campaign_plan_basis_present",
+            "PASS" if not campaign_plan_missing else "WARN",
+            "all_campaign_plan_basis_present" if not campaign_plan_missing else "missing=" + ",".join(campaign_plan_missing),
+        )
+
+        checks = payload.get("checks") or []
+        missing_check_reason = [
+            str(check.get("check_name") or "unknown")
+            for check in checks
+            if not check.get("status") or not check.get("reason")
+        ]
+        add(
+            "checks_have_status_and_reason",
+            "PASS" if checks and not missing_check_reason else "WARN",
+            f"checks={len(checks)}" if not missing_check_reason else "missing=" + ",".join(missing_check_reason),
+        )
+
+        campaigns = payload.get("campaigns") or []
+        add(
+            "active_campaign_section_present",
+            "PASS" if campaigns else "FAIL",
+            f"campaign_count={len(campaigns)}",
+        )
+
+        statuses = [row.get("status") for row in rows]
+        status = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
+        return {"status": status, "reason": f"fail={statuses.count('FAIL')},warn={statuses.count('WARN')}", "rows": rows}
+
+    def _build_artifact_integrity(self, *, project_root: Path, artifact_index: list[dict[str, Any]]) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        for artifact in artifact_index:
+            raw_path = str(artifact.get("path") or "")
+            normalized_path = raw_path.replace("\\", "/")
+            path = project_root / normalized_path if normalized_path else project_root
+            exists = path.exists()
+            size_bytes = path.stat().st_size if exists and path.is_file() else None
+            modified_at = datetime.utcfromtimestamp(path.stat().st_mtime).isoformat() if exists else None
+            parse_status = "NOT_APPLICABLE"
+            parse_reason = "not_json_file"
+            if exists and path.is_file() and path.suffix.lower() == ".json":
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                    parse_status = "PASS"
+                    parse_reason = "json_parse_ok"
+                except Exception as exc:
+                    parse_status = "FAIL"
+                    parse_reason = f"json_parse_failed:{type(exc).__name__}:{exc}"
+            elif exists and path.is_file() and size_bytes == 0:
+                parse_status = "WARN"
+                parse_reason = "empty_file"
+
+            if not exists:
+                row_status = "WARN"
+                row_reason = "artifact_path_missing"
+            elif path.is_file() and size_bytes == 0:
+                row_status = "WARN"
+                row_reason = "artifact_file_empty"
+            elif parse_status == "FAIL":
+                row_status = "FAIL"
+                row_reason = parse_reason
+            else:
+                row_status = "PASS"
+                row_reason = "artifact_accessible"
+
+            rows.append({
+                "campaign_code": artifact.get("campaign_code"),
+                "artifact_type": artifact.get("artifact_type"),
+                "path": raw_path,
+                "exists": exists,
+                "size_bytes": size_bytes,
+                "modified_at": modified_at,
+                "parse_status": parse_status,
+                "status": row_status,
+                "reason": row_reason,
+            })
+        statuses = [row.get("status") for row in rows]
+        status = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
+        return {"status": status, "reason": f"artifact_count={len(rows)},fail={statuses.count('FAIL')},warn={statuses.count('WARN')}", "rows": rows}
+
+    @classmethod
+    def _build_action_priority(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+
+        def add(priority: str, status: str, item: str, reason: str, action: str) -> None:
+            rows.append({"priority": priority, "status": status, "item": item, "reason": reason, "suggested_action": action})
+
+        overall_status = str(payload.get("overall_status") or "WARN")
+        if overall_status == "FAIL":
+            add("P0", "FAIL", "overall_status", "生产日报 overall_status=FAIL", "先检查 FAIL check、campaign 状态和数据水位。")
+        elif overall_status == "WARN":
+            add("P1", "WARN", "overall_status", "生产日报 overall_status=WARN", "检查 WARN 项是否为可接受观察状态。")
+        else:
+            add("INFO", "PASS", "overall_status", "生产日报整体 PASS", "无需处理。")
+
+        for check in payload.get("checks") or []:
+            check_status = str(check.get("status") or "WARN")
+            if check_status == "FAIL":
+                add("P0", "FAIL", f"check:{check.get('check_name')}", str(check.get("reason") or ""), "优先修复该生产检查失败项。")
+            elif check_status == "WARN":
+                add("P1", "WARN", f"check:{check.get('check_name')}", str(check.get("reason") or ""), "当天处理或确认是否为预期 WARN。")
+
+        next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
+        if next_trade_plan_sla.get("status") == "FAIL":
+            add("P0", "FAIL", "next_trade_plan_sla", str(next_trade_plan_sla.get("blocker") or ""), "检查 next_trade_date target/order 查询失败原因。")
+        elif next_trade_plan_sla.get("status") == "WARN":
+            add("P1", "WARN", "next_trade_plan_sla", str(next_trade_plan_sla.get("blocker") or ""), "确认 next_trade_date 计划生成链路是否已运行或是否尚未接入。")
+
+        if payload.get("git_commit_status") == "WARN":
+            add("P1", "WARN", "git_commit_traceability", "git_commit 无法追溯", "后续注入 Docker build git metadata。")
+
+        report_self_check = payload.get("report_self_check") or {}
+        if report_self_check.get("status") == "FAIL":
+            add("P0", "FAIL", "report_self_check", str(report_self_check.get("reason") or ""), "先修复日报自身关键字段缺失。")
+        elif report_self_check.get("status") == "WARN":
+            add("P1", "WARN", "report_self_check", str(report_self_check.get("reason") or ""), "检查摘要字段、plan_basis、reason 是否完整。")
+
+        artifact_integrity = payload.get("artifact_integrity") or {}
+        if artifact_integrity.get("status") == "FAIL":
+            add("P0", "FAIL", "artifact_integrity", str(artifact_integrity.get("reason") or ""), "检查产物 JSON/Markdown 是否损坏。")
+        elif artifact_integrity.get("status") == "WARN":
+            add("P1", "WARN", "artifact_integrity", str(artifact_integrity.get("reason") or ""), "检查产物是否缺失、为空或 latest 未更新。")
+
+        market_context = payload.get("market_context") or {}
+        breadth = market_context.get("breadth") or {}
+        if breadth.get("market_breadth_state") == "BREADTH_WEAK":
+            add("P2", "WARN", "market_breadth", "市场宽度偏弱", "观察组合是否连续跑输市场或高仓位暴露。")
+
+        campaigns = payload.get("campaigns") or []
+        first_campaign = campaigns[0] if campaigns else {}
+        risk = first_campaign.get("risk_metrics") or {}
+        snapshot = first_campaign.get("snapshot") or {}
+        stock_exposure_value = risk.get("stock_exposure")
+        if stock_exposure_value in (None, ""):
+            cash_ratio = cls._safe_ratio(snapshot.get("cash_balance"), snapshot.get("total_equity"))
+            if cash_ratio is not None:
+                stock_exposure_value = Decimal("1") - cash_ratio
+        stock_exposure = cls._to_decimal_value(stock_exposure_value)
+        if stock_exposure is not None and stock_exposure >= Decimal("0.95"):
+            add("P2", "WARN", "stock_exposure", f"stock_exposure={cls._fmt_percent(stock_exposure, 2)}", "市场偏弱时重点观察高仓位风险。")
+
+        counts = {priority: len([row for row in rows if row.get("priority") == priority]) for priority in ("P0", "P1", "P2", "INFO")}
+        status = "FAIL" if counts["P0"] else ("WARN" if counts["P1"] or counts["P2"] else "PASS")
+        return {"status": status, "reason": f"P0={counts['P0']},P1={counts['P1']},P2={counts['P2']},INFO={counts['INFO']}", "counts": counts, "rows": rows}
+
+    @classmethod
+    def _build_daily_control_panel(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        action_priority = payload.get("action_priority") or {}
+        next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
+        report_self_check = payload.get("report_self_check") or {}
+        artifact_integrity = payload.get("artifact_integrity") or {}
+        market_context = payload.get("market_context") or {}
+        breadth = market_context.get("breadth") or {}
+        campaigns = payload.get("campaigns") or []
+        first_campaign = campaigns[0] if campaigns else {}
+        snapshot = first_campaign.get("snapshot") or {}
+        risk = first_campaign.get("risk_metrics") or {}
+        cash_ratio = risk.get("cash_ratio")
+        if cash_ratio in (None, ""):
+            cash_ratio = cls._safe_ratio(snapshot.get("cash_balance"), snapshot.get("total_equity"))
+        stock_exposure = risk.get("stock_exposure")
+        if stock_exposure in (None, ""):
+            cash_ratio_decimal = cls._to_decimal_value(cash_ratio)
+            if cash_ratio_decimal is not None:
+                stock_exposure = Decimal("1") - cash_ratio_decimal
+        top_action = next((row for row in action_priority.get("rows") or [] if row.get("priority") in {"P0", "P1"}), None)
+        if top_action is None:
+            top_action = next((row for row in action_priority.get("rows") or [] if row.get("priority") == "P2"), None)
+        return {
+            "status": action_priority.get("status") or payload.get("overall_status"),
+            "action_required": bool(top_action and top_action.get("priority") in {"P0", "P1"}),
+            "top_action": top_action,
+            "overall_status": payload.get("overall_status"),
+            "report_date": payload.get("report_date"),
+            "signal_as_of_date": payload.get("signal_as_of_date"),
+            "next_trade_date": payload.get("next_trade_date"),
+            "next_trade_plan_status": next_trade_plan_sla.get("status"),
+            "next_trade_plan_basis": next_trade_plan_sla.get("plan_basis"),
+            "report_self_check_status": report_self_check.get("status"),
+            "artifact_integrity_status": artifact_integrity.get("status"),
+            "market_breadth_state": breadth.get("market_breadth_state"),
+            "cash_ratio": cash_ratio,
+            "stock_exposure": stock_exposure,
+            "priority_counts": action_priority.get("counts") or {},
+        }
+
+    @classmethod
+    def _build_manual_review_checklist(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
+        market_context = payload.get("market_context") or {}
+        breadth = market_context.get("breadth") or {}
+        checklist = [
+            {"priority": "P1", "checked": False, "item": "git_commit 是否真实可追溯", "reason": str(payload.get("git_commit_status"))},
+            {"priority": "P1", "checked": False, "item": "next_trade_plan 是否已落表", "reason": str(next_trade_plan_sla.get("blocker") or "")},
+            {"priority": "P2", "checked": False, "item": "market breadth 是否持续偏弱", "reason": str(breadth.get("market_breadth_state") or "UNKNOWN")},
+            {"priority": "P2", "checked": False, "item": "组合是否连续跑输市场", "reason": "需要 Daily Diff 阶段补充连续观察。"},
+            {"priority": "P2", "checked": False, "item": "主线是否连续 NEUTRAL/WEAK", "reason": "需要主线错位连续观察阶段补充。"},
+            {"priority": "P2", "checked": False, "item": "是否有接近退出条件的持仓", "reason": "当前仅为生产观察骨架，正式退出规则未落表。"},
+            {"priority": "P1", "checked": False, "item": "是否有订单/成交异常", "reason": "查看 Production Paper Campaigns 和风险 / 异常检查。"},
+            {"priority": "P2", "checked": False, "item": "是否需要进入研究端复盘", "reason": "若连续跑输、主线错位或选股大换血，再进入研究端复盘。"},
+        ]
+        if payload.get("overall_status") == "PASS":
+            checklist.insert(0, {"priority": "INFO", "checked": False, "item": "确认生产日报整体 PASS", "reason": "overall_status=PASS"})
+        return checklist
 
     def _build_market_context(
         self,
@@ -3443,6 +3767,130 @@ class ProductionDailyObservationReportBuilder:
         return notes
 
 
+    def _render_daily_control_panel(self, control_panel: dict[str, Any]) -> list[str]:
+        if not control_panel:
+            return ["## 0.0 生产晨间操作台 / Morning Control Panel", "", "- status: `WARN` / reason: `missing_control_panel`"]
+        counts = control_panel.get("priority_counts") or {}
+        top_action = control_panel.get("top_action") or {}
+        action_text = (
+            f"{top_action.get('priority')} / {top_action.get('item')}: {top_action.get('suggested_action')}"
+            if top_action else "暂无 P0/P1 处理项，按 P2 观察项复核。"
+        )
+        return [
+            "## 0.0 生产晨间操作台 / Morning Control Panel",
+            "",
+            f"- status: `{control_panel.get('status')}` / action_required: `{control_panel.get('action_required')}`",
+            f"- top_action: {self._md_cell(action_text)}",
+            "",
+            "| field | value |",
+            "|---|---|",
+            f"| report_date | `{self._json_default(control_panel.get('report_date'))}` |",
+            f"| signal_as_of_date | `{self._json_default(control_panel.get('signal_as_of_date'))}` |",
+            f"| next_trade_date | `{self._json_default(control_panel.get('next_trade_date'))}` |",
+            f"| overall_status | `{control_panel.get('overall_status')}` |",
+            f"| next_trade_plan | `{control_panel.get('next_trade_plan_status')}` / `{control_panel.get('next_trade_plan_basis')}` |",
+            f"| report_self_check | `{control_panel.get('report_self_check_status')}` |",
+            f"| artifact_integrity | `{control_panel.get('artifact_integrity_status')}` |",
+            f"| market_breadth_state | `{control_panel.get('market_breadth_state')}` |",
+            f"| cash_ratio | `{self._fmt_percent(control_panel.get('cash_ratio'), 2) or 'UNKNOWN'}` |",
+            f"| stock_exposure | `{self._fmt_percent(control_panel.get('stock_exposure'), 2) or 'UNKNOWN'}` |",
+            f"| priority_counts | `P0={counts.get('P0', 0)}, P1={counts.get('P1', 0)}, P2={counts.get('P2', 0)}, INFO={counts.get('INFO', 0)}` |",
+        ]
+
+    def _render_action_priority(self, action_priority: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.4 生产动作优先级 / Action Priority",
+            "",
+            f"- status: `{action_priority.get('status')}` / reason: `{action_priority.get('reason')}`",
+            "",
+            "| priority | status | item | reason | suggested_action |",
+            "|---|---|---|---|---|",
+        ]
+        rows = action_priority.get("rows") or []
+        if not rows:
+            lines.append("| INFO | PASS | no_action | 未生成处理优先级 | 检查 report_self_check。 |")
+            return lines
+        priority_order = {"P0": 0, "P1": 1, "P2": 2, "INFO": 3}
+        for row in sorted(rows, key=lambda item: priority_order.get(str(item.get("priority")), 9))[:20]:
+            lines.append(
+                "| "
+                f"{self._md_cell(row.get('priority'))} | "
+                f"{self._md_cell(row.get('status'))} | "
+                f"{self._md_cell(row.get('item'))} | "
+                f"{self._md_cell(row.get('reason'))} | "
+                f"{self._md_cell(row.get('suggested_action'))} |"
+            )
+        return lines
+
+    def _render_next_trade_plan_sla(self, sla: dict[str, Any]) -> list[str]:
+        return [
+            "",
+            "## 0.5 次日计划生成 SLA / Next Trade Plan SLA",
+            "",
+            f"- status: `{sla.get('status')}` / reason: `{sla.get('reason')}` / blocker: `{sla.get('blocker')}`",
+            "",
+            "| field | value |",
+            "|---|---|",
+            f"| next_trade_date | `{self._json_default(sla.get('next_trade_date'))}` |",
+            f"| plan_basis | `{sla.get('plan_basis')}` |",
+            f"| expected_time | {self._md_cell(sla.get('expected_time'))} |",
+            f"| materialized_at | `{self._json_default(sla.get('materialized_at'))}` |",
+            f"| next_check_command | `{self._md_cell(sla.get('next_check_command'))}` |",
+            f"| note | {self._md_cell(sla.get('note'))} |",
+        ]
+
+    def _render_report_self_check(self, self_check: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.6 报告自身质量检查 / Report Self Check",
+            "",
+            f"- status: `{self_check.get('status')}` / reason: `{self_check.get('reason')}`",
+            "",
+            "| check | status | reason |",
+            "|---|---|---|",
+        ]
+        for row in (self_check.get("rows") or [])[:20]:
+            lines.append(f"| {self._md_cell(row.get('check_name'))} | {self._md_cell(row.get('status'))} | {self._md_cell(row.get('reason'))} |")
+        return lines
+
+    def _render_artifact_integrity(self, artifact_integrity: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.7 产物完整性检查 / Artifact Integrity",
+            "",
+            f"- status: `{artifact_integrity.get('status')}` / reason: `{artifact_integrity.get('reason')}`",
+            "",
+            "| campaign | type | path | exists | size_bytes | modified_at | parse_status | status | reason |",
+            "|---|---|---|---|---:|---|---|---|---|",
+        ]
+        for row in (artifact_integrity.get("rows") or [])[:25]:
+            lines.append(
+                "| "
+                f"{self._md_cell(row.get('campaign_code'))} | "
+                f"{self._md_cell(row.get('artifact_type'))} | "
+                f"`{self._md_cell(row.get('path'))}` | "
+                f"{row.get('exists')} | "
+                f"{row.get('size_bytes')} | "
+                f"{self._json_default(row.get('modified_at'))} | "
+                f"{self._md_cell(row.get('parse_status'))} | "
+                f"{self._md_cell(row.get('status'))} | "
+                f"{self._md_cell(row.get('reason'))} |"
+            )
+        return lines
+
+    def _render_manual_review_checklist(self, checklist: list[dict[str, Any]]) -> list[str]:
+        lines = ["", "## 6.1 今日人工复盘清单 / Manual Review Checklist", ""]
+        if not checklist:
+            lines.append("- [ ] 未生成复盘清单，请检查 report_self_check。")
+            return lines
+        for item in checklist:
+            checked = "x" if item.get("checked") else " "
+            lines.append(
+                f"- [{checked}] `{self._md_cell(item.get('priority'))}` {self._md_cell(item.get('item'))} —— {self._md_cell(item.get('reason'))}"
+            )
+        return lines
+
     def _render_next_trade_plan(self, next_trade_plan: dict[str, Any]) -> list[str]:
         if not next_trade_plan:
             return [
@@ -3803,6 +4251,8 @@ class ProductionDailyObservationReportBuilder:
             "",
             "> 这是一份生产端 daily run 观察报告，不是研究报告，不是 M8 full ops 报告，也不是正式实盘交易报告。",
             "",
+            *self._render_daily_control_panel(payload.get("daily_control_panel") or {}),
+            "",
             "## 0. 今日运行概览",
             "",
             "| field | value |",
@@ -3858,6 +4308,10 @@ class ProductionDailyObservationReportBuilder:
             )
 
         lines.extend(self._render_next_trade_plan(payload.get("next_trade_plan") or {}))
+        lines.extend(self._render_action_priority(payload.get("action_priority") or {}))
+        lines.extend(self._render_next_trade_plan_sla(payload.get("next_trade_plan_sla") or {}))
+        lines.extend(self._render_report_self_check(payload.get("report_self_check") or {}))
+        lines.extend(self._render_artifact_integrity(payload.get("artifact_integrity") or {}))
 
         lines.extend([
             "",
@@ -4207,6 +4661,7 @@ class ProductionDailyObservationReportBuilder:
         lines.extend(["", "## 6. 观察提示", ""])
         for note in payload.get("observation_notes") or []:
             lines.append(f"- {note}")
+        lines.extend(self._render_manual_review_checklist(payload.get("manual_review_checklist") or []))
         lines.append("")
         return "\n".join(lines)
 
