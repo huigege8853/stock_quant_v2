@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
+import socket
+import subprocess
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -105,11 +108,17 @@ class ProductionDailyObservationReportBuilder:
 
         resolved_report_date = report_date or self._resolve_report_date()
         generated_at = datetime.utcnow().isoformat()
+        runtime_overview = self._build_runtime_overview(project_root=project_root)
         campaigns_all = self._load_campaigns(campaign_config_path)
         production_campaigns = self._filter_campaigns(campaigns_all, execution_context=execution_context)
 
         signal_as_of_date = self._resolve_signal_as_of_date(resolved_report_date)
         waterline = self._build_waterline(
+            report_date=resolved_report_date,
+            signal_as_of_date=signal_as_of_date,
+        )
+        data_refresh_summary = self._build_data_refresh_summary(report_date=resolved_report_date)
+        feature_readiness = self._build_feature_readiness(
             report_date=resolved_report_date,
             signal_as_of_date=signal_as_of_date,
         )
@@ -145,6 +154,11 @@ class ProductionDailyObservationReportBuilder:
             "execution_context": "production_daily_run",
             "report_context": "production_daily_observation",
             "paper_campaign_context": execution_context,
+            "daily_profile": runtime_overview.get("daily_profile"),
+            "git_commit": runtime_overview.get("git_commit"),
+            "docker_container": runtime_overview.get("docker_container"),
+            "database": runtime_overview.get("database"),
+            "runtime_overview": runtime_overview,
             "report_date": resolved_report_date,
             "generated_at": generated_at,
             "project_root": str(project_root),
@@ -154,6 +168,8 @@ class ProductionDailyObservationReportBuilder:
             "overall_status": overall_status,
             "signal_as_of_date": signal_as_of_date,
             "waterline": waterline,
+            "data_refresh_summary": data_refresh_summary,
+            "feature_readiness": feature_readiness,
             "market_context": market_context,
             "campaigns": campaign_reports,
             "artifact_index": artifact_index,
@@ -227,6 +243,42 @@ class ProductionDailyObservationReportBuilder:
     @staticmethod
     def _resolve_project_path(project_root: Path, path: Path) -> Path:
         return path if path.is_absolute() else project_root / path
+
+    def _build_runtime_overview(self, *, project_root: Path) -> dict[str, Any]:
+        """Return production daily runtime metadata without changing runtime behavior."""
+        return {
+            "daily_profile": os.environ.get("SQV2_DAILY_PROFILE") or "runtime",
+            "git_commit": self._resolve_git_commit(project_root),
+            "docker_container": os.environ.get("HOSTNAME") or socket.gethostname(),
+            "database": self._database_label(),
+        }
+
+    @staticmethod
+    def _resolve_git_commit(project_root: Path) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(project_root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            commit = (result.stdout or "").strip()
+            return commit or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _database_label() -> str | None:
+        url = os.environ.get("V2_SQLALCHEMY_URL") or os.environ.get("SQLALCHEMY_DATABASE_URL")
+        if not url:
+            return None
+        # Avoid leaking credentials. Keep only host/database level context.
+        text_url = str(url)
+        if "@" in text_url:
+            text_url = text_url.split("@", 1)[1]
+        return text_url
 
     def _load_campaigns(self, campaign_config_path: Path) -> list[dict[str, Any]]:
         if not campaign_config_path.exists():
@@ -319,7 +371,195 @@ class ProductionDailyObservationReportBuilder:
                 row["status"] = "FAIL" if spec.critical else "WARN"
                 row["reason"] = f"query_failed:{type(exc).__name__}:{exc}"
             rows.append(row)
+        rows.extend(self._build_reference_data_waterline())
         return rows
+
+    def _build_reference_data_waterline(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        try:
+            tag_row = self.session.execute(
+                text(
+                    """
+                    select
+                        count(*) as rows,
+                        count(*) filter (where tag_type like 'SW_INDUSTRY%') as industry_tag_rows,
+                        count(*) filter (where tag_type = 'CONCEPT_EM') as concept_tag_rows
+                    from public.tag
+                    """
+                )
+            ).mappings().one()
+            tag_count = self._optional_int(tag_row.get("rows")) or 0
+            rows.append({
+                "table_name": "tag",
+                "date_column": None,
+                "run_id_column": None,
+                "critical": False,
+                "freshness_basis": "reference_data",
+                "expected_date": None,
+                "rows": tag_row.get("rows"),
+                "max_date": None,
+                "max_run_id": None,
+                "status": "PASS" if tag_count > 0 else "WARN",
+                "reason": f"industry_tags={tag_row.get('industry_tag_rows')},concept_tags={tag_row.get('concept_tag_rows')}",
+            })
+        except Exception as exc:
+            rows.append({
+                "table_name": "tag",
+                "date_column": None,
+                "run_id_column": None,
+                "critical": False,
+                "freshness_basis": "reference_data",
+                "expected_date": None,
+                "rows": None,
+                "max_date": None,
+                "max_run_id": None,
+                "status": "WARN",
+                "reason": f"query_failed:{type(exc).__name__}:{exc}",
+            })
+        try:
+            instrument_tag_row = self.session.execute(
+                text(
+                    """
+                    select
+                        count(*) as rows,
+                        max(effective_from) as max_effective_from,
+                        max(effective_to) as max_effective_to
+                    from public.instrument_tag
+                    """
+                )
+            ).mappings().one()
+            row_count = self._optional_int(instrument_tag_row.get("rows")) or 0
+            rows.append({
+                "table_name": "instrument_tag",
+                "date_column": "effective_from",
+                "run_id_column": None,
+                "critical": False,
+                "freshness_basis": "reference_data",
+                "expected_date": None,
+                "rows": instrument_tag_row.get("rows"),
+                "max_date": self._to_date(instrument_tag_row.get("max_effective_from")),
+                "max_run_id": None,
+                "status": "PASS" if row_count > 0 else "WARN",
+                "reason": f"max_effective_from={instrument_tag_row.get('max_effective_from')}",
+            })
+        except Exception as exc:
+            rows.append({
+                "table_name": "instrument_tag",
+                "date_column": "effective_from",
+                "run_id_column": None,
+                "critical": False,
+                "freshness_basis": "reference_data",
+                "expected_date": None,
+                "rows": None,
+                "max_date": None,
+                "max_run_id": None,
+                "status": "WARN",
+                "reason": f"query_failed:{type(exc).__name__}:{exc}",
+            })
+        return rows
+
+    def _build_data_refresh_summary(self, *, report_date: date, limit: int = 15) -> dict[str, Any]:
+        try:
+            rows = self._rows(
+                """
+                select
+                    sync_job_code,
+                    theme_code,
+                    dataset_code,
+                    provider_name,
+                    sync_mode,
+                    partition_from,
+                    partition_to,
+                    status,
+                    stats_json,
+                    started_at,
+                    finished_at
+                from public.data_sync_run
+                where coalesce(partition_to, partition_from, finished_at::date, started_at::date) <= :report_date
+                order by finished_at desc nulls last, started_at desc nulls last, id desc
+                limit :limit
+                """,
+                {"report_date": report_date, "limit": limit},
+            )
+        except Exception as exc:
+            return {"status": "WARN", "reason": f"query_failed:{type(exc).__name__}:{exc}", "rows": []}
+
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            stats = self._coerce_json_dict(row.get("stats_json"))
+            failed_rows = self._stats_value(stats, ("failed_rows", "fail_rows", "error_rows", "failed", "errors"))
+            normalized.append({
+                "refresh_module": row.get("sync_job_code") or row.get("dataset_code") or row.get("theme_code"),
+                "dataset_code": row.get("dataset_code"),
+                "provider": row.get("provider_name"),
+                "date_from": row.get("partition_from"),
+                "date_to": row.get("partition_to"),
+                "status": row.get("status"),
+                "inserted_rows": self._stats_value(stats, ("inserted_rows", "insert_rows", "created_rows", "created", "inserted")),
+                "updated_rows": self._stats_value(stats, ("updated_rows", "update_rows", "updated")),
+                "skipped_rows": self._stats_value(stats, ("skipped_rows", "skip_rows", "skipped")),
+                "failed_rows": failed_rows,
+                "provider_fallback": self._stats_value(stats, ("provider_fallback", "fallback_provider", "fallback", "fallback_used")),
+                "key_error": self._stats_value(stats, ("error", "key_error", "last_error", "message")),
+            })
+        if not normalized:
+            return {"status": "WARN", "reason": "no_recent_data_sync_run_rows", "rows": []}
+        has_failure = any(str(row.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"} or (self._optional_int(row.get("failed_rows")) or 0) > 0 for row in normalized)
+        return {"status": "WARN" if has_failure else "PASS", "reason": f"rows={len(normalized)}", "rows": normalized}
+
+    def _build_feature_readiness(self, *, report_date: date, signal_as_of_date: date) -> dict[str, Any]:
+        try:
+            row = self._one_or_none(
+                """
+                with
+                feature_date as (
+                    select max(trade_date) as trade_date from public.analytics_feature_snapshot where trade_date <= :signal_as_of_date
+                ),
+                factor_date as (
+                    select max(trade_date) as trade_date from public.analytics_instrument_factor_snapshot where trade_date <= :signal_as_of_date
+                ),
+                indicator_date as (
+                    select max(trade_date) as trade_date from public.analytics_instrument_indicator_snapshot where trade_date <= :signal_as_of_date
+                ),
+                active_instruments as (
+                    select count(*) as universe_size from public.meta_instrument where is_active = true
+                )
+                select
+                    (select trade_date from feature_date) as feature_date,
+                    (select universe_size from active_instruments) as universe_size,
+                    (select count(distinct instrument_id) from public.analytics_feature_snapshot where trade_date = (select trade_date from feature_date)) as valid_instrument_count,
+                    (select count(*) from public.analytics_feature_snapshot where trade_date = (select trade_date from feature_date)) as feature_rows,
+                    (select trade_date from factor_date) as factor_date,
+                    (select count(*) from public.analytics_instrument_factor_snapshot where trade_date = (select trade_date from factor_date)) as factor_rows,
+                    (select trade_date from indicator_date) as indicator_date,
+                    (select count(*) from public.analytics_instrument_indicator_snapshot where trade_date = (select trade_date from indicator_date)) as indicator_rows
+                """,
+                {"signal_as_of_date": signal_as_of_date},
+            ) or {}
+        except Exception as exc:
+            return {"feature_status": "WARN", "reason": f"query_failed:{type(exc).__name__}:{exc}"}
+
+        universe_size = self._optional_int(row.get("universe_size")) or 0
+        valid_count = self._optional_int(row.get("valid_instrument_count")) or 0
+        missing_count = max(universe_size - valid_count, 0) if universe_size else None
+        feature_date = self._to_date(row.get("feature_date"))
+        factor_rows = self._optional_int(row.get("factor_rows")) or 0
+        indicator_rows = self._optional_int(row.get("indicator_rows")) or 0
+        feature_status = "PASS" if feature_date and feature_date >= signal_as_of_date and valid_count > 0 and factor_rows > 0 and indicator_rows > 0 else "WARN"
+        return {
+            "feature_date": feature_date,
+            "universe_size": universe_size,
+            "valid_instrument_count": valid_count,
+            "excluded_instrument_count": missing_count,
+            "indicator_rows": row.get("indicator_rows"),
+            "factor_rows": row.get("factor_rows"),
+            "feature_rows": row.get("feature_rows"),
+            "missing_feature_count": missing_count,
+            "factor_date": self._to_date(row.get("factor_date")),
+            "indicator_date": self._to_date(row.get("indicator_date")),
+            "feature_status": feature_status,
+            "reason": f"feature_date={feature_date},signal_as_of_date={signal_as_of_date},valid={valid_count},universe={universe_size}",
+        }
 
     def _build_campaign_section(
         self,
@@ -481,7 +721,19 @@ class ProductionDailyObservationReportBuilder:
           )
         group by t.run_id, t.portfolio_id
         """
-        return self._one_or_none(sql, {"portfolio_id": portfolio_id, "report_date": report_date, "target_count": target_count})
+        summary = self._one_or_none(sql, {"portfolio_id": portfolio_id, "report_date": report_date, "target_count": target_count})
+        if summary:
+            source_signal_run_id = summary.get("source_signal_run_id")
+            if source_signal_run_id is not None:
+                summary["candidate_count"] = self._safe_scalar(
+                    "select count(*) from public.strategy_signal where run_id = :run_id",
+                    {"run_id": source_signal_run_id},
+                )
+            rank_out = self._optional_int(summary.get("rank_out_of_scope_rows")) or 0
+            selected_count = self._optional_int(summary.get("selected_count")) or 0
+            rank_in = self._optional_int(summary.get("rank_in_scope_rows")) or 0
+            summary["rank_scope_check"] = bool(selected_count and rank_out == 0 and rank_in == selected_count)
+        return summary
 
     def _selected_instruments(self, *, portfolio_id: int, target_run_id: int, limit: int) -> list[dict[str, Any]]:
         sql = """
@@ -515,6 +767,8 @@ class ProductionDailyObservationReportBuilder:
                count(*) filter (where upper(order_side) = 'BUY') as buy_order_count,
                count(*) filter (where upper(order_side) = 'SELL') as sell_order_count,
                count(*) filter (where upper(status) not in ('CREATED','ACCEPTED','FILLED')) as abnormal_order_count,
+               string_agg(distinct nullif(price_fill_rule, ''), ',') as entry_policy,
+               string_agg(distinct nullif(order_type, ''), ',') as order_type_policy,
                sum(order_quantity) as total_order_quantity,
                sum(estimated_gross_amount) as total_estimated_gross_amount,
                sum(estimated_fee) as total_estimated_fee,
@@ -536,7 +790,9 @@ class ProductionDailyObservationReportBuilder:
                sum(gross_amount) as gross_amount,
                sum(total_fee_amount) as total_fee_amount,
                sum(net_amount) as net_amount,
-               sum(cash_delta) as cash_delta
+               sum(cash_delta) as cash_delta,
+               string_agg(distinct nullif(fill_rule, ''), ',') as fill_policy,
+               string_agg(distinct nullif(price_source, ''), ',') as fill_price_source
         from public.trading_paper_fill
         where portfolio_id = :portfolio_id
           and fill_date <= :report_date
@@ -679,6 +935,10 @@ class ProductionDailyObservationReportBuilder:
             row["trade_reason_parts"] = reason_parts
             row["trade_reason_summary"] = self._trade_reason_summary(reason_parts)
             row["trade_reason"] = self._trade_reason(row)
+            side = str(row.get("order_side") or "").upper()
+            policy = self._dedupe_join([row.get("price_fill_rule"), row.get("fill_rule"), row.get("price_source")], separator=";")
+            row["entry_policy"] = policy if side == "BUY" else None
+            row["exit_policy"] = policy if side == "SELL" else None
         return rows
 
     def _campaign_runtime_observation(
@@ -907,6 +1167,28 @@ class ProductionDailyObservationReportBuilder:
             "check_name": "turnover_rate",
             "status": "WARN" if turnover_rate is not None and turnover_rate > Decimal("1.20") else "PASS",
             "reason": f"turnover_rate={snapshot.get('turnover_rate')}",
+        })
+        trade_details = section.get("trade_details") or []
+        missing_price_count = sum(
+            1
+            for row in trade_details
+            if row.get("fill_status") and row.get("fill_price") is None and row.get("estimated_price") is None
+        )
+        failed_trade_count = sum(
+            1
+            for row in trade_details
+            if str(row.get("order_status") or "").upper() in {"FAILED", "REJECTED", "CANCELLED"}
+            or str(row.get("fill_status") or "").upper() in {"FAILED", "REJECTED", "CANCELLED"}
+        )
+        checks.append({
+            "check_name": "price_available",
+            "status": "PASS" if missing_price_count == 0 else "FAIL",
+            "reason": f"missing_price_count={missing_price_count}",
+        })
+        checks.append({
+            "check_name": "trade_failure",
+            "status": "PASS" if failed_trade_count == 0 else "FAIL",
+            "reason": f"failed_trade_count={failed_trade_count}",
         })
         return checks
 
@@ -1836,6 +2118,15 @@ class ProductionDailyObservationReportBuilder:
 
     def _build_artifact_index(self, *, project_root: Path, campaigns: list[dict[str, Any]], report_date: date) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        runtime_log = project_root / "logs/daily_runtime.log"
+        rows.append({
+            "campaign_code": "__runtime__",
+            "portfolio_id": None,
+            "artifact_type": "daily_runtime_log",
+            "path": str(runtime_log.relative_to(project_root)) if runtime_log.exists() else "logs/daily_runtime.log",
+            "exists": runtime_log.exists(),
+            "kind": "file",
+        })
         for campaign in campaigns:
             campaign_code = str(campaign.get("campaign_code") or "")
             portfolio_id = campaign.get("portfolio_id")
@@ -1865,6 +2156,63 @@ class ProductionDailyObservationReportBuilder:
             seen.add(key)
             unique.append(row)
         return unique
+
+    @staticmethod
+    def _coerce_json_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _stats_value(stats: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in stats:
+                return stats.get(key)
+        # Some stats payloads group counters under nested dictionaries. Search one level deep.
+        for value in stats.values():
+            if isinstance(value, dict):
+                for key in keys:
+                    if key in value:
+                        return value.get(key)
+        return None
+
+    @classmethod
+    def _trade_explanation_counts(cls, *, selection: dict[str, Any], orders: dict[str, Any], fills: dict[str, Any], snapshot: dict[str, Any], risk: dict[str, Any]) -> dict[str, Any]:
+        selected_count = cls._optional_int(selection.get("selected_count")) or 0
+        order_count = cls._optional_int((orders or {}).get("order_count")) or 0
+        buy_count = cls._optional_int((orders or {}).get("buy_order_count")) or 0
+        sell_count = cls._optional_int((orders or {}).get("sell_order_count")) or 0
+        hold_count = cls._optional_int(risk.get("open_position_rows"))
+        if hold_count is None:
+            hold_count = cls._optional_int(snapshot.get("holding_count")) or 0
+        skip_count = max(selected_count - order_count, 0)
+        abnormal_orders = cls._optional_int((orders or {}).get("abnormal_order_count")) or 0
+        abnormal_fills = cls._optional_int((fills or {}).get("abnormal_fill_count")) or 0
+        entry_policy = cls._dedupe_join(
+            [
+                (orders or {}).get("entry_policy"),
+                (fills or {}).get("fill_policy"),
+                f"fill_price_source={(fills or {}).get('fill_price_source')}" if (fills or {}).get("fill_price_source") else None,
+            ],
+            separator=";",
+        )
+        exit_policy = entry_policy if sell_count else "no_sell_order_today"
+        return {
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "hold_count": hold_count,
+            "skip_count": skip_count,
+            "abnormal_orders": abnormal_orders,
+            "abnormal_fills": abnormal_fills,
+            "entry_policy": entry_policy or "not_available",
+            "exit_policy": exit_policy or "not_available",
+        }
 
     def _build_checks(
         self,
@@ -1966,15 +2314,23 @@ class ProductionDailyObservationReportBuilder:
         lines.extend([
             "# Production Daily Observation Report",
             "",
-            f"- report_date: `{self._json_default(payload.get('report_date'))}`",
-            f"- generated_at: `{payload.get('generated_at')}`",
-            f"- execution_context: `{payload.get('execution_context')}`",
-            f"- report_context: `{payload.get('report_context')}`",
-            f"- paper_campaign_context: `{payload.get('paper_campaign_context')}`",
-            f"- signal_as_of_date: `{self._json_default(payload.get('signal_as_of_date'))}`",
-            f"- overall_status: `{payload.get('overall_status')}`",
-            "",
             "> 这是一份生产端 daily run 观察报告，不是研究报告，不是 M8 full ops 报告，也不是正式实盘交易报告。",
+            "",
+            "## 0. 今日运行概览",
+            "",
+            "| field | value |",
+            "|---|---|",
+            f"| report_date | `{self._json_default(payload.get('report_date'))}` |",
+            f"| generated_at | `{payload.get('generated_at')}` |",
+            f"| execution_context | `{payload.get('execution_context')}` |",
+            f"| report_context | `{payload.get('report_context')}` |",
+            f"| daily_profile | `{payload.get('daily_profile')}` |",
+            f"| git_commit | `{payload.get('git_commit')}` |",
+            f"| docker_container | `{payload.get('docker_container')}` |",
+            f"| database | `{payload.get('database')}` |",
+            f"| paper_campaign_context | `{payload.get('paper_campaign_context')}` |",
+            f"| signal_as_of_date | `{self._json_default(payload.get('signal_as_of_date'))}` |",
+            f"| overall_status | `{payload.get('overall_status')}` |",
             "",
             "## 1. 数据水位",
             "",
@@ -1985,6 +2341,34 @@ class ProductionDailyObservationReportBuilder:
             lines.append(
                 f"| {row.get('table_name')} | {row.get('freshness_basis')} | {self._json_default(row.get('expected_date'))} | {self._json_default(row.get('max_date'))} | {row.get('rows')} | {row.get('max_run_id')} | {row.get('status')} | {row.get('reason')} |"
             )
+
+        data_refresh = payload.get("data_refresh_summary") or {}
+        lines.extend([
+            "",
+            "## 1.1 基础数据刷新报告",
+            "",
+            f"- status: `{data_refresh.get('status')}` / reason: `{data_refresh.get('reason')}`",
+            "",
+            "| refresh_module | provider | date_from | date_to | inserted | updated | skipped | failed | fallback | key_error | status |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|",
+        ])
+        for refresh_row in (data_refresh.get("rows") or [])[:15]:
+            lines.append(
+                f"| {refresh_row.get('refresh_module')} | {refresh_row.get('provider')} | {self._json_default(refresh_row.get('date_from'))} | {self._json_default(refresh_row.get('date_to'))} | {refresh_row.get('inserted_rows')} | {refresh_row.get('updated_rows')} | {refresh_row.get('skipped_rows')} | {refresh_row.get('failed_rows')} | {refresh_row.get('provider_fallback')} | {refresh_row.get('key_error')} | {refresh_row.get('status')} |"
+            )
+
+        feature = payload.get("feature_readiness") or {}
+        lines.extend([
+            "",
+            "## 1.2 特征 / 因子 / 指标准备情况",
+            "",
+            f"- feature_status: `{feature.get('feature_status')}` / reason: `{feature.get('reason')}`",
+            "",
+            "| feature_date | universe_size | valid_instrument_count | excluded_instrument_count | indicator_rows | factor_rows | missing_feature_count | feature_rows | factor_date | indicator_date |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| {self._json_default(feature.get('feature_date'))} | {feature.get('universe_size')} | {feature.get('valid_instrument_count')} | {feature.get('excluded_instrument_count')} | {feature.get('indicator_rows')} | {feature.get('factor_rows')} | {feature.get('missing_feature_count')} | {feature.get('feature_rows')} | {self._json_default(feature.get('factor_date'))} | {self._json_default(feature.get('indicator_date'))} |",
+        ])
+
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         lines.extend([
@@ -2104,19 +2488,20 @@ class ProductionDailyObservationReportBuilder:
                 f"- portfolio_id: `{campaign.get('portfolio_id')}`",
                 f"- validation_stage: `{campaign.get('validation_stage')}`",
                 f"- target_run_id: `{selection.get('target_run_id')}`",
-                f"- source_signal_run_id: `{selection.get('source_signal_run_id')}`",
-                f"- selected_count: `{selection.get('selected_count')}`",
-                f"- source_rank_range: `{selection.get('min_source_rank')}` - `{selection.get('max_source_rank')}`",
+                f"- source_signal_run_id: `{selection.get('source_signal_run_id')}` / screen_request_id: `{selection.get('source_screen_request_id')}`",
+                f"- candidate_count: `{selection.get('candidate_count')}` / selected_count: `{selection.get('selected_count')}`",
+                f"- target_rank_range: `{selection.get('min_target_rank')}` - `{selection.get('max_target_rank')}` / source_rank_range: `{selection.get('min_source_rank')}` - `{selection.get('max_source_rank')}`",
+                f"- score_range: `{self._fmt_decimal(selection.get('min_target_score'), 4)}` - `{self._fmt_decimal(selection.get('max_target_score'), 4)}` / rank_scope_check: `{selection.get('rank_scope_check')}`",
                 f"- rank_out_of_scope_rows: `{selection.get('rank_out_of_scope_rows')}`",
                 f"- order_run_id: `{(orders or {}).get('order_run_id')}` / order_count: `{(orders or {}).get('order_count')}` / buy: `{(orders or {}).get('buy_order_count')}` / sell: `{(orders or {}).get('sell_order_count')}`",
                 f"- fill_run_id: `{(fills or {}).get('fill_run_id')}` / fill_count: `{(fills or {}).get('fill_count')}`",
                 f"- snapshot_run_id: `{snapshot.get('snapshot_run_id')}` / position_run_id: `{snapshot.get('position_run_id') or snapshot.get('snapshot_run_id')}` / snapshot_date: `{snapshot.get('snapshot_date')}`",
                 f"- holding_count: `{snapshot.get('holding_count')}`",
-                f"- cash_balance: `{self._fmt_money(snapshot.get('cash_balance'))}`",
+                f"- cash_balance: `{self._fmt_money(snapshot.get('cash_balance'))}` / cash_ratio: `{self._fmt_percent(self._safe_ratio(snapshot.get('cash_balance'), snapshot.get('total_equity')), 2)}`",
                 f"- market_value: `{self._fmt_money(snapshot.get('market_value'))}`",
                 f"- total_equity: `{self._fmt_money(snapshot.get('total_equity'))}`",
-                f"- daily_return: `{self._fmt_percent(snapshot.get('daily_return'), 4)}`",
-                f"- turnover_rate: `{self._fmt_percent(snapshot.get('turnover_rate'), 2)}`",
+                f"- daily_pnl: `{self._fmt_money(snapshot.get('daily_pnl'))}` / daily_return: `{self._fmt_percent(snapshot.get('daily_return'), 4)}`",
+                f"- turnover_amount: `{self._fmt_money(snapshot.get('turnover_amount'))}` / turnover_rate: `{self._fmt_percent(snapshot.get('turnover_rate'), 2)}`",
                 "",
                 "#### Daily runtime action",
                 "",
@@ -2127,6 +2512,33 @@ class ProductionDailyObservationReportBuilder:
                 f"- latest_campaign_date: `{self._json_default(runtime.get('latest_campaign_date'))}` / daily_artifact_exists: `{runtime.get('daily_artifact_exists')}`",
                 f"- target_run_id: `{runtime.get('target_run_id')}` / order_run_id: `{runtime.get('order_run_id')}` / fill_run_id: `{runtime.get('fill_run_id')}` / snapshot_run_id: `{runtime.get('snapshot_run_id')}` / position_run_id: `{runtime.get('position_run_id')}`",
                 f"- note: {runtime.get('note')}",
+                "",
+            ])
+            trade_explain = self._trade_explanation_counts(
+                selection=selection,
+                orders=orders or {},
+                fills=fills or {},
+                snapshot=snapshot,
+                risk=campaign.get("risk_metrics") or {},
+            )
+            reason_samples = self._dedupe_strings(
+                item.get("trade_reason_summary") or item.get("trade_reason")
+                for item in (campaign.get("trade_details") or [])[:10]
+            )
+            lines.extend([
+                "#### 买卖点与交易说明",
+                "",
+                f"- target_run_id: `{selection.get('target_run_id')}` / order_run_id: `{(orders or {}).get('order_run_id')}` / fill_run_id: `{(fills or {}).get('fill_run_id')}`",
+                f"- buy_count: `{trade_explain.get('buy_count')}` / sell_count: `{trade_explain.get('sell_count')}` / hold_count: `{trade_explain.get('hold_count')}` / skip_count: `{trade_explain.get('skip_count')}`",
+                f"- entry_policy: `{trade_explain.get('entry_policy')}` / exit_policy: `{trade_explain.get('exit_policy')}`",
+                f"- trade_reason_sample: `{self._dedupe_join(reason_samples[:5], separator=' | ') or 'not_available'}`",
+                "",
+                "| action | count | policy | reason |",
+                "|---|---:|---|---|",
+                f"| BUY | {trade_explain.get('buy_count')} | {trade_explain.get('entry_policy')} | 买入来自策略入选、等权目标仓位、价格/成交规则执行。 |",
+                f"| SELL | {trade_explain.get('sell_count')} | {trade_explain.get('exit_policy')} | {'当日存在卖出订单，查看交易明细。' if (trade_explain.get('sell_count') or 0) else '当日无卖出订单。'} |",
+                f"| HOLD | {trade_explain.get('hold_count')} | position_status=OPEN | 当前持仓仍处于 OPEN 状态，继续纳入生产观察。 |",
+                f"| SKIP | {trade_explain.get('skip_count')} | target_without_order_or_rejected | {'存在目标未形成订单或异常订单，需检查原因。' if (trade_explain.get('skip_count') or 0) else '当日目标均已进入订单/成交链路。'} |",
                 "",
                 "#### 交易增强摘要",
                 "",
@@ -2166,13 +2578,13 @@ class ProductionDailyObservationReportBuilder:
                 "",
                 "#### 交易明细预览",
                 "",
-                "| side | code | name | order_qty | fill_qty | fill_price | gross_amount | fee | order_status | fill_status | strategy_reason | sizing_reason | price_reason | fill_reason |",
-                "|---|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|---|",
+                "| side | code | name | target_weight | order_qty | fill_qty | fill_price | entry_policy | exit_policy | gross_amount | fee | order_status | fill_status | trade_reason |",
+                "|---|---|---|---:|---:|---:|---:|---|---|---:|---:|---|---|---|",
             ])
             for item in (campaign.get("trade_details") or [])[:30]:
                 code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
                 lines.append(
-                    f"| {item.get('order_side')} | {code} | {item.get('display_name')} | {self._fmt_quantity(item.get('order_quantity'))} | {self._fmt_quantity(item.get('fill_quantity'))} | {self._fmt_money(item.get('fill_price'))} | {self._fmt_money(item.get('gross_amount'))} | {self._fmt_money(item.get('total_fee_amount'))} | {item.get('order_status')} | {item.get('fill_status')} | {(item.get('trade_reason_parts') or {}).get('strategy_reason')} | {(item.get('trade_reason_parts') or {}).get('sizing_reason')} | {(item.get('trade_reason_parts') or {}).get('price_reason')} | {(item.get('trade_reason_parts') or {}).get('fill_reason')} |"
+                    f"| {item.get('order_side')} | {code} | {item.get('display_name')} | {self._fmt_percent(item.get('target_weight'), 2)} | {self._fmt_quantity(item.get('order_quantity'))} | {self._fmt_quantity(item.get('fill_quantity'))} | {self._fmt_money(item.get('fill_price'))} | {item.get('entry_policy') or ''} | {item.get('exit_policy') or ''} | {self._fmt_money(item.get('gross_amount'))} | {self._fmt_money(item.get('total_fee_amount'))} | {item.get('order_status')} | {item.get('fill_status')} | {item.get('trade_reason_summary') or item.get('trade_reason')} |"
                 )
             lines.extend([
                 "",
