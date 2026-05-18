@@ -762,6 +762,16 @@ class ProductionDailyObservationReportBuilder:
                 order="loss",
                 limit=5,
             )
+            section["trade_lifecycle"] = self._trade_lifecycle_observation(
+                portfolio_id=portfolio_id,
+                report_date=report_date,
+                position_run_id=int(position_run_id),
+                order_run_id=self._optional_int(order_run_id),
+                selection_summary=section.get("selection_summary") or {},
+                trade_summary=section.get("trade_summary") or {},
+                snapshot=snapshot,
+                limit=10,
+            )
 
         section["runtime_observation"] = self._campaign_runtime_observation(
             project_root=project_root,
@@ -1213,6 +1223,218 @@ class ProductionDailyObservationReportBuilder:
         limit :limit
         """
         return self._rows(sql, {"portfolio_id": portfolio_id, "position_run_id": position_run_id, "limit": limit})
+
+    def _trade_lifecycle_observation(
+        self,
+        *,
+        portfolio_id: int,
+        report_date: date,
+        position_run_id: int,
+        order_run_id: int | None,
+        selection_summary: dict[str, Any],
+        trade_summary: dict[str, Any],
+        snapshot: dict[str, Any],
+        limit: int,
+    ) -> dict[str, Any]:
+        """Build production observation for trade lifecycle without pretending to be an exit-rule engine.
+
+        Current production tables contain target/order/fill/position snapshots and optional risk_decision rows,
+        but they do not yet materialize formal 20-trading-day exit, profit drawdown, stop-loss, or sell-signal
+        lifecycle states. Keep this section explicit: observed facts are reported as OBSERVED; missing rule-backed
+        lifecycle items are reported as NOT_EVALUATED.
+        """
+        orders = trade_summary.get("orders") if isinstance(trade_summary, dict) else {}
+        fills = trade_summary.get("fills") if isinstance(trade_summary, dict) else {}
+        sell_count = self._optional_int((orders or {}).get("sell_order_count")) or 0
+        buy_count = self._optional_int((orders or {}).get("buy_order_count")) or 0
+        selected_count = self._optional_int(selection_summary.get("selected_count")) or 0
+        holding_count = self._optional_int(snapshot.get("holding_count")) or 0
+        effective_date = self._to_date(selection_summary.get("effective_date"))
+        snapshot_date = self._to_date(snapshot.get("snapshot_date")) or report_date
+
+        rows_sql = """
+        with current_pos as (
+            select
+                p.instrument_id,
+                mi.instrument_code,
+                mi.symbol,
+                mi.display_name,
+                p.position_date,
+                p.quantity,
+                p.avg_cost,
+                p.market_price,
+                p.market_value,
+                p.total_pnl,
+                p.position_status
+            from public.trading_paper_position p
+            left join public.meta_instrument mi on mi.id = p.instrument_id
+            where p.portfolio_id = :portfolio_id
+              and p.run_id = :position_run_id
+        ),
+        first_seen as (
+            select
+                instrument_id,
+                min(position_date) as first_position_date
+            from public.trading_paper_position
+            where portfolio_id = :portfolio_id
+              and quantity > 0
+              and position_date <= :report_date
+            group by instrument_id
+        ),
+        last_order as (
+            select distinct on (instrument_id)
+                instrument_id,
+                effective_date as last_order_date,
+                order_side as last_order_side,
+                price_fill_rule as last_order_policy,
+                status as last_order_status
+            from public.trading_paper_order
+            where portfolio_id = :portfolio_id
+              and effective_date <= :report_date
+            order by instrument_id, effective_date desc, run_id desc, id desc
+        )
+        select
+            cp.instrument_id,
+            cp.instrument_code,
+            cp.symbol,
+            cp.display_name,
+            cp.position_date,
+            fs.first_position_date,
+            (cp.position_date - fs.first_position_date + 1) as calendar_holding_days_candidate,
+            greatest(20 - (cp.position_date - fs.first_position_date + 1), 0) as calendar_days_to_20_candidate,
+            cp.quantity,
+            cp.avg_cost,
+            cp.market_price,
+            cp.market_value,
+            cp.total_pnl,
+            cp.position_status,
+            lo.last_order_date,
+            lo.last_order_side,
+            lo.last_order_policy,
+            lo.last_order_status
+        from current_pos cp
+        left join first_seen fs on fs.instrument_id = cp.instrument_id
+        left join last_order lo on lo.instrument_id = cp.instrument_id
+        order by calendar_holding_days_candidate desc nulls last, cp.market_value desc nulls last, cp.instrument_id
+        limit :limit
+        """
+        details = self._rows(
+            rows_sql,
+            {
+                "portfolio_id": portfolio_id,
+                "position_run_id": position_run_id,
+                "report_date": report_date,
+                "limit": limit,
+            },
+        )
+        all_rows = self._rows(
+            rows_sql.replace("limit :limit", ""),
+            {
+                "portfolio_id": portfolio_id,
+                "position_run_id": position_run_id,
+                "report_date": report_date,
+                "limit": 100000,
+            },
+        )
+        holding_days_values = [
+            self._optional_int(row.get("calendar_holding_days_candidate"))
+            for row in all_rows
+            if self._optional_int(row.get("calendar_holding_days_candidate")) is not None
+        ]
+        near_20_count = sum(1 for value in holding_days_values if value is not None and value >= 15)
+        reached_20_count = sum(1 for value in holding_days_values if value is not None and value >= 20)
+        open_count = sum(1 for row in all_rows if str(row.get("position_status") or "").upper() == "OPEN")
+        winning_count = sum(1 for row in all_rows if (self._to_decimal_value(row.get("total_pnl")) or Decimal("0")) > 0)
+        losing_count = sum(1 for row in all_rows if (self._to_decimal_value(row.get("total_pnl")) or Decimal("0")) < 0)
+
+        risk_sql = """
+        select
+            count(*) as risk_decision_count,
+            count(*) filter (where upper(coalesce(action_taken, '')) like '%REDUCE%' or upper(coalesce(decision_type, '')) like '%REDUCE%') as risk_reduce_count,
+            count(*) filter (where upper(coalesce(action_taken, '')) like '%BLOCK%' or upper(coalesce(decision_type, '')) like '%BLOCK%') as risk_block_count,
+            string_agg(distinct nullif(reason_code, ''), ',') as risk_reason_codes
+        from public.risk_decision
+        where portfolio_id = :portfolio_id
+          and decision_date = :report_date
+        """
+        try:
+            risk_decision = self._one_or_none(risk_sql, {"portfolio_id": portfolio_id, "report_date": report_date}) or {}
+        except Exception as exc:
+            risk_decision = {"query_error": f"{type(exc).__name__}:{exc}"}
+
+        lifecycle_context = "FIRST_CHAIN" if selected_count and buy_count and sell_count == 0 and holding_count == buy_count else "DAILY_OBSERVATION"
+        if order_run_id is None:
+            lifecycle_context = "NO_ORDER_RUN"
+
+        exit_checks = [
+            {
+                "check_name": "sell_order_observed",
+                "status": "OBSERVED",
+                "value": f"sell_count={sell_count}",
+                "reason": "当日卖出订单数量；这只是已发生交易观察，不等同于完整卖点信号评估。",
+            },
+            {
+                "check_name": "no_exit_positions",
+                "status": "OBSERVED",
+                "value": f"no_exit_count={open_count}",
+                "reason": "当前 position_status=OPEN 的持仓继续纳入观察。",
+            },
+            {
+                "check_name": "holding_days_candidate",
+                "status": "CANDIDATE",
+                "value": f"min={min(holding_days_values) if holding_days_values else None},max={max(holding_days_values) if holding_days_values else None},near_20={near_20_count},reached_20={reached_20_count}",
+                "reason": "按当前持仓首次出现在 position 表的自然日候选值估算，不等同于正式 20 个交易日退出规则。",
+            },
+            {
+                "check_name": "twenty_trading_day_exit",
+                "status": "NOT_EVALUATED",
+                "value": "not_materialized",
+                "reason": "当前生产表未落地正式 20 个交易日退出规则状态；不能硬判定触发/未触发。",
+            },
+            {
+                "check_name": "profit_drawdown_exit",
+                "status": "NOT_EVALUATED",
+                "value": "not_materialized",
+                "reason": "当前生产表未落地持仓峰值收益/利润回撤阈值状态；不能硬判定触发/未触发。",
+            },
+            {
+                "check_name": "stop_loss_exit",
+                "status": "NOT_EVALUATED",
+                "value": "not_materialized",
+                "reason": "当前 active campaign 未提供正式止损阈值状态；不能硬判定触发/未触发。",
+            },
+            {
+                "check_name": "risk_reduce_exit",
+                "status": "OBSERVED" if risk_decision.get("query_error") is None else "WARN",
+                "value": f"risk_reduce_count={self._optional_int(risk_decision.get('risk_reduce_count')) or 0}",
+                "reason": risk_decision.get("query_error") or "来自 risk_decision 当日记录的风控减仓候选观察。",
+            },
+        ]
+
+        return {
+            "scope": "production_observation_lifecycle_skeleton_not_exit_rule_engine",
+            "lifecycle_context": lifecycle_context,
+            "target_run_id": selection_summary.get("target_run_id"),
+            "order_run_id": (orders or {}).get("order_run_id"),
+            "fill_run_id": (fills or {}).get("fill_run_id"),
+            "position_run_id": position_run_id,
+            "effective_date": effective_date,
+            "snapshot_date": snapshot_date,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "current_position_count": len(all_rows),
+            "open_position_count": open_count,
+            "no_exit_count": open_count if sell_count == 0 else max(open_count - sell_count, 0),
+            "winning_position_count": winning_count,
+            "losing_position_count": losing_count,
+            "calendar_holding_days_min": min(holding_days_values) if holding_days_values else None,
+            "calendar_holding_days_max": max(holding_days_values) if holding_days_values else None,
+            "near_20_calendar_day_count": near_20_count,
+            "reached_20_calendar_day_count": reached_20_count,
+            "risk_decision": risk_decision,
+            "exit_checks": exit_checks,
+            "details": details,
+        }
 
     def _campaign_risk_checks(self, section: dict[str, Any]) -> list[dict[str, Any]]:
         selection = section.get("selection_summary") or {}
@@ -2799,6 +3021,44 @@ class ProductionDailyObservationReportBuilder:
             notes.append("未发现相关 M6.5/M8 产物索引，需检查 daily run 是否生成报告产物。")
         return notes
 
+    def _render_trade_lifecycle_observation(self, lifecycle: dict[str, Any]) -> list[str]:
+        if not lifecycle:
+            return [
+                "#### 买卖点生命周期观察",
+                "",
+                "- status: `WARN` / reason: `missing_lifecycle_context`",
+                "",
+            ]
+        lines: list[str] = [
+            "#### 买卖点生命周期观察",
+            "",
+            f"- scope: `{lifecycle.get('scope')}`",
+            f"- lifecycle_context: `{lifecycle.get('lifecycle_context')}`",
+            f"- target_run_id: `{lifecycle.get('target_run_id')}` / order_run_id: `{lifecycle.get('order_run_id')}` / fill_run_id: `{lifecycle.get('fill_run_id')}` / position_run_id: `{lifecycle.get('position_run_id')}`",
+            f"- buy_count: `{lifecycle.get('buy_count')}` / sell_count: `{lifecycle.get('sell_count')}` / current_position_count: `{lifecycle.get('current_position_count')}` / no_exit_count: `{lifecycle.get('no_exit_count')}`",
+            f"- calendar_holding_days_candidate: min=`{lifecycle.get('calendar_holding_days_min')}` / max=`{lifecycle.get('calendar_holding_days_max')}` / near_20=`{lifecycle.get('near_20_calendar_day_count')}` / reached_20=`{lifecycle.get('reached_20_calendar_day_count')}`",
+            "- note: 当前为生产观察版生命周期骨架；未落表的 20 交易日退出、利润回撤、止损、卖出信号不做硬判定。",
+            "",
+            "| lifecycle_check | status | value | reason |",
+            "|---|---|---|---|",
+        ]
+        for check in lifecycle.get("exit_checks") or []:
+            lines.append(f"| {check.get('check_name')} | {check.get('status')} | {check.get('value')} | {check.get('reason')} |")
+        lines.extend([
+            "",
+            "##### 持仓生命周期候选 Top",
+            "",
+            "| code | name | first_position_date | position_date | calendar_holding_days_candidate | days_to_20_candidate | total_pnl | last_order_side | status |",
+            "|---|---|---:|---:|---:|---:|---:|---|---|",
+        ])
+        for item in (lifecycle.get("details") or [])[:10]:
+            code = item.get("instrument_code") or item.get("symbol") or item.get("instrument_id")
+            lines.append(
+                f"| {code} | {item.get('display_name')} | {self._json_default(item.get('first_position_date'))} | {self._json_default(item.get('position_date'))} | {item.get('calendar_holding_days_candidate')} | {item.get('calendar_days_to_20_candidate')} | {self._fmt_money(item.get('total_pnl'))} | {item.get('last_order_side')} | {item.get('position_status')} |"
+            )
+        lines.append("")
+        return lines
+
     def _render_markdown(self, payload: dict[str, Any]) -> str:
         lines: list[str] = []
         return_attribution_by_campaign = {
@@ -3074,6 +3334,9 @@ class ProductionDailyObservationReportBuilder:
                 f"| HOLD | {trade_explain.get('hold_count')} | position_status=OPEN | 当前持仓仍处于 OPEN 状态，继续纳入生产观察。 |",
                 f"| SKIP | {trade_explain.get('skip_count')} | target_without_order_or_rejected | {'存在目标未形成订单或异常订单，需检查原因。' if (trade_explain.get('skip_count') or 0) else '当日目标均已进入订单/成交链路。'} |",
                 "",
+            ])
+            lines.extend(self._render_trade_lifecycle_observation(campaign.get("trade_lifecycle") or {}))
+            lines.extend([
                 "#### 交易增强摘要",
                 "",
                 f"- order_total_quantity: `{self._fmt_quantity((orders or {}).get('total_order_quantity'))}` / estimated_gross_amount: `{self._fmt_money((orders or {}).get('total_estimated_gross_amount'))}` / estimated_fee: `{self._fmt_money((orders or {}).get('total_estimated_fee'))}`",
