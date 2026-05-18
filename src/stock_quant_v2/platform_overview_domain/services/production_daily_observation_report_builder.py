@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1571,14 +1572,14 @@ class ProductionDailyObservationReportBuilder:
 
         strategy_reason = ProductionDailyObservationReportBuilder._dedupe_join(
             part for part in raw_reasons
-            if part and not part.startswith(("M7_", "price_", "raw_target_", "cash_buffer_", "lot_size="))
+            if part and not part.startswith(("M7_", "price_", "price=", "raw_target_", "cash_buffer_", "lot_size="))
         )
         sizing_reason = ProductionDailyObservationReportBuilder._dedupe_join(
             part for part in raw_reasons
             if part.startswith(("M7_", "raw_target_", "cash_buffer_", "lot_size="))
         )
         price_context = ProductionDailyObservationReportBuilder._dedupe_join(
-            part for part in raw_reasons if part.startswith("price_")
+            part for part in raw_reasons if part.startswith(("price_", "price="))
         )
         if row.get("price_source"):
             price_context = ProductionDailyObservationReportBuilder._dedupe_join(
@@ -2316,13 +2317,60 @@ class ProductionDailyObservationReportBuilder:
         }
 
     @classmethod
+    def _signal_reference_price_observation(cls, row: dict[str, Any]) -> dict[str, Any]:
+        """Extract the signal-side reference price embedded in existing reasons.
+
+        The paper-order estimated_price can already be normalized to the NEXT_OPEN
+        fill reference in some production chains. For buy-price quality we want the
+        signal-side reference price, usually stored in target_status_reason as
+        price_source=core_daily_bar.close;price_date=YYYY-MM-DD;price=... .
+        This helper is read-only and only parses existing reason text.
+        """
+        reason_texts: list[str] = []
+        for key in ("target_status_reason", "trade_reason", "trade_reason_summary", "target_reason_code", "signal_reason_code"):
+            value = row.get(key)
+            if value:
+                reason_texts.append(str(value))
+        parts = row.get("trade_reason_parts") or {}
+        if isinstance(parts, dict):
+            for key in ("strategy_reason", "price_reason", "sizing_reason"):
+                value = parts.get(key)
+                if value:
+                    reason_texts.append(str(value))
+        text = ";".join(reason_texts)
+
+        price: Decimal | None = None
+        match = re.search(r"(?:^|[;\s,])price=([-+]?\d+(?:\.\d+)?)", text)
+        if match:
+            price = cls._to_decimal_value(match.group(1))
+
+        price_source = None
+        source_match = re.search(r"(?:^|[;\s,])price_source=([^;\s,]+)", text)
+        if source_match:
+            price_source = source_match.group(1)
+
+        price_date = None
+        date_match = re.search(r"(?:^|[;\s,])price_date=([^;\s,]+)", text)
+        if date_match:
+            price_date = date_match.group(1)
+
+        return {
+            "price": price,
+            "price_source": price_source,
+            "price_date": price_date,
+            "raw_source": "target_status_reason.price" if price is not None else None,
+        }
+
+    @classmethod
     def _build_buy_price_quality(cls, payload: dict[str, Any]) -> dict[str, Any]:
         """Observe NEXT_OPEN buy price quality from existing order/fill rows.
 
-        This is an operational observation only. It compares the order estimated
-        price (currently derived from the signal-side close in the existing
-        execution chain) with the actual simulated fill price (NEXT_OPEN). It
-        does not introduce a new buy-point engine or change execution behavior.
+        This is an operational observation only. It compares the signal-side
+        reference price parsed from existing target/status reason text with the
+        actual simulated fill price (NEXT_OPEN). It does not introduce a new
+        buy-point engine or change execution behavior. If no signal-side price is
+        available, it falls back to order.estimated_price and marks the section
+        WARN because that fallback may already equal the fill-open price.
         """
         campaign_rows: list[dict[str, Any]] = []
         for campaign in payload.get("campaigns") or []:
@@ -2335,12 +2383,25 @@ class ProductionDailyObservationReportBuilder:
             total_estimated_amount = Decimal("0")
             gap_ratio_sum = Decimal("0")
             computed_count = 0
+            signal_reference_count = 0
+            fallback_reference_count = 0
             favorable_count = 0
             unfavorable_count = 0
             flat_count = 0
 
             for row in buy_rows:
-                estimated_price = cls._to_decimal_value(row.get("estimated_price"))
+                signal_reference = cls._signal_reference_price_observation(row)
+                signal_reference_price = cls._to_decimal_value(signal_reference.get("price"))
+                order_estimated_price = cls._to_decimal_value(row.get("estimated_price"))
+                if signal_reference_price is not None:
+                    estimated_price = signal_reference_price
+                    price_reference_source = signal_reference.get("price_source") or signal_reference.get("raw_source") or "signal_reference_price"
+                    signal_reference_count += 1
+                else:
+                    estimated_price = order_estimated_price
+                    price_reference_source = "order_estimated_price_fallback"
+                    fallback_reference_count += 1
+
                 fill_price = cls._to_decimal_value(row.get("fill_price"))
                 quantity = cls._to_decimal_value(row.get("fill_quantity") or row.get("order_quantity") or row.get("target_quantity"))
                 if estimated_price is None or fill_price is None or estimated_price == 0 or quantity is None:
@@ -2367,6 +2428,10 @@ class ProductionDailyObservationReportBuilder:
                     "symbol": row.get("symbol"),
                     "display_name": row.get("display_name"),
                     "estimated_price": estimated_price,
+                    "signal_reference_price": signal_reference_price,
+                    "order_estimated_price": order_estimated_price,
+                    "price_reference_source": price_reference_source,
+                    "price_reference_date": signal_reference.get("price_date"),
                     "fill_price": fill_price,
                     "quantity": quantity,
                     "gap_amount": gap_amount,
@@ -2388,8 +2453,10 @@ class ProductionDailyObservationReportBuilder:
                 reason = "no_buy_order_rows"
             elif computed_count == 0:
                 status = "WARN"
-                reason = "no_buy_rows_with_estimated_and_fill_price"
+                reason = "no_buy_rows_with_signal_or_estimated_and_fill_price"
             else:
+                if fallback_reference_count > 0:
+                    warning_reasons.append("signal_reference_price_missing_using_order_estimated_price")
                 if (avg_gap_ratio is not None and avg_gap_ratio > Decimal("0.005")) or (
                     weighted_gap_ratio is not None and weighted_gap_ratio > Decimal("0.005")
                 ):
@@ -2416,6 +2483,8 @@ class ProductionDailyObservationReportBuilder:
                 "scope": "production_observation_next_open_price_quality_not_buy_point_engine",
                 "buy_order_count": len(buy_rows),
                 "computed_count": computed_count,
+                "signal_reference_count": signal_reference_count,
+                "fallback_reference_count": fallback_reference_count,
                 "favorable_gap_count": favorable_count,
                 "unfavorable_gap_count": unfavorable_count,
                 "flat_gap_count": flat_count,
@@ -2437,7 +2506,7 @@ class ProductionDailyObservationReportBuilder:
         return {
             "status": status,
             "reason": reason,
-            "scope": "production_observation_price_gap_from_estimated_signal_price_to_next_open_fill",
+            "scope": "production_observation_price_gap_from_signal_reference_to_next_open_fill",
             "campaigns": campaign_rows,
         }
 
@@ -4391,12 +4460,12 @@ class ProductionDailyObservationReportBuilder:
             f"- status: `{buy_price_quality.get('status')}` / reason: `{self._md_cell(buy_price_quality.get('reason'))}`",
             f"- scope: `{self._md_cell(buy_price_quality.get('scope'))}`",
             "",
-            "| campaign | status | buy | computed | favorable | unfavorable | avg_gap | weighted_gap | estimated_gap_cost | reason |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| campaign | status | buy | computed | signal_ref | fallback_ref | favorable | unfavorable | avg_gap | weighted_gap | estimated_gap_cost | reason |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
         campaigns = buy_price_quality.get("campaigns") or []
         if not campaigns:
-            lines.append("| None | WARN | 0 | 0 | 0 | 0 |  |  |  | no_campaign_quality_rows |")
+            lines.append("| None | WARN | 0 | 0 | 0 | 0 | 0 | 0 |  |  |  | no_campaign_quality_rows |")
             return lines
         for row in campaigns:
             lines.append(
@@ -4405,6 +4474,8 @@ class ProductionDailyObservationReportBuilder:
                 f"{self._md_cell(row.get('status'))} | "
                 f"{row.get('buy_order_count')} | "
                 f"{row.get('computed_count')} | "
+                f"{row.get('signal_reference_count')} | "
+                f"{row.get('fallback_reference_count')} | "
                 f"{row.get('favorable_gap_count')} | "
                 f"{row.get('unfavorable_gap_count')} | "
                 f"{self._fmt_percent(row.get('avg_gap_ratio'), 2)} | "
@@ -4419,8 +4490,8 @@ class ProductionDailyObservationReportBuilder:
                     "",
                     f"### 0.9 Campaign: {self._md_cell(row.get('campaign_code'))} 不利跳空 Top",
                     "",
-                    "| rank | code | name | estimated_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost |",
-                    "|---:|---|---|---:|---:|---:|---:|---:|---:|",
+                    "| rank | code | name | reference_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost | reference_source |",
+                    "|---:|---|---|---:|---:|---:|---:|---:|---:|---|",
                 ])
                 for detail in worst_rows[:5]:
                     lines.append(
@@ -4433,15 +4504,16 @@ class ProductionDailyObservationReportBuilder:
                         f"{self._fmt_quantity(detail.get('quantity'))} | "
                         f"{self._fmt_decimal(detail.get('gap_amount'), 4)} | "
                         f"{self._fmt_percent(detail.get('gap_ratio'), 2)} | "
-                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} |"
+                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} | "
+                        f"{self._md_cell(detail.get('price_reference_source'))} |"
                     )
             if best_rows:
                 lines.extend([
                     "",
                     f"### 0.9 Campaign: {self._md_cell(row.get('campaign_code'))} 有利跳空 Top",
                     "",
-                    "| rank | code | name | estimated_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost |",
-                    "|---:|---|---|---:|---:|---:|---:|---:|---:|",
+                    "| rank | code | name | reference_price | fill_price | qty | gap | gap_ratio | estimated_gap_cost | reference_source |",
+                    "|---:|---|---|---:|---:|---:|---:|---:|---:|---|",
                 ])
                 for detail in best_rows[:5]:
                     lines.append(
@@ -4454,7 +4526,8 @@ class ProductionDailyObservationReportBuilder:
                         f"{self._fmt_quantity(detail.get('quantity'))} | "
                         f"{self._fmt_decimal(detail.get('gap_amount'), 4)} | "
                         f"{self._fmt_percent(detail.get('gap_ratio'), 2)} | "
-                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} |"
+                        f"{self._fmt_money(detail.get('estimated_gap_cost'))} | "
+                        f"{self._md_cell(detail.get('price_reference_source'))} |"
                     )
         return lines
 
