@@ -1785,6 +1785,9 @@ class ProductionDailyObservationReportBuilder:
             "report_date": report_date,
             "signal_as_of_date": signal_as_of_date,
             "next_trade_date": next_trade_date,
+            "next_plan_signal_as_of_date": None,
+            "next_plan_signal_run_id": None,
+            "next_plan_signal_effective_date": None,
             "current_position_run_id": current_position_run_id,
             "status": "WARN",
             "reason": None,
@@ -1798,6 +1801,9 @@ class ProductionDailyObservationReportBuilder:
             "planned_buy_rows": [],
             "planned_sell_rows": [],
             "planned_hold_rows": [],
+            "planned_buy_preview_count": 0,
+            "planned_sell_preview_count": 0,
+            "planned_hold_preview_count": 0,
             "current_position_review_rows": [],
         }
         if portfolio_id is None:
@@ -1819,7 +1825,10 @@ class ProductionDailyObservationReportBuilder:
             order_rows = self._next_trade_order_rows(
                 portfolio_id=portfolio_id,
                 next_trade_date=next_trade_date,
-                limit=detail_limit,
+                # Fetch enough rows to calculate true side counts even when the
+                # markdown preview is capped by detail_limit.  A 30-stock rebalance
+                # can produce 60 order rows (30 SELL + 30 BUY).
+                limit=max(detail_limit * 4, 200),
             )
             missing_target_rows = self._next_trade_missing_from_target_rows(
                 portfolio_id=portfolio_id,
@@ -1836,8 +1845,18 @@ class ProductionDailyObservationReportBuilder:
 
         if target_rows:
             plan["target_run_id"] = target_rows[0].get("target_run_id")
+            plan["next_plan_signal_run_id"] = target_rows[0].get("source_signal_run_id")
+            plan["next_plan_signal_as_of_date"] = target_rows[0].get("source_signal_as_of_date")
+            plan["next_plan_signal_effective_date"] = target_rows[0].get("source_signal_effective_date")
         if order_rows:
             plan["order_run_id"] = order_rows[0].get("order_run_id")
+            if plan.get("next_plan_signal_run_id") is None:
+                for row in order_rows:
+                    if row.get("source_signal_run_id") is not None:
+                        plan["next_plan_signal_run_id"] = row.get("source_signal_run_id")
+                        plan["next_plan_signal_as_of_date"] = row.get("source_signal_as_of_date")
+                        plan["next_plan_signal_effective_date"] = row.get("source_signal_effective_date")
+                        break
 
         if order_rows:
             buy_rows = [row for row in order_rows if str(row.get("order_side") or "").upper() == "BUY"]
@@ -1875,6 +1894,9 @@ class ProductionDailyObservationReportBuilder:
         plan["planned_buy_count"] = len(buy_rows)
         plan["planned_sell_count"] = len(sell_rows)
         plan["planned_hold_count"] = len(hold_rows)
+        plan["planned_buy_preview_count"] = len(plan["planned_buy_rows"])
+        plan["planned_sell_preview_count"] = len(plan["planned_sell_rows"])
+        plan["planned_hold_preview_count"] = len(plan["planned_hold_rows"])
         plan["planned_review_count"] = len(plan.get("current_position_review_rows") or [])
         return plan
 
@@ -1917,6 +1939,9 @@ class ProductionDailyObservationReportBuilder:
             t.target_quantity,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
+            ss.run_id as source_signal_run_id,
+            ss.as_of_date as source_signal_as_of_date,
+            ss.effective_date as source_signal_effective_date,
             ss.rank_in_batch as source_rank,
             ss.reason_code as signal_reason_code,
             cp.current_quantity,
@@ -1988,6 +2013,9 @@ class ProductionDailyObservationReportBuilder:
             t.target_weight,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
+            ss.run_id as source_signal_run_id,
+            ss.as_of_date as source_signal_as_of_date,
+            ss.effective_date as source_signal_effective_date,
             ss.rank_in_batch as source_rank,
             ss.reason_code as signal_reason_code,
             upper(o.order_side) as plan_action,
@@ -2048,6 +2076,9 @@ class ProductionDailyObservationReportBuilder:
             0::numeric as target_quantity,
             null::text as target_reason_code,
             null::text as target_status_reason,
+            null::bigint as source_signal_run_id,
+            null::date as source_signal_as_of_date,
+            null::date as source_signal_effective_date,
             null::integer as source_rank,
             null::text as signal_reason_code,
             p.quantity as current_quantity,
@@ -4908,10 +4939,11 @@ class ProductionDailyObservationReportBuilder:
             f"- scope: `{next_trade_plan.get('scope')}`",
             f"- status: `{next_trade_plan.get('status')}` / reason: `{next_trade_plan.get('reason')}`",
             f"- report_date: `{self._json_default(next_trade_plan.get('report_date'))}` / signal_as_of_date: `{self._json_default(next_trade_plan.get('signal_as_of_date'))}` / next_trade_date: `{self._json_default(next_trade_plan.get('next_trade_date'))}`",
+            "- date_semantics: 今日执行观察使用 report signal_as_of_date；下一交易日计划使用 campaign 级 next_plan_signal_as_of_date。",
             f"- note: {next_trade_plan.get('note')}",
             "",
-            "| campaign | status | plan_basis | target_run_id | order_run_id | planned_buy | planned_sell | planned_hold | review | reason |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+            "| campaign | status | plan_basis | target_run_id | order_run_id | planned_buy | planned_sell | planned_hold | preview_buy/sell/hold | review | reason |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
         for plan in next_trade_plan.get("campaigns") or []:
             lines.append(
@@ -4924,6 +4956,7 @@ class ProductionDailyObservationReportBuilder:
                 f"{plan.get('planned_buy_count')} | "
                 f"{plan.get('planned_sell_count')} | "
                 f"{plan.get('planned_hold_count')} | "
+                f"{plan.get('planned_buy_preview_count')}/{plan.get('planned_sell_preview_count')}/{plan.get('planned_hold_preview_count')} | "
                 f"{plan.get('planned_review_count')} | "
                 f"{self._md_cell(plan.get('reason'))} |"
             )
@@ -4937,6 +4970,8 @@ class ProductionDailyObservationReportBuilder:
                 f"- strategy: `{plan.get('strategy_code')}` / `{plan.get('strategy_version_code')}`",
                 f"- portfolio_id: `{plan.get('portfolio_id')}` / current_position_run_id: `{plan.get('current_position_run_id')}`",
                 f"- plan_basis: `{plan.get('plan_basis')}`",
+                f"- next_plan_signal_as_of_date: `{self._json_default(plan.get('next_plan_signal_as_of_date'))}` / next_plan_signal_run_id: `{self._json_default(plan.get('next_plan_signal_run_id'))}` / next_plan_signal_effective_date: `{self._json_default(plan.get('next_plan_signal_effective_date'))}`",
+                f"- preview_count: buy `{plan.get('planned_buy_preview_count')}` / sell `{plan.get('planned_sell_preview_count')}` / hold `{plan.get('planned_hold_preview_count')}`",
                 "",
                 "#### 明日计划买入 / 加仓",
                 "",
