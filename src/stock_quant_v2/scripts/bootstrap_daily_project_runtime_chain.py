@@ -149,11 +149,11 @@ def _normalize_env_value(value: str) -> str:
 
 
 def _load_env_file(project_root: Path, env_file: str | None) -> Path | None:
-    """Load a simple .env.research file without overriding already exported variables.
+    """Load a simple env file without overriding already exported variables.
 
     Precedence is intentionally: CLI args > process environment > env file > defaults.
-    This keeps Docker/cron/shell exports authoritative while still allowing
-    .env.research.production / .env.research.research to provide local defaults.
+    This keeps Docker/cron/shell exports authoritative in production while still
+    allowing local development to fall back to .env.research when present.
     """
     requested = (env_file or os.getenv("SQV2_ENV_FILE") or ".env.research").strip()
     if not requested:
@@ -737,7 +737,7 @@ def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
 
     if not args.skip_m5:
         steps.append(
-            ChainStep("m5_research_refresh", "stock_quant_v2.scripts.bootstrap_m5_research_refresh_chain")
+            ChainStep("m5_daily_refresh", "stock_quant_v2.scripts.bootstrap_m5_research_refresh_chain")
         )
 
     paper_step = _resolve_paper_step(args)
@@ -968,9 +968,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Daily master chain with profile routing. "
-            "runtime = production daily path with m8_daily_ops_entrypoint; "
-            "research = heavy/research path with bootstrap_m8_ops_master_chain; "
-            "full = runtime + research."
+            "runtime = production daily path with production_daily_observation_report and M8 daily ops entrypoint; "
+            "research = heavy/research path that may run bootstrap_m8_ops_master_chain; "
+            "full = runtime + research. Runtime does not require M8 full ops PASS."
         )
     )
     parser.add_argument(
@@ -982,7 +982,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file",
         default=None,
         help=(
-            "Optional .env.research file to load before resolving DailyRun controls. "
+            "Optional env file to load before resolving DailyRun controls. "
+            "Production Docker should use exported/docker-compose env values; local development may fall back to .env.research. "
             "Relative paths are resolved from project root. Default: SQV2_ENV_FILE or .env.research if it exists."
         ),
     )
@@ -1012,7 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-m5",
         action="store_true",
         default=None,
-        help="Skip M5 research refresh chain. Env: SQV2_DAILY_SKIP_M5.",
+        help="Skip the M5 daily refresh step in the selected DailyRun profile. Env: SQV2_DAILY_SKIP_M5.",
     )
     parser.add_argument(
         "--paper-mode",
@@ -1040,9 +1041,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable M8 ops master chain for research/full profiles. "
-            "Use --no-enable-m8-ops-master to disable. "
-            "Env: SQV2_RESEARCH_ENABLE_M8_OPS_MASTER."
+            "Enable M8 ops master chain for research/full profiles only. "
+            "This is not required for production runtime daily observation. "
+            "Use --no-enable-m8-ops-master to disable. Env: SQV2_RESEARCH_ENABLE_M8_OPS_MASTER."
         ),
     )
     parser.add_argument(

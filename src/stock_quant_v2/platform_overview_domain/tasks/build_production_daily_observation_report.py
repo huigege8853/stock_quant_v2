@@ -32,6 +32,8 @@ def _normalize_env_value(value: str) -> str:
 
 
 def _load_env_file(project_root: Path, env_file: str | None) -> Path | None:
+    # Production Docker should rely on exported/docker-compose environment values.
+    # The .env.research fallback is only a local-development convenience and does not override exports.
     requested = (env_file or os.getenv("SQV2_ENV_FILE") or ".env.research").strip()
     if not requested:
         return None
@@ -91,7 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build production daily observation report for DailyRun."
     )
     parser.add_argument("--project-root", default=None)
-    parser.add_argument("--env-file", default=None)
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help=(
+            "Optional env file. Production Docker should use exported/docker-compose env values; "
+            "local development may fall back to .env.research. Env: SQV2_ENV_FILE."
+        ),
+    )
     parser.add_argument("--report-date", default=None, help="Report date in YYYY-MM-DD. Default: latest production snapshot/core data date.")
     parser.add_argument("--campaign-config", default="configs/paper_campaigns/active_campaigns.json")
     parser.add_argument("--execution-context", default="production_paper_campaign")
