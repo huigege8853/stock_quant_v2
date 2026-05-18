@@ -981,6 +981,36 @@ class ProductionDailyObservationReportBuilder:
             ordered.append(text_value)
         return separator.join(ordered) if ordered else None
 
+    @staticmethod
+    def _dedupe_strings(values: Any) -> list[str]:
+        """Return non-empty strings in original order with duplicates removed.
+
+        This helper is used by production daily observation conclusion rendering,
+        where callers need a list for slicing instead of the joined string returned
+        by _dedupe_join().
+        """
+        if values is None:
+            return []
+        if isinstance(values, str):
+            iterable = [values]
+        else:
+            try:
+                iterable = list(values)
+            except TypeError:
+                iterable = [values]
+
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for value in iterable:
+            if value is None:
+                continue
+            text_value = str(value).strip()
+            if not text_value or text_value in seen:
+                continue
+            seen.add(text_value)
+            ordered.append(text_value)
+        return ordered
+
     def _build_market_context(
         self,
         *,
@@ -1604,6 +1634,170 @@ class ProductionDailyObservationReportBuilder:
                 )
         return notes
 
+    @classmethod
+    def _render_market_observation_conclusion(cls, market_context: dict[str, Any]) -> list[str]:
+        """Render production-style market observation conclusions.
+
+        These conclusions are intentionally operational observations. They are derived
+        from the report's own market context and strategy exposure rows; they are not
+        research conclusions, alpha commentary, or trading advice.
+        """
+        breadth = market_context.get("breadth") or {}
+        industry_rows = ((market_context.get("industry_strength") or {}).get("rows") or [])
+        concept_rows = ((market_context.get("concept_strength") or {}).get("rows") or [])
+        alignments = market_context.get("strategy_alignment") or []
+
+        up_ratio = cls._to_decimal_value(breadth.get("up_ratio"))
+        down_ratio = cls._to_decimal_value(breadth.get("down_ratio"))
+        limit_up = cls._optional_int(breadth.get("limit_up_rows")) or 0
+        limit_down = cls._optional_int(breadth.get("limit_down_rows")) or 0
+        breadth_state = str(breadth.get("market_breadth_state") or "UNKNOWN")
+
+        if up_ratio is None:
+            market_bias = "市场宽度数据不足，暂不判断整体强弱。"
+        elif up_ratio <= Decimal("0.40"):
+            market_bias = "市场整体偏弱。"
+        elif up_ratio >= Decimal("0.60"):
+            market_bias = "市场整体偏强。"
+        else:
+            market_bias = "市场整体震荡。"
+
+        breadth_detail = (
+            f"上涨比例 {cls._fmt_percent(up_ratio, 2)}，"
+            f"下跌比例 {cls._fmt_percent(down_ratio, 2)}，"
+            f"涨停 {limit_up} 家，跌停 {limit_down} 家。"
+        )
+        if limit_down > limit_up and limit_down >= 10:
+            money_effect = "跌停数量高于涨停数量，亏钱效应需要重点观察。"
+        elif limit_up >= max(limit_down * 2, 10):
+            money_effect = "涨停数量明显高于跌停数量，局部赚钱效应仍在。"
+        else:
+            money_effect = "涨跌停结构未出现极端失衡。"
+
+        def _tag_name(row: dict[str, Any]) -> str:
+            return str(row.get("tag_name") or row.get("tag") or "").strip()
+
+        def _avg(row: dict[str, Any]) -> Decimal | None:
+            return cls._to_decimal_value(row.get("avg_pct_change") or row.get("market_avg_pct_change"))
+
+        strong_industries = [row for row in industry_rows if (_avg(row) is not None and _avg(row) >= Decimal("0.015"))]
+        strong_concepts = [row for row in concept_rows if (_avg(row) is not None and _avg(row) >= Decimal("0.015") and not cls._is_generic_theme_tag(row))]
+        weak_industries = [row for row in industry_rows if (_avg(row) is not None and _avg(row) <= Decimal("-0.01"))]
+        weak_concepts = [row for row in concept_rows if (_avg(row) is not None and _avg(row) <= Decimal("-0.01") and not cls._is_generic_theme_tag(row))]
+
+        strong_names = [_tag_name(row) for row in (strong_concepts[:3] + strong_industries[:2]) if _tag_name(row)]
+        weak_names = [_tag_name(row) for row in (weak_concepts[:3] + weak_industries[:2]) if _tag_name(row)]
+        if strong_names:
+            strong_line = "强势方向：" + "、".join(cls._dedupe_strings(strong_names)[:5]) + "。"
+        else:
+            strong_line = "强势方向不集中，暂未形成清晰主线。"
+        if weak_names:
+            weak_line = "弱势方向：" + "、".join(cls._dedupe_strings(weak_names)[:5]) + "。"
+        else:
+            weak_line = "弱势方向未明显集中。"
+
+        match_lines: list[str] = []
+        risk_lines: list[str] = []
+        focus_lines: list[str] = []
+        for item in alignments:
+            campaign_code = item.get("campaign_code")
+            selected_stats = item.get("selected_market_stats") or {}
+            selected_avg = cls._to_decimal_value(selected_stats.get("avg_pct_change"))
+            selected_up = selected_stats.get("up_rows")
+            selected_down = selected_stats.get("down_rows")
+            summary = item.get("market_match_summary") or {}
+            top_mainline = summary.get("top_exposure_tag")
+            top_match = summary.get("top_exposure_match_status")
+            strong_count = cls._optional_int(summary.get("strong_tag_count")) or 0
+            weak_count = cls._optional_int(summary.get("weak_tag_count")) or 0
+
+            if top_mainline:
+                match_lines.append(
+                    f"{campaign_code} 当前主线暴露为 {top_mainline}，匹配状态 {top_match or 'UNKNOWN'}。"
+                )
+            if selected_avg is not None:
+                match_lines.append(
+                    f"{campaign_code} 选股当日平均涨跌幅 {cls._fmt_percent(selected_avg, 2)}，上涨 {selected_up} 只，下跌 {selected_down} 只。"
+                )
+            if strong_count > 0 and weak_count > 0:
+                match_lines.append(
+                    f"{campaign_code} 同时存在强势暴露与弱势暴露，需要观察主线分化。"
+                )
+            elif strong_count > 0:
+                match_lines.append(f"{campaign_code} 存在强势方向暴露。")
+            elif weak_count > 0:
+                match_lines.append(f"{campaign_code} 暴露更多偏向弱势方向。")
+
+            exposure_rows: list[dict[str, Any]] = []
+            for exposure_key in ("industry_exposure", "concept_exposure"):
+                exposure_rows.extend((item.get(exposure_key) or {}).get("rows") or [])
+            weak_exposure_names = [
+                _tag_name(row)
+                for row in exposure_rows
+                if row.get("match_status") == "WEAK_EXPOSURE" and not cls._is_generic_theme_tag(row)
+            ]
+            strong_exposure_names = [
+                _tag_name(row)
+                for row in exposure_rows
+                if row.get("match_status") == "STRONG_MATCH" and not cls._is_generic_theme_tag(row)
+            ]
+            if weak_exposure_names:
+                risk_lines.append(
+                    f"{campaign_code} 弱势暴露集中在：" + "、".join(cls._dedupe_strings(weak_exposure_names)[:4]) + "。"
+                )
+            if strong_exposure_names:
+                focus_lines.append(
+                    "关注强势暴露方向是否延续：" + "、".join(cls._dedupe_strings(strong_exposure_names)[:4]) + "。"
+                )
+            if top_mainline:
+                focus_lines.append(f"关注 {top_mainline} 是否继续作为组合主线暴露。")
+
+        if breadth_state == "BREADTH_WEAK" or (up_ratio is not None and up_ratio <= Decimal("0.40")):
+            risk_lines.insert(0, "市场宽度偏弱，需关注弱势扩散对组合的拖累。")
+        elif breadth_state == "BREADTH_STRONG":
+            risk_lines.insert(0, "市场宽度偏强，需关注强势主线是否延续。")
+        else:
+            risk_lines.insert(0, "市场宽度中性，需观察主线轮动是否加快。")
+        if limit_down > limit_up and limit_down >= 10:
+            risk_lines.append("跌停压力偏高，需关注高波动方向回撤。")
+        if strong_names:
+            focus_lines.insert(0, "关注强势方向是否继续扩散：" + "、".join(cls._dedupe_strings(strong_names)[:4]) + "。")
+        if weak_names:
+            focus_lines.append("关注弱势方向是否继续拖累组合：" + "、".join(cls._dedupe_strings(weak_names)[:4]) + "。")
+
+        if not match_lines:
+            match_lines.append("策略与市场匹配数据不足，暂不生成适配度结论。")
+        if not focus_lines:
+            focus_lines.append("关注市场宽度、涨跌停结构和组合主线暴露的变化。")
+
+        return [
+            "",
+            "### 2.9 市场观察结论",
+            "",
+            "#### 2.9.1 市场环境判断",
+            "",
+            f"- {market_bias}",
+            f"- {breadth_detail}",
+            f"- {money_effect}",
+            "",
+            "#### 2.9.2 当前主线状态",
+            "",
+            f"- {strong_line}",
+            f"- {weak_line}",
+            "",
+            "#### 2.9.3 策略适配度观察",
+            "",
+            *[f"- {line}" for line in cls._dedupe_strings(match_lines)[:6]],
+            "",
+            "#### 2.9.4 风险提示",
+            "",
+            *[f"- {line}" for line in cls._dedupe_strings(risk_lines)[:6]],
+            "",
+            "#### 2.9.5 次日观察重点",
+            "",
+            *[f"- {line}" for line in cls._dedupe_strings(focus_lines)[:6]],
+        ]
+
     @staticmethod
     def _classify_breadth(breadth: dict[str, Any]) -> str:
         up_ratio = ProductionDailyObservationReportBuilder._to_decimal_value(breadth.get("up_ratio"))
@@ -1894,6 +2088,7 @@ class ProductionDailyObservationReportBuilder:
             lines.append(
                 f"| {item.get('campaign_code')} | {summary.get('status')} | {summary.get('reason')} | {summary.get('strong_tag_count')} | {summary.get('weak_tag_count')} | {summary.get('generic_tag_filtered_count')} | {summary.get('top_exposure_tag')} | {summary.get('top_exposure_match_status')} | {summary.get('top_generic_tag_filtered') or ''} |"
             )
+        lines.extend(self._render_market_observation_conclusion(market_context))
         lines.extend(["", "## 3. Production Paper Campaigns", ""])
         for campaign in payload.get("campaigns") or []:
             snapshot = campaign.get("snapshot") or {}
