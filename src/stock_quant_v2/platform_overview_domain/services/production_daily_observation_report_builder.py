@@ -223,6 +223,11 @@ class ProductionDailyObservationReportBuilder:
             report_date=resolved_report_date,
             current_payload=payload,
         )
+        payload["continuous_observation"] = self._build_continuous_observation(
+            output_root=output_root,
+            report_date=resolved_report_date,
+            current_payload=payload,
+        )
         payload["artifact_integrity"] = self._build_artifact_integrity(
             project_root=project_root,
             artifact_index=artifact_index,
@@ -2805,6 +2810,284 @@ class ProductionDailyObservationReportBuilder:
             return None
         return Decimal("1") - cash_ratio
 
+
+    def _load_recent_report_payloads(
+        self,
+        *,
+        output_root: Path,
+        report_date: date,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Load recent previous production daily reports for continuity observation.
+
+        This reads already generated production daily observation JSON files only. It
+        does not query new DB tables, does not create new state, and gracefully
+        degrades when history is absent.
+        """
+        if not output_root.exists():
+            return []
+        candidates = sorted(
+            output_root.glob("20??-??-??/production_daily_observation_20??-??-??.json"),
+            reverse=True,
+        )
+        payloads: list[dict[str, Any]] = []
+        seen_dates: set[str] = set()
+        for candidate in candidates:
+            payload = self._read_report_payload_if_previous(candidate, report_date=report_date)
+            if payload is None:
+                continue
+            payload_date = self._json_default(payload.get("report_date"))
+            if payload_date in seen_dates:
+                continue
+            seen_dates.add(str(payload_date))
+            payloads.append(payload)
+            if len(payloads) >= limit:
+                break
+        return payloads
+
+    @classmethod
+    def _campaign_daily_return(cls, payload: dict[str, Any]) -> Decimal | None:
+        campaign = cls._first_campaign_payload(payload)
+        snapshot = campaign.get("snapshot") or {}
+        return cls._to_decimal_value(snapshot.get("daily_return"))
+
+    @classmethod
+    def _campaign_stock_exposure(cls, payload: dict[str, Any]) -> Decimal | None:
+        campaign = cls._first_campaign_payload(payload)
+        risk = campaign.get("risk_metrics") or {}
+        snapshot = campaign.get("snapshot") or {}
+        exposure = risk.get("stock_exposure")
+        if exposure in (None, ""):
+            return cls._derive_stock_exposure_from_snapshot(snapshot)
+        return cls._to_decimal_value(exposure)
+
+    @classmethod
+    def _market_breadth_state_from_payload(cls, payload: dict[str, Any]) -> str | None:
+        breadth = ((payload.get("market_context") or {}).get("breadth") or {})
+        value = breadth.get("market_breadth_state")
+        return str(value) if value not in (None, "") else None
+
+    @classmethod
+    def _streak_from_payloads(
+        cls,
+        payloads: list[dict[str, Any]],
+        predicate,
+    ) -> int:
+        streak = 0
+        for payload in payloads:
+            try:
+                if predicate(payload):
+                    streak += 1
+                    continue
+            except Exception:
+                pass
+            break
+        return streak
+
+    @classmethod
+    def _diff_row(cls, daily_diff: dict[str, Any], metric: str) -> dict[str, Any]:
+        for row in daily_diff.get("rows") or []:
+            if row.get("metric") == metric:
+                return row
+        return {}
+
+    @classmethod
+    def _overlap_ratio_from_diff_row(cls, row: dict[str, Any]) -> Decimal | None:
+        previous_count = cls._to_decimal_value(row.get("previous_value"))
+        overlap_count = cls._to_decimal_value(row.get("delta"))
+        return cls._safe_ratio(overlap_count, previous_count)
+
+    def _build_continuous_observation(
+        self,
+        *,
+        output_root: Path,
+        report_date: date,
+        current_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build continuous-operation observation from existing daily report history.
+
+        This section is production-observation only. It detects whether warnings and
+        strategy/market mismatches are isolated one-day events or short streaks.
+        """
+        history = self._load_recent_report_payloads(output_root=output_root, report_date=report_date, limit=5)
+        timeline = [current_payload, *history]
+        rows: list[dict[str, Any]] = []
+        summary: list[str] = []
+
+        def add(metric: str, status: str, value: Any, threshold: Any, reason: str, action: str = "") -> None:
+            rows.append({
+                "metric": metric,
+                "status": status,
+                "value": value,
+                "threshold": threshold,
+                "reason": reason,
+                "suggested_action": action,
+            })
+
+        history_dates = [self._json_default(item.get("report_date")) for item in history]
+        expected_previous_report_date = self._resolve_signal_as_of_date(report_date)
+        first_history_date = self._to_date(history[0].get("report_date")) if history else None
+        history_is_contiguous = bool(
+            expected_previous_report_date
+            and first_history_date
+            and first_history_date == expected_previous_report_date
+        )
+
+        if len(history) < 2:
+            coverage_status = "WARN"
+            coverage_reason = "insufficient_history_for_continuous_observation"
+        elif not history_is_contiguous:
+            coverage_status = "WARN"
+            coverage_reason = (
+                "latest_history_not_expected_previous_trade_date:"
+                f"{self._json_default(first_history_date)}!={self._json_default(expected_previous_report_date)}"
+            )
+        else:
+            coverage_status = "PASS"
+            coverage_reason = "history_available=" + ",".join(str(x) for x in history_dates[:5])
+
+        add(
+            "history_coverage",
+            coverage_status,
+            len(history),
+            ">=2 previous reports and latest history is expected previous trade date",
+            coverage_reason,
+            "连续日报累积后再判断 streak，不阻塞单日生产日报。" if coverage_status == "WARN" else "",
+        )
+
+        streak_timeline = timeline if history_is_contiguous else [current_payload]
+        streak_scope_reason = (
+            "contiguous_history_available"
+            if history_is_contiguous
+            else "streak_limited_to_current_report_because_previous_report_is_missing_or_stale"
+        )
+
+        weak_breadth_streak = self._streak_from_payloads(
+            streak_timeline,
+            lambda p: self._market_breadth_state_from_payload(p) == "BREADTH_WEAK",
+        )
+        add(
+            "market_breadth_weak_streak",
+            "WARN" if weak_breadth_streak >= 3 else "PASS",
+            weak_breadth_streak,
+            ">=3 days",
+            ("continuous_breadth_weak" if weak_breadth_streak >= 3 else "not_continuous_or_below_threshold")
+            + ";" + streak_scope_reason,
+            "若连续 3 天以上市场宽度偏弱，重点观察高仓位和弱势暴露。",
+        )
+
+        negative_return_streak = self._streak_from_payloads(
+            streak_timeline,
+            lambda p: (self._campaign_daily_return(p) is not None and self._campaign_daily_return(p) < 0),
+        )
+        add(
+            "negative_daily_return_streak",
+            "WARN" if negative_return_streak >= 3 else "PASS",
+            negative_return_streak,
+            ">=3 days",
+            ("portfolio_negative_return_streak" if negative_return_streak >= 3 else "not_continuous_or_below_threshold")
+            + ";" + streak_scope_reason,
+            "若组合连续亏损，进入研究端归因复盘而不是仅看单日波动。",
+        )
+
+        high_exposure_streak = self._streak_from_payloads(
+            streak_timeline,
+            lambda p: (self._campaign_stock_exposure(p) is not None and self._campaign_stock_exposure(p) >= Decimal("0.95")),
+        )
+        add(
+            "high_stock_exposure_streak",
+            "WARN" if high_exposure_streak >= 3 else "PASS",
+            high_exposure_streak,
+            ">=3 days at >=95%",
+            ("continuous_high_stock_exposure" if high_exposure_streak >= 3 else "not_continuous_or_below_threshold")
+            + ";" + streak_scope_reason,
+            "市场偏弱且连续高仓位时，优先观察风控减仓/退出规则是否需要研究端复盘。",
+        )
+
+        mainline_weak_or_neutral_streak = self._streak_from_payloads(
+            streak_timeline,
+            lambda p: str(self._top_mainline_summary(p).get("match") or "").upper() in {"NEUTRAL", "WEAK_EXPOSURE"},
+        )
+        current_mainline = self._top_mainline_summary(current_payload)
+        add(
+            "mainline_neutral_or_weak_streak",
+            "WARN" if mainline_weak_or_neutral_streak >= 3 else "PASS",
+            mainline_weak_or_neutral_streak,
+            ">=3 days",
+            f"current_top_mainline={current_mainline.get('tag')};match={current_mainline.get('match')};{streak_scope_reason}",
+            "若主线连续 NEUTRAL/WEAK，说明策略可能正确运行但没有跟上市场赚钱方向。",
+        )
+
+        daily_diff = current_payload.get("daily_diff") or {}
+        selected_overlap_ratio = self._overlap_ratio_from_diff_row(
+            self._diff_row(daily_diff, "selected_overlap_with_previous_day")
+        )
+        holding_overlap_ratio = self._overlap_ratio_from_diff_row(
+            self._diff_row(daily_diff, "holding_overlap_with_previous_day")
+        )
+        if selected_overlap_ratio is None:
+            add("selected_overlap_stability", "WARN", None, ">=50%", "selected_overlap_not_available", "等待上一日报告可用后再判断选股稳定性。")
+        else:
+            add(
+                "selected_overlap_stability",
+                "WARN" if selected_overlap_ratio < Decimal("0.50") else "PASS",
+                selected_overlap_ratio,
+                ">=50%",
+                f"selected_overlap={self._fmt_percent(selected_overlap_ratio, 2)}",
+                "若低重合不是首次建仓或市场状态切换导致，进入策略稳定性复盘。",
+            )
+        if holding_overlap_ratio is None:
+            add("holding_overlap_stability", "WARN", None, ">=50%", "holding_overlap_not_available", "等待上一日报告可用后再判断持仓稳定性。")
+        else:
+            add(
+                "holding_overlap_stability",
+                "WARN" if holding_overlap_ratio < Decimal("0.50") else "PASS",
+                holding_overlap_ratio,
+                ">=50%",
+                f"holding_overlap={self._fmt_percent(holding_overlap_ratio, 2)}",
+                "若连续低重合，检查是否异常大换仓。",
+            )
+
+        buy_price_quality = current_payload.get("buy_price_quality") or {}
+        gap_warn_count = 0
+        for campaign_quality in buy_price_quality.get("campaigns") or []:
+            weighted_gap_ratio = self._to_decimal_value(campaign_quality.get("weighted_gap_ratio"))
+            if weighted_gap_ratio is not None and weighted_gap_ratio > Decimal("0.005"):
+                gap_warn_count += 1
+        add(
+            "unfavorable_gap_observation",
+            "WARN" if gap_warn_count else "PASS",
+            gap_warn_count,
+            "weighted_gap_ratio > 0.5%",
+            "unfavorable_gap_campaigns=" + str(gap_warn_count),
+            "若持续不利开盘跳空，研究端评估 NEXT_OPEN 入场规则。",
+        )
+
+        warn_count = sum(1 for row in rows if row.get("status") == "WARN")
+        status = "WARN" if warn_count else "PASS"
+        reason = f"history_count={len(history)},warn={warn_count}"
+        if weak_breadth_streak:
+            summary.append(f"weak_breadth_streak={weak_breadth_streak}")
+        if negative_return_streak:
+            summary.append(f"negative_return_streak={negative_return_streak}")
+        if high_exposure_streak:
+            summary.append(f"high_exposure_streak={high_exposure_streak}")
+        if mainline_weak_or_neutral_streak:
+            summary.append(f"mainline_neutral_or_weak_streak={mainline_weak_or_neutral_streak}")
+        return {
+            "status": status,
+            "reason": reason,
+            "scope": "production_continuous_observation_from_existing_daily_reports",
+            "history_count": len(history),
+            "history_dates": history_dates,
+            "expected_previous_report_date": expected_previous_report_date,
+            "first_history_date": first_history_date,
+            "history_is_contiguous": history_is_contiguous,
+            "streak_scope": "history_plus_current" if history_is_contiguous else "current_report_only",
+            "summary": summary,
+            "rows": rows,
+        }
+
     @classmethod
     def _build_report_self_check(cls, payload: dict[str, Any]) -> dict[str, Any]:
         rows: list[dict[str, Any]] = []
@@ -2896,6 +3179,13 @@ class ProductionDailyObservationReportBuilder:
             "daily_diff_section_present",
             "PASS" if daily_diff.get("rows") else "WARN",
             str(daily_diff.get("reason") or "daily_diff_missing"),
+        )
+
+        continuous_observation = payload.get("continuous_observation") or {}
+        add(
+            "continuous_observation_section_present",
+            "PASS" if continuous_observation.get("rows") else "WARN",
+            str(continuous_observation.get("reason") or "continuous_observation_missing"),
         )
 
         statuses = [row.get("status") for row in rows]
@@ -3004,6 +3294,10 @@ class ProductionDailyObservationReportBuilder:
         if buy_price_quality.get("status") == "WARN":
             add("P2", "WARN", "buy_price_quality", str(buy_price_quality.get("reason") or ""), "查看不利开盘跳空 Top，判断 NEXT_OPEN 成本影响。")
 
+        continuous_observation = payload.get("continuous_observation") or {}
+        if continuous_observation.get("status") == "WARN":
+            add("P2", "WARN", "continuous_observation", str(continuous_observation.get("reason") or ""), "查看连续运行观察，区分单日噪声和连续漂移。")
+
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         if breadth.get("market_breadth_state") == "BREADTH_WEAK":
@@ -3034,6 +3328,7 @@ class ProductionDailyObservationReportBuilder:
         artifact_integrity = payload.get("artifact_integrity") or {}
         daily_diff = payload.get("daily_diff") or {}
         buy_price_quality = payload.get("buy_price_quality") or {}
+        continuous_observation = payload.get("continuous_observation") or {}
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         campaigns = payload.get("campaigns") or []
@@ -3065,6 +3360,7 @@ class ProductionDailyObservationReportBuilder:
             "artifact_integrity_status": artifact_integrity.get("status"),
             "daily_diff_status": daily_diff.get("status"),
             "buy_price_quality_status": buy_price_quality.get("status"),
+            "continuous_observation_status": continuous_observation.get("status"),
             "market_breadth_state": breadth.get("market_breadth_state"),
             "cash_ratio": cash_ratio,
             "stock_exposure": stock_exposure,
@@ -3076,6 +3372,7 @@ class ProductionDailyObservationReportBuilder:
         next_trade_plan_sla = payload.get("next_trade_plan_sla") or {}
         daily_diff = payload.get("daily_diff") or {}
         buy_price_quality = payload.get("buy_price_quality") or {}
+        continuous_observation = payload.get("continuous_observation") or {}
         market_context = payload.get("market_context") or {}
         breadth = market_context.get("breadth") or {}
         checklist = [
@@ -3084,7 +3381,8 @@ class ProductionDailyObservationReportBuilder:
             {"priority": "P2", "checked": False, "item": "market breadth 是否持续偏弱", "reason": str(breadth.get("market_breadth_state") or "UNKNOWN")},
             {"priority": "P2", "checked": False, "item": "昨日对比是否异常", "reason": str(daily_diff.get("reason") or "daily_diff_missing")},
             {"priority": "P2", "checked": False, "item": "NEXT_OPEN 买入价格质量是否异常", "reason": str(buy_price_quality.get("reason") or "buy_price_quality_missing")},
-            {"priority": "P2", "checked": False, "item": "主线是否连续 NEUTRAL/WEAK", "reason": "需要主线错位连续观察阶段补充。"},
+            {"priority": "P2", "checked": False, "item": "连续运行观察是否异常", "reason": str(continuous_observation.get("reason") or "continuous_observation_missing")},
+            {"priority": "P2", "checked": False, "item": "主线是否连续 NEUTRAL/WEAK", "reason": ";".join(continuous_observation.get("summary") or []) or "continuous_summary_missing"},
             {"priority": "P2", "checked": False, "item": "是否有接近退出条件的持仓", "reason": "当前仅为生产观察骨架，正式退出规则未落表。"},
             {"priority": "P1", "checked": False, "item": "是否有订单/成交异常", "reason": "查看 Production Paper Campaigns 和风险 / 异常检查。"},
             {"priority": "P2", "checked": False, "item": "是否需要进入研究端复盘", "reason": "若连续跑输、主线错位或选股大换血，再进入研究端复盘。"},
@@ -4332,6 +4630,7 @@ class ProductionDailyObservationReportBuilder:
             f"| artifact_integrity | `{control_panel.get('artifact_integrity_status')}` |",
             f"| daily_diff | `{control_panel.get('daily_diff_status')}` |",
             f"| buy_price_quality | `{control_panel.get('buy_price_quality_status')}` |",
+            f"| continuous_observation | `{control_panel.get('continuous_observation_status')}` |",
             f"| market_breadth_state | `{control_panel.get('market_breadth_state')}` |",
             f"| cash_ratio | `{self._fmt_percent(control_panel.get('cash_ratio'), 2) or 'UNKNOWN'}` |",
             f"| stock_exposure | `{self._fmt_percent(control_panel.get('stock_exposure'), 2) or 'UNKNOWN'}` |",
@@ -4417,6 +4716,40 @@ class ProductionDailyObservationReportBuilder:
                 f"{self._md_cell(row.get('parse_status'))} | "
                 f"{self._md_cell(row.get('status'))} | "
                 f"{self._md_cell(row.get('reason'))} |"
+            )
+        return lines
+
+    def _render_continuous_observation(self, continuous: dict[str, Any]) -> list[str]:
+        lines = [
+            "",
+            "## 0.10 连续运行观察 / Continuous Observation",
+            "",
+            f"- status: `{continuous.get('status')}` / reason: `{self._md_cell(continuous.get('reason'))}`",
+            f"- scope: `{self._md_cell(continuous.get('scope'))}`",
+            f"- history_count: `{continuous.get('history_count')}` / history_dates: `{self._md_cell(','.join(str(x) for x in (continuous.get('history_dates') or [])))}`",
+            f"- expected_previous_report_date: `{self._md_cell(continuous.get('expected_previous_report_date'))}` / first_history_date: `{self._md_cell(continuous.get('first_history_date'))}` / history_is_contiguous: `{continuous.get('history_is_contiguous')}` / streak_scope: `{self._md_cell(continuous.get('streak_scope'))}`",
+        ]
+        summary = continuous.get("summary") or []
+        if summary:
+            lines.append("- summary: " + "; ".join(self._md_cell(item) for item in summary))
+        lines.extend([
+            "",
+            "| metric | status | value | threshold | reason | suggested_action |",
+            "|---|---|---:|---:|---|---|",
+        ])
+        rows = continuous.get("rows") or []
+        if not rows:
+            lines.append("| continuous_observation | WARN |  |  | missing_rows | 检查日报历史产物是否存在。 |")
+            return lines
+        for row in rows[:20]:
+            lines.append(
+                "| "
+                f"{self._md_cell(row.get('metric'))} | "
+                f"{self._md_cell(row.get('status'))} | "
+                f"{self._format_diff_value(row.get('value'))} | "
+                f"{self._md_cell(row.get('threshold'))} | "
+                f"{self._md_cell(row.get('reason'))} | "
+                f"{self._md_cell(row.get('suggested_action'))} |"
             )
         return lines
 
@@ -4981,6 +5314,7 @@ class ProductionDailyObservationReportBuilder:
         lines.extend(self._render_artifact_integrity(payload.get("artifact_integrity") or {}))
         lines.extend(self._render_daily_diff(payload.get("daily_diff") or {}))
         lines.extend(self._render_buy_price_quality(payload.get("buy_price_quality") or {}))
+        lines.extend(self._render_continuous_observation(payload.get("continuous_observation") or {}))
 
         lines.extend([
             "",
