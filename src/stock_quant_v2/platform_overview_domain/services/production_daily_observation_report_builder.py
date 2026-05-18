@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -131,6 +132,12 @@ class ProductionDailyObservationReportBuilder:
             )
             for campaign in production_campaigns
         ]
+        used_date_guard = self._build_used_date_guard(
+            report_date=resolved_report_date,
+            signal_as_of_date=signal_as_of_date,
+            waterline=waterline,
+            campaign_reports=campaign_reports,
+        )
         market_context = self._build_market_context(
             report_date=resolved_report_date,
             campaign_reports=campaign_reports,
@@ -146,6 +153,7 @@ class ProductionDailyObservationReportBuilder:
             production_campaigns=production_campaigns,
             campaign_reports=campaign_reports,
             artifact_index=artifact_index,
+            used_date_guard=used_date_guard,
         )
         overall_status = self._derive_overall_status(checks)
 
@@ -156,7 +164,14 @@ class ProductionDailyObservationReportBuilder:
             "paper_campaign_context": execution_context,
             "daily_profile": runtime_overview.get("daily_profile"),
             "git_commit": runtime_overview.get("git_commit"),
+            "git_branch": runtime_overview.get("git_branch"),
+            "git_dirty": runtime_overview.get("git_dirty"),
+            "git_commit_status": runtime_overview.get("git_commit_status"),
             "docker_container": runtime_overview.get("docker_container"),
+            "docker_image_id": runtime_overview.get("docker_image_id"),
+            "docker_image_digest": runtime_overview.get("docker_image_digest"),
+            "container_started_at": runtime_overview.get("container_started_at"),
+            "runtime_command": runtime_overview.get("runtime_command"),
             "database": runtime_overview.get("database"),
             "runtime_overview": runtime_overview,
             "report_date": resolved_report_date,
@@ -167,6 +182,7 @@ class ProductionDailyObservationReportBuilder:
             "production_campaign_count": len(production_campaigns),
             "overall_status": overall_status,
             "signal_as_of_date": signal_as_of_date,
+            "used_date_guard": used_date_guard,
             "waterline": waterline,
             "data_refresh_summary": data_refresh_summary,
             "feature_readiness": feature_readiness,
@@ -182,6 +198,7 @@ class ProductionDailyObservationReportBuilder:
                 artifact_index=artifact_index,
             ),
         }
+        payload["daily_conclusion"] = self._build_daily_conclusion_summary(payload)
 
         output_dir = output_root / resolved_report_date.isoformat()
         latest_dir = output_root / "latest"
@@ -246,26 +263,112 @@ class ProductionDailyObservationReportBuilder:
 
     def _build_runtime_overview(self, *, project_root: Path) -> dict[str, Any]:
         """Return production daily runtime metadata without changing runtime behavior."""
+        git_commit = self._resolve_git_commit(project_root)
+        git_branch = self._resolve_git_branch(project_root)
+        git_dirty = self._resolve_git_dirty(project_root)
+        docker_image_id = self._first_env(
+            "SQV2_DOCKER_IMAGE_ID",
+            "DOCKER_IMAGE_ID",
+            "IMAGE_ID",
+            "CONTAINER_IMAGE_ID",
+        )
+        docker_image_digest = self._first_env(
+            "SQV2_DOCKER_IMAGE_DIGEST",
+            "DOCKER_IMAGE_DIGEST",
+            "IMAGE_DIGEST",
+            "CONTAINER_IMAGE_DIGEST",
+        )
+        commit_unknown = str(git_commit or "").startswith("UNKNOWN")
         return {
             "daily_profile": os.environ.get("SQV2_DAILY_PROFILE") or "runtime",
-            "git_commit": self._resolve_git_commit(project_root),
+            "git_commit": git_commit,
+            "git_branch": git_branch,
+            "git_dirty": git_dirty,
+            "git_commit_status": "WARN" if commit_unknown else "PASS",
             "docker_container": os.environ.get("HOSTNAME") or socket.gethostname(),
+            "docker_image_id": docker_image_id,
+            "docker_image_digest": docker_image_digest,
+            "container_started_at": self._container_started_at(),
+            "runtime_command": self._runtime_command(),
             "database": self._database_label(),
+            "traceability_status": "WARN" if commit_unknown else "PASS",
+            "traceability_reason": "git_commit_unavailable_in_runtime" if commit_unknown else "git_commit_resolved",
         }
 
     @staticmethod
-    def _resolve_git_commit(project_root: Path) -> str | None:
+    def _first_env(*names: str) -> str | None:
+        for name in names:
+            value = os.environ.get(name)
+            if value:
+                return value
+        return None
+
+    @classmethod
+    def _resolve_git_commit(cls, project_root: Path) -> str:
+        env_commit = cls._first_env(
+            "SQV2_GIT_COMMIT",
+            "GIT_COMMIT",
+            "GIT_SHA",
+            "SOURCE_COMMIT",
+            "COMMIT_SHA",
+            "IMAGE_COMMIT",
+            "BUILD_COMMIT",
+        )
+        if env_commit:
+            return str(env_commit).strip()
+        commit = cls._run_git(project_root, ["rev-parse", "--short", "HEAD"])
+        if commit:
+            return commit
+        return "UNKNOWN_NO_GIT_METADATA"
+
+    @classmethod
+    def _resolve_git_branch(cls, project_root: Path) -> str | None:
+        env_branch = cls._first_env("SQV2_GIT_BRANCH", "GIT_BRANCH", "BRANCH_NAME", "SOURCE_BRANCH")
+        if env_branch:
+            return str(env_branch).strip()
+        branch = cls._run_git(project_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        return branch or None
+
+    @classmethod
+    def _resolve_git_dirty(cls, project_root: Path) -> str:
+        status = cls._run_git(project_root, ["status", "--short"])
+        if status is None:
+            return "UNKNOWN"
+        return "true" if status.strip() else "false"
+
+    @staticmethod
+    def _run_git(project_root: Path, args: list[str]) -> str | None:
         try:
             result = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
+                ["git", *args],
                 cwd=str(project_root),
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=3,
             )
-            commit = (result.stdout or "").strip()
-            return commit or None
+            if result.returncode != 0:
+                return None
+            value = (result.stdout or "").strip()
+            return value or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _container_started_at() -> str | None:
+        try:
+            proc_1 = Path("/proc/1")
+            if proc_1.exists():
+                return datetime.utcfromtimestamp(proc_1.stat().st_ctime).isoformat()
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _runtime_command() -> str | None:
+        try:
+            command = " ".join(str(part) for part in sys.argv if part is not None).strip()
+            return command or None
         except Exception:
             return None
 
@@ -1293,6 +1396,192 @@ class ProductionDailyObservationReportBuilder:
             ordered.append(text_value)
         return ordered
 
+    def _build_used_date_guard(
+        self,
+        *,
+        report_date: date,
+        signal_as_of_date: date,
+        waterline: list[dict[str, Any]],
+        campaign_reports: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Describe which dates are available vs. actually used by the production report."""
+        max_dates = [
+            self._to_date(row.get("max_date"))
+            for row in waterline
+            if row.get("max_date") is not None
+            and row.get("freshness_basis") != "reference_data"
+            and row.get("table_name") != "meta_trading_calendar"
+        ]
+        latest_available_date = max((d for d in max_dates if d is not None), default=None)
+        details: list[dict[str, Any]] = []
+        status = "PASS"
+        reasons: list[str] = []
+
+        def add_detail(name: str, used_date: Any, expected_max: Any, detail_status: str, reason: str) -> None:
+            nonlocal status
+            details.append({
+                "check_name": name,
+                "used_date": self._to_date(used_date),
+                "expected_max_date": self._to_date(expected_max),
+                "status": detail_status,
+                "reason": reason,
+            })
+            if detail_status == "FAIL":
+                status = "FAIL"
+            elif detail_status == "WARN" and status != "FAIL":
+                status = "WARN"
+
+        if signal_as_of_date > report_date:
+            add_detail("signal_as_of_date_not_future", signal_as_of_date, report_date, "FAIL", "signal_as_of_date_after_report_date")
+            reasons.append("signal_as_of_date_after_report_date")
+        else:
+            add_detail("signal_as_of_date_not_future", signal_as_of_date, report_date, "PASS", "signal_as_of_date<=report_date")
+
+        for campaign in campaign_reports:
+            campaign_code = str(campaign.get("campaign_code") or "")
+            selection = campaign.get("selection_summary") or {}
+            source_signal_run_id = selection.get("source_signal_run_id")
+            if source_signal_run_id is not None:
+                signal_max_date = self._safe_scalar(
+                    "select max(as_of_date) from public.strategy_signal where run_id = :run_id",
+                    {"run_id": source_signal_run_id},
+                )
+                signal_max_date = self._to_date(signal_max_date)
+                if signal_max_date is None:
+                    add_detail(f"{campaign_code}:source_signal_run_date", None, signal_as_of_date, "WARN", f"source_signal_run_id={source_signal_run_id};no_signal_date")
+                elif signal_max_date > signal_as_of_date:
+                    add_detail(f"{campaign_code}:source_signal_run_date", signal_max_date, signal_as_of_date, "FAIL", f"source_signal_run_id={source_signal_run_id};source_signal_after_signal_as_of_date")
+                    reasons.append(f"{campaign_code}:source_signal_after_signal_as_of_date")
+                else:
+                    add_detail(f"{campaign_code}:source_signal_run_date", signal_max_date, signal_as_of_date, "PASS", f"source_signal_run_id={source_signal_run_id};source_signal_date<=signal_as_of_date")
+
+            target_date = self._to_date(selection.get("effective_date"))
+            if target_date is not None:
+                add_detail(
+                    f"{campaign_code}:target_effective_date",
+                    target_date,
+                    report_date,
+                    "PASS" if target_date <= report_date else "FAIL",
+                    "target_effective_date<=report_date" if target_date <= report_date else "target_effective_date_after_report_date",
+                )
+
+            trade = campaign.get("trade_summary") or {}
+            orders = trade.get("orders") or {}
+            fills = trade.get("fills") or {}
+            snapshot = campaign.get("snapshot") or {}
+            for name, used_date in [
+                ("order_effective_date", self._to_date(orders.get("effective_date"))),
+                ("fill_date", self._to_date(fills.get("fill_date"))),
+                ("snapshot_date", self._to_date(snapshot.get("snapshot_date"))),
+            ]:
+                if used_date is None:
+                    continue
+                add_detail(
+                    f"{campaign_code}:{name}",
+                    used_date,
+                    report_date,
+                    "PASS" if used_date <= report_date else "FAIL",
+                    f"{name}<=report_date" if used_date <= report_date else f"{name}_after_report_date",
+                )
+
+        if not reasons:
+            reasons.append("used_signal_date_is_t_minus_1_or_earlier_and_trade_dates_do_not_exceed_report_date")
+
+        return {
+            "latest_available_date": latest_available_date,
+            "used_for_signal_date": signal_as_of_date,
+            "used_for_trade_date": report_date,
+            "future_data_guard_status": status,
+            "future_data_guard_reason": ";".join(reasons),
+            "details": details,
+        }
+
+    @classmethod
+    def _build_daily_conclusion_summary(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        waterline = payload.get("waterline") or []
+        market_context = payload.get("market_context") or {}
+        breadth = market_context.get("breadth") or {}
+        campaigns = payload.get("campaigns") or []
+        first_campaign = campaigns[0] if campaigns else {}
+        runtime = first_campaign.get("runtime_observation") or {}
+        selection = first_campaign.get("selection_summary") or {}
+        trade = first_campaign.get("trade_summary") or {}
+        orders = trade.get("orders") or {}
+        fills = trade.get("fills") or {}
+        snapshot = first_campaign.get("snapshot") or {}
+        risk = first_campaign.get("risk_metrics") or {}
+        used_guard = payload.get("used_date_guard") or {}
+        market_alignment = market_context.get("strategy_alignment") or []
+        first_alignment = market_alignment[0] if market_alignment else {}
+
+        failed = [row for row in waterline if row.get("status") == "FAIL"]
+        warns = [row for row in waterline if row.get("status") == "WARN"]
+        if failed:
+            data_status = "FAIL"
+            data_summary = "关键数据水位存在 FAIL：" + ", ".join(str(x.get("table_name")) for x in failed[:5])
+        elif warns:
+            data_status = "WARN"
+            data_summary = "存在非关键数据水位 WARN：" + ", ".join(str(x.get("table_name")) for x in warns[:5])
+        else:
+            data_status = "PASS"
+            data_summary = "关键数据水位满足本次生产观察要求。"
+
+        market_state = breadth.get("market_breadth_state") or "UNKNOWN"
+        market_summary = (
+            f"{market_state}; 上涨比例 {cls._fmt_percent(breadth.get('up_ratio'), 2)}，"
+            f"下跌比例 {cls._fmt_percent(breadth.get('down_ratio'), 2)}，"
+            f"涨停 {breadth.get('limit_up_rows')}，跌停 {breadth.get('limit_down_rows')}。"
+        )
+
+        buy_count = cls._optional_int((orders or {}).get("buy_order_count")) or 0
+        sell_count = cls._optional_int((orders or {}).get("sell_order_count")) or 0
+        fill_count = cls._optional_int((fills or {}).get("fill_count")) or 0
+        action_summary = (
+            f"{runtime.get('runtime_action') or 'UNKNOWN'}; "
+            f"selected={selection.get('selected_count')}, buy={buy_count}, sell={sell_count}, fill={fill_count}."
+        )
+
+        portfolio_summary = (
+            f"daily_return={cls._fmt_percent(snapshot.get('daily_return'), 4)}, "
+            f"daily_pnl={cls._fmt_money(snapshot.get('daily_pnl'))}, "
+            f"cash_ratio={cls._fmt_percent(risk.get('cash_ratio'), 2)}, "
+            f"stock_exposure={cls._fmt_percent(risk.get('stock_exposure'), 2)}."
+        )
+
+        risk_items: list[str] = []
+        if str(market_state) == "BREADTH_WEAK":
+            risk_items.append("市场宽度偏弱")
+        stock_exposure = cls._to_decimal_value(risk.get("stock_exposure"))
+        if stock_exposure is not None and stock_exposure >= Decimal("0.95"):
+            risk_items.append(f"股票仓位较高 {cls._fmt_percent(stock_exposure, 2)}")
+        if str(used_guard.get("future_data_guard_status")) != "PASS":
+            risk_items.append(f"future_data_guard={used_guard.get('future_data_guard_status')}")
+        if payload.get("git_commit_status") == "WARN":
+            risk_items.append("git_commit 未解析到真实提交号")
+        risk_summary = "；".join(risk_items) if risk_items else "未发现需要置顶的生产观察风险。"
+
+        focus_items: list[str] = []
+        top_mainline = first_alignment.get("top_mainline_tag")
+        if top_mainline:
+            focus_items.append(f"观察主线暴露 {top_mainline} 是否延续")
+        for note in (market_context.get("summary") or [])[:3]:
+            if "strong_concept" in str(note) or "strong_industry" in str(note):
+                focus_items.append(str(note))
+        if not focus_items:
+            focus_items.append("观察市场宽度、主线强弱和组合暴露变化")
+        focus_summary = "；".join(cls._dedupe_strings(focus_items)[:4])
+
+        return [
+            {"item": "今日生产状态", "status": payload.get("overall_status"), "summary": "production_daily_observation_report 已生成。"},
+            {"item": "数据状态", "status": data_status, "summary": data_summary},
+            {"item": "数据使用语义", "status": used_guard.get("future_data_guard_status"), "summary": f"signal_date={cls._json_default(used_guard.get('used_for_signal_date'))}; trade_date={cls._json_default(used_guard.get('used_for_trade_date'))}; {used_guard.get('future_data_guard_reason')}"},
+            {"item": "市场状态", "status": market_context.get("status"), "summary": market_summary},
+            {"item": "策略动作", "status": first_campaign.get("status"), "summary": action_summary},
+            {"item": "组合表现", "status": first_campaign.get("status"), "summary": portfolio_summary},
+            {"item": "主要风险", "status": "WARN" if risk_items else "PASS", "summary": risk_summary},
+            {"item": "次日观察重点", "status": "INFO", "summary": focus_summary},
+        ]
+
     def _build_market_context(
         self,
         *,
@@ -2221,6 +2510,7 @@ class ProductionDailyObservationReportBuilder:
         production_campaigns: list[dict[str, Any]],
         campaign_reports: list[dict[str, Any]],
         artifact_index: list[dict[str, Any]],
+        used_date_guard: dict[str, Any],
     ) -> list[dict[str, Any]]:
         checks: list[dict[str, Any]] = []
         failed_critical = [row for row in waterline if row.get("critical") and row.get("status") == "FAIL"]
@@ -2251,6 +2541,11 @@ class ProductionDailyObservationReportBuilder:
             "check_name": "production_artifacts_present",
             "status": "PASS" if artifact_index else "WARN",
             "reason": f"artifact_count={len(artifact_index)}",
+        })
+        checks.append({
+            "check_name": "future_data_guard",
+            "status": used_date_guard.get("future_data_guard_status") or "WARN",
+            "reason": used_date_guard.get("future_data_guard_reason") or "not_checked",
         })
         return checks
 
@@ -2326,11 +2621,51 @@ class ProductionDailyObservationReportBuilder:
             f"| report_context | `{payload.get('report_context')}` |",
             f"| daily_profile | `{payload.get('daily_profile')}` |",
             f"| git_commit | `{payload.get('git_commit')}` |",
+            f"| git_branch | `{payload.get('git_branch')}` |",
+            f"| git_dirty | `{payload.get('git_dirty')}` |",
+            f"| git_commit_status | `{payload.get('git_commit_status')}` |",
             f"| docker_container | `{payload.get('docker_container')}` |",
+            f"| docker_image_id | `{payload.get('docker_image_id')}` |",
+            f"| docker_image_digest | `{payload.get('docker_image_digest')}` |",
+            f"| container_started_at | `{payload.get('container_started_at')}` |",
+            f"| runtime_command | `{self._md_cell(payload.get('runtime_command'))}` |",
             f"| database | `{payload.get('database')}` |",
             f"| paper_campaign_context | `{payload.get('paper_campaign_context')}` |",
             f"| signal_as_of_date | `{self._json_default(payload.get('signal_as_of_date'))}` |",
             f"| overall_status | `{payload.get('overall_status')}` |",
+            "",
+            "## 0.1 今日结论",
+            "",
+            "| item | status | summary |",
+            "|---|---|---|",
+        ])
+        for row in payload.get("daily_conclusion") or []:
+            lines.append(
+                f"| {self._md_cell(row.get('item'))} | {self._md_cell(row.get('status'))} | {self._md_cell(row.get('summary'))} |"
+            )
+
+        used_guard = payload.get("used_date_guard") or {}
+        lines.extend([
+            "",
+            "## 0.2 数据使用语义 / Future Data Guard",
+            "",
+            "| field | value |",
+            "|---|---|",
+            f"| latest_available_date | `{self._json_default(used_guard.get('latest_available_date'))}` |",
+            f"| used_for_signal_date | `{self._json_default(used_guard.get('used_for_signal_date'))}` |",
+            f"| used_for_trade_date | `{self._json_default(used_guard.get('used_for_trade_date'))}` |",
+            f"| future_data_guard_status | `{used_guard.get('future_data_guard_status')}` |",
+            f"| future_data_guard_reason | `{self._md_cell(used_guard.get('future_data_guard_reason'))}` |",
+            "",
+            "| check | used_date | expected_max_date | status | reason |",
+            "|---|---:|---:|---|---|",
+        ])
+        for row in (used_guard.get("details") or [])[:20]:
+            lines.append(
+                f"| {self._md_cell(row.get('check_name'))} | {self._json_default(row.get('used_date'))} | {self._json_default(row.get('expected_max_date'))} | {row.get('status')} | {self._md_cell(row.get('reason'))} |"
+            )
+
+        lines.extend([
             "",
             "## 1. 数据水位",
             "",
@@ -2697,6 +3032,13 @@ class ProductionDailyObservationReportBuilder:
             return ""
         quant = Decimal("1").scaleb(-places)
         return f"{(decimal_value * Decimal('100')).quantize(quant)}%"
+
+    @staticmethod
+    def _md_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        text_value = str(value).replace("\r", " ").replace("\n", " ").replace("|", "/")
+        return text_value[:500]
 
     @classmethod
     def _csv_cell(cls, value: Any) -> str:
