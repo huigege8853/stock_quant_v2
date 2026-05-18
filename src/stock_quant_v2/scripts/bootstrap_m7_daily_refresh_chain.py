@@ -20,6 +20,9 @@ from stock_quant_v2.trading_domain.tasks.build_target_positions import (
 from stock_quant_v2.trading_domain.tasks.run_paper_trading_daily import (
     run_paper_trading_daily,
 )
+from stock_quant_v2.trading_domain.services.paper_rebalance_service import (
+    PaperRebalanceService,
+)
 
 from stock_quant_v2.trading_domain.constants import (
     DEFAULT_PORTFOLIO_CONSTRUCTION_MODE,
@@ -523,6 +526,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-signal-run-id", type=int, default=None)
     parser.add_argument("--source-screen-request-id", type=int, default=None)
     parser.add_argument("--replace-existing", action="store_true")
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help=(
+            "Generate next-trade target/order plan only. "
+            "This mode writes target/order rows but must not write fill, position, or snapshot rows."
+        ),
+    )
     return parser
 
 
@@ -540,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         latest_completed_bar_date = _resolve_latest_available_bar_date(session)
         effective_date = date.fromisoformat(args.effective_date) if args.effective_date else latest_completed_bar_date
 
-        if effective_date > latest_completed_bar_date:
+        if effective_date > latest_completed_bar_date and not args.plan_only:
             raise RuntimeError(
                 "M7 daily refresh refuses to execute beyond completed market data: "
                 f"paper_execution_date={effective_date}, "
@@ -583,11 +594,23 @@ def main(argv: list[str] | None = None) -> int:
             if signal_effective_date == effective_date
             else "CARRY_LATEST_AVAILABLE_SIGNAL"
         )
+        if args.plan_only and signal_effective_date != effective_date:
+            raise RuntimeError(
+                "M7 plan-only refuses carried signals: "
+                f"signal_effective_date={signal_effective_date}, "
+                f"plan_effective_date={effective_date}. "
+                "Generate next-trade plans only from an exact next-trade signal."
+            )
         print(
             json.dumps(
                 {
                     "module": "M7.date_alignment",
-                    "date_policy": "paper_execution_date defaults to latest completed core_daily_bar date",
+                    "date_policy": (
+                        "plan_only allows next_trade_date when an exact signal effective_date is provided"
+                        if args.plan_only
+                        else "paper_execution_date defaults to latest completed core_daily_bar date"
+                    ),
+                    "plan_only": bool(args.plan_only),
                     "portfolio_id": portfolio_id,
                     "latest_completed_core_daily_bar_date": latest_completed_bar_date.isoformat(),
                     "paper_execution_date": effective_date.isoformat(),
@@ -625,7 +648,12 @@ def main(argv: list[str] | None = None) -> int:
                 "effective_date": effective_date.isoformat(),
                 "source_signal_effective_date": signal_effective_date.isoformat(),
                 "latest_completed_core_daily_bar_date": latest_completed_bar_date.isoformat(),
-                "date_policy": "paper_execution_date defaults to latest completed core_daily_bar date",
+                "date_policy": (
+                    "plan_only allows next_trade_date when an exact signal effective_date is provided"
+                    if args.plan_only
+                    else "paper_execution_date defaults to latest completed core_daily_bar date"
+                ),
+                "plan_only": bool(args.plan_only),
                 "source_signal_run_id": source_signal_run_id,
                 "source_screen_request_id": source_screen_request_id,
                 "previous_snapshot_run_id": int(previous_snapshot["run_id"]),
@@ -643,6 +671,72 @@ def main(argv: list[str] | None = None) -> int:
             as_of_date=as_of_date,
             effective_date=effective_date,
         )
+
+        if args.plan_only:
+            order_run_id = _create_ops_run(
+                session,
+                run_type="PAPER_TRADING",
+                run_name="M7 Plan Only Rebalance Order",
+                context={
+                    "module": "M7",
+                    "stage": "PLAN_ONLY",
+                    "role": "order",
+                    "portfolio_id": portfolio_id,
+                    "as_of_date": as_of_date.isoformat(),
+                    "effective_date": effective_date.isoformat(),
+                    "source_signal_run_id": source_signal_run_id,
+                    "target_position_run_id": target_position_run_id,
+                    "current_position_run_id": int(previous_position["run_id"]),
+                    "source_effective_date": str(previous_position.get("source_effective_date")),
+                    "replace_existing": bool(args.replace_existing),
+                },
+            )
+            child_run_ids = [order_run_id]
+            session.commit()
+
+            order_result_obj = PaperRebalanceService(session).generate_rebalance_orders(
+                order_run_id=order_run_id,
+                portfolio_id=portfolio_id,
+                current_position_run_id=int(previous_position["run_id"]),
+                target_position_run_id=target_position_run_id,
+                effective_date=effective_date,
+                as_of_date=as_of_date,
+                template_order_run_id=None,
+                target_quantity_source=os.getenv("M7_TARGET_QUANTITY_SOURCE", "AUTO"),
+                replace_existing=bool(args.replace_existing),
+                write_hold_orders=_env_bool("M7_WRITE_HOLD_ORDERS", False),
+            )
+            session.flush()
+
+            _mark_success(session, order_run_id)
+            if root_run_id is not None:
+                _mark_success(session, root_run_id)
+            session.commit()
+
+            result = {
+                "module": "M7.plan_only_next_trade",
+                "plan_only": True,
+                "status": "SUCCESS",
+                "portfolio_id": portfolio_id,
+                "as_of_date": as_of_date.isoformat(),
+                "effective_date": effective_date.isoformat(),
+                "source_signal_run_id": source_signal_run_id,
+                "source_signal_effective_date": signal_effective_date.isoformat(),
+                "source_screen_request_id": source_screen_request_id,
+                "source_position_run_id": int(previous_position["run_id"]),
+                "source_position_effective_date": str(previous_position.get("source_effective_date")),
+                "target_position_run_id": target_position_run_id,
+                "order_run_id": order_run_id,
+                "order_result": asdict(order_result_obj),
+                "forbidden_outputs": {
+                    "fill_run_id": None,
+                    "position_run_id": None,
+                    "snapshot_run_id": None,
+                    "reason": "plan_only mode writes target/order only; fills, positions, and snapshots are intentionally not materialized",
+                },
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return 0
 
         carry_run_id = _create_ops_run(
             session,
