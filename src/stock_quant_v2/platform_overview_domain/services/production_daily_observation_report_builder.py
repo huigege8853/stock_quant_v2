@@ -132,6 +132,14 @@ class ProductionDailyObservationReportBuilder:
             )
             for campaign in production_campaigns
         ]
+        next_trade_date = self._resolve_next_trade_date(resolved_report_date)
+        next_trade_plan = self._build_next_trade_plan(
+            report_date=resolved_report_date,
+            signal_as_of_date=signal_as_of_date,
+            next_trade_date=next_trade_date,
+            campaign_reports=campaign_reports,
+            detail_limit=detail_limit,
+        )
         used_date_guard = self._build_used_date_guard(
             report_date=resolved_report_date,
             signal_as_of_date=signal_as_of_date,
@@ -186,6 +194,8 @@ class ProductionDailyObservationReportBuilder:
             "production_campaign_count": len(production_campaigns),
             "overall_status": overall_status,
             "signal_as_of_date": signal_as_of_date,
+            "next_trade_date": next_trade_date,
+            "next_trade_plan": next_trade_plan,
             "used_date_guard": used_date_guard,
             "waterline": waterline,
             "data_refresh_summary": data_refresh_summary,
@@ -1623,6 +1633,417 @@ class ProductionDailyObservationReportBuilder:
             ordered.append(text_value)
         return ordered
 
+    def _resolve_next_trade_date(self, report_date: date) -> date | None:
+        """Resolve the next open trading day after report_date for production observation.
+
+        This is intentionally read-only. If the trading calendar is unavailable, the
+        next-trade plan section will render a WARN instead of blocking the daily report.
+        """
+        next_trade_date = self._safe_scalar(
+            """
+            select trade_date
+            from public.meta_trading_calendar
+            where is_open = true
+              and trade_date > :report_date
+            order by trade_date asc
+            limit 1
+            """,
+            {"report_date": report_date},
+        )
+        return self._to_date(next_trade_date)
+
+    def _build_next_trade_plan(
+        self,
+        *,
+        report_date: date,
+        signal_as_of_date: date,
+        next_trade_date: date | None,
+        campaign_reports: list[dict[str, Any]],
+        detail_limit: int,
+    ) -> dict[str, Any]:
+        """Build a front-page next-trading-day plan from already materialized production tables.
+
+        The section does not invent buy/sell signals. It only shows next_trade_date
+        target/order rows if they have been materialized by the production chain. When
+        no next-date plan exists yet, the section is WARN and explains that absence is
+        not equivalent to a zero-buy/zero-sell decision.
+        """
+        campaign_plans: list[dict[str, Any]] = []
+        for campaign in campaign_reports:
+            campaign_plans.append(
+                self._build_campaign_next_trade_plan(
+                    campaign=campaign,
+                    report_date=report_date,
+                    signal_as_of_date=signal_as_of_date,
+                    next_trade_date=next_trade_date,
+                    detail_limit=detail_limit,
+                )
+            )
+
+        statuses = [str(item.get("status") or "WARN").upper() for item in campaign_plans]
+        materialized_plans = [
+            item
+            for item in campaign_plans
+            if item.get("plan_basis") not in {
+                "no_next_trade_target_or_order_materialized",
+                "next_trade_date_unresolved",
+                "missing_portfolio_id",
+                "query_failed",
+                "not_checked",
+            }
+        ]
+        query_failed = any(item.get("plan_basis") == "query_failed" for item in campaign_plans)
+        if not campaign_plans:
+            status = "WARN"
+            reason = "no_active_production_campaign"
+        elif any(item.get("next_trade_date") is None for item in campaign_plans):
+            status = "WARN"
+            reason = "next_trade_date_unresolved"
+        elif query_failed:
+            status = "WARN"
+            reason = "next_trade_plan_query_failed"
+        elif materialized_plans:
+            if any(value == "FAIL" for value in statuses):
+                status = "FAIL"
+            elif any(value == "WARN" for value in statuses):
+                status = "WARN"
+            else:
+                status = "PASS"
+            reason = "next_trade_plan_materialized"
+        else:
+            status = "WARN"
+            reason = "no_next_trade_target_or_order_materialized"
+
+        return {
+            "scope": "production_next_trade_plan_observation_not_independent_buy_sell_engine",
+            "report_date": report_date,
+            "signal_as_of_date": signal_as_of_date,
+            "next_trade_date": next_trade_date,
+            "status": status,
+            "reason": reason,
+            "note": (
+                "本节只展示已落表的 next_trade_date target/order。"
+                "若 plan_basis=no_next_trade_target_or_order_materialized，表示当前日报生成时尚未观察到次日计划落表，"
+                "不能解释为正式零买入/零卖出信号。"
+            ),
+            "campaigns": campaign_plans,
+        }
+
+    def _build_campaign_next_trade_plan(
+        self,
+        *,
+        campaign: dict[str, Any],
+        report_date: date,
+        signal_as_of_date: date,
+        next_trade_date: date | None,
+        detail_limit: int,
+    ) -> dict[str, Any]:
+        portfolio_id = self._optional_int(campaign.get("portfolio_id"))
+        snapshot = campaign.get("snapshot") or {}
+        current_position_run_id = self._optional_int(snapshot.get("position_run_id") or snapshot.get("snapshot_run_id"))
+        plan: dict[str, Any] = {
+            "campaign_code": campaign.get("campaign_code"),
+            "portfolio_id": portfolio_id,
+            "strategy_code": campaign.get("strategy_code"),
+            "strategy_version_code": campaign.get("strategy_version_code"),
+            "report_date": report_date,
+            "signal_as_of_date": signal_as_of_date,
+            "next_trade_date": next_trade_date,
+            "current_position_run_id": current_position_run_id,
+            "status": "WARN",
+            "reason": None,
+            "plan_basis": "not_checked",
+            "target_run_id": None,
+            "order_run_id": None,
+            "planned_buy_count": 0,
+            "planned_sell_count": 0,
+            "planned_hold_count": 0,
+            "planned_review_count": 0,
+            "planned_buy_rows": [],
+            "planned_sell_rows": [],
+            "planned_hold_rows": [],
+            "current_position_review_rows": [],
+        }
+        if portfolio_id is None:
+            plan["reason"] = "missing_portfolio_id"
+            plan["plan_basis"] = "missing_portfolio_id"
+            return plan
+        if next_trade_date is None:
+            plan["reason"] = "next_trade_date_unresolved"
+            plan["plan_basis"] = "next_trade_date_unresolved"
+            return plan
+
+        try:
+            target_rows = self._next_trade_target_rows(
+                portfolio_id=portfolio_id,
+                next_trade_date=next_trade_date,
+                current_position_run_id=current_position_run_id,
+                limit=detail_limit,
+            )
+            order_rows = self._next_trade_order_rows(
+                portfolio_id=portfolio_id,
+                next_trade_date=next_trade_date,
+                limit=detail_limit,
+            )
+            missing_target_rows = self._next_trade_missing_from_target_rows(
+                portfolio_id=portfolio_id,
+                next_trade_date=next_trade_date,
+                current_position_run_id=current_position_run_id,
+                limit=detail_limit,
+            )
+        except Exception as exc:
+            self._rollback_session_safely()
+            plan["status"] = "WARN"
+            plan["reason"] = f"query_failed:{type(exc).__name__}:{exc}"
+            plan["plan_basis"] = "query_failed"
+            return plan
+
+        if target_rows:
+            plan["target_run_id"] = target_rows[0].get("target_run_id")
+        if order_rows:
+            plan["order_run_id"] = order_rows[0].get("order_run_id")
+
+        if order_rows:
+            buy_rows = [row for row in order_rows if str(row.get("order_side") or "").upper() == "BUY"]
+            sell_rows = [row for row in order_rows if str(row.get("order_side") or "").upper() == "SELL"]
+            hold_rows = [row for row in target_rows if str(row.get("plan_action") or "").upper() == "HOLD_TARGET"]
+            plan["plan_basis"] = "next_trade_date_order_plan_materialized"
+            plan["status"] = "PASS"
+            plan["reason"] = "next_trade_order_rows_observed"
+        elif target_rows:
+            buy_rows = [
+                row for row in target_rows
+                if str(row.get("plan_action") or "").upper() in {"BUY_NEW_TARGET", "BUY_INCREASE_TARGET"}
+            ]
+            sell_rows = [
+                row for row in target_rows
+                if str(row.get("plan_action") or "").upper() == "SELL_REDUCE_TARGET"
+            ]
+            sell_rows.extend(missing_target_rows)
+            hold_rows = [row for row in target_rows if str(row.get("plan_action") or "").upper() == "HOLD_TARGET"]
+            plan["plan_basis"] = "next_trade_date_target_plan_materialized_without_order"
+            plan["status"] = "PASS"
+            plan["reason"] = "next_trade_target_rows_observed_without_order_rows"
+        else:
+            buy_rows = []
+            sell_rows = []
+            hold_rows = []
+            plan["current_position_review_rows"] = (campaign.get("positions_preview") or [])[: min(detail_limit, 15)]
+            plan["plan_basis"] = "no_next_trade_target_or_order_materialized"
+            plan["status"] = "WARN"
+            plan["reason"] = "当前日报生成时未观察到 next_trade_date 的 target/order；不能解释为正式零买入/零卖出。"
+
+        plan["planned_buy_rows"] = buy_rows[:detail_limit]
+        plan["planned_sell_rows"] = sell_rows[:detail_limit]
+        plan["planned_hold_rows"] = hold_rows[: min(detail_limit, 30)]
+        plan["planned_buy_count"] = len(buy_rows)
+        plan["planned_sell_count"] = len(sell_rows)
+        plan["planned_hold_count"] = len(hold_rows)
+        plan["planned_review_count"] = len(plan.get("current_position_review_rows") or [])
+        return plan
+
+    def _next_trade_target_rows(
+        self,
+        *,
+        portfolio_id: int,
+        next_trade_date: date,
+        current_position_run_id: int | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = """
+        with target_run as (
+            select max(run_id) as target_run_id
+            from public.trading_paper_target_position
+            where portfolio_id = :portfolio_id
+              and effective_date = :next_trade_date
+        ),
+        current_pos as (
+            select
+                instrument_id,
+                quantity as current_quantity,
+                market_value as current_market_value,
+                total_pnl as current_total_pnl,
+                position_status as current_position_status
+            from public.trading_paper_position
+            where portfolio_id = :portfolio_id
+              and run_id = :current_position_run_id
+        )
+        select
+            t.run_id as target_run_id,
+            t.effective_date,
+            t.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            t.rank_no,
+            t.score,
+            t.target_weight,
+            t.target_quantity,
+            t.reason_code as target_reason_code,
+            t.status_reason as target_status_reason,
+            ss.rank_in_batch as source_rank,
+            ss.reason_code as signal_reason_code,
+            cp.current_quantity,
+            cp.current_market_value,
+            cp.current_total_pnl,
+            cp.current_position_status,
+            case
+                when cp.instrument_id is null or coalesce(cp.current_quantity, 0) = 0 then 'BUY_NEW_TARGET'
+                when coalesce(t.target_quantity, 0) > coalesce(cp.current_quantity, 0) then 'BUY_INCREASE_TARGET'
+                when coalesce(t.target_quantity, 0) < coalesce(cp.current_quantity, 0) then 'SELL_REDUCE_TARGET'
+                else 'HOLD_TARGET'
+            end as plan_action,
+            'target_quantity_vs_current_position' as plan_reason
+        from public.trading_paper_target_position t
+        join target_run tr on tr.target_run_id = t.run_id
+        left join current_pos cp on cp.instrument_id = t.instrument_id
+        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.meta_instrument mi on mi.id = t.instrument_id
+        where t.portfolio_id = :portfolio_id
+          and t.effective_date = :next_trade_date
+        order by t.rank_no nulls last, t.score desc nulls last, t.instrument_id
+        limit :limit
+        """
+        return self._rows(
+            sql,
+            {
+                "portfolio_id": portfolio_id,
+                "next_trade_date": next_trade_date,
+                "current_position_run_id": current_position_run_id,
+                "limit": limit,
+            },
+        )
+
+    def _next_trade_order_rows(
+        self,
+        *,
+        portfolio_id: int,
+        next_trade_date: date,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        sql = """
+        with order_run as (
+            select max(run_id) as order_run_id
+            from public.trading_paper_order
+            where portfolio_id = :portfolio_id
+              and effective_date = :next_trade_date
+        )
+        select
+            o.run_id as order_run_id,
+            o.effective_date,
+            o.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            o.order_side,
+            o.order_type,
+            o.price_fill_rule,
+            o.target_quantity,
+            o.order_quantity,
+            o.estimated_price,
+            o.estimated_gross_amount,
+            o.estimated_fee,
+            o.estimated_net_amount,
+            o.status as order_status,
+            o.reject_reason,
+            t.run_id as target_run_id,
+            t.rank_no,
+            t.score,
+            t.target_weight,
+            t.reason_code as target_reason_code,
+            t.status_reason as target_status_reason,
+            ss.rank_in_batch as source_rank,
+            ss.reason_code as signal_reason_code,
+            upper(o.order_side) as plan_action,
+            'next_trade_date_order' as plan_reason
+        from public.trading_paper_order o
+        join order_run r on r.order_run_id = o.run_id
+        left join public.trading_paper_target_position t on t.id = o.target_position_id
+        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.meta_instrument mi on mi.id = o.instrument_id
+        where o.portfolio_id = :portfolio_id
+          and o.effective_date = :next_trade_date
+        order by case when upper(o.order_side) = 'SELL' then 0 else 1 end, t.rank_no nulls last, o.id
+        limit :limit
+        """
+        return self._rows(
+            sql,
+            {
+                "portfolio_id": portfolio_id,
+                "next_trade_date": next_trade_date,
+                "limit": limit,
+            },
+        )
+
+    def _next_trade_missing_from_target_rows(
+        self,
+        *,
+        portfolio_id: int,
+        next_trade_date: date,
+        current_position_run_id: int | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if current_position_run_id is None:
+            return []
+        sql = """
+        with target_run as (
+            select max(run_id) as target_run_id
+            from public.trading_paper_target_position
+            where portfolio_id = :portfolio_id
+              and effective_date = :next_trade_date
+        ),
+        target_instruments as (
+            select instrument_id
+            from public.trading_paper_target_position t
+            join target_run tr on tr.target_run_id = t.run_id
+            where t.portfolio_id = :portfolio_id
+              and t.effective_date = :next_trade_date
+        )
+        select
+            null::bigint as target_run_id,
+            :next_trade_date as effective_date,
+            p.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            null::integer as rank_no,
+            null::numeric as score,
+            null::numeric as target_weight,
+            0::numeric as target_quantity,
+            null::text as target_reason_code,
+            null::text as target_status_reason,
+            null::integer as source_rank,
+            null::text as signal_reason_code,
+            p.quantity as current_quantity,
+            p.market_value as current_market_value,
+            p.total_pnl as current_total_pnl,
+            p.position_status as current_position_status,
+            'SELL_CANDIDATE_NOT_IN_NEXT_TARGET' as plan_action,
+            'current_open_position_missing_from_next_target' as plan_reason
+        from public.trading_paper_position p
+        left join public.meta_instrument mi on mi.id = p.instrument_id
+        where p.portfolio_id = :portfolio_id
+          and p.run_id = :current_position_run_id
+          and upper(coalesce(p.position_status, '')) = 'OPEN'
+          and coalesce(p.quantity, 0) > 0
+          and not exists (
+              select 1
+              from target_instruments ti
+              where ti.instrument_id = p.instrument_id
+          )
+        order by p.market_value desc nulls last, p.instrument_id
+        limit :limit
+        """
+        return self._rows(
+            sql,
+            {
+                "portfolio_id": portfolio_id,
+                "next_trade_date": next_trade_date,
+                "current_position_run_id": current_position_run_id,
+                "limit": limit,
+            },
+        )
+
     def _build_used_date_guard(
         self,
         *,
@@ -3022,6 +3443,157 @@ class ProductionDailyObservationReportBuilder:
         return notes
 
 
+    def _render_next_trade_plan(self, next_trade_plan: dict[str, Any]) -> list[str]:
+        if not next_trade_plan:
+            return [
+                "",
+                "## 0.3 次日交易计划 / Next Trading Day Plan",
+                "",
+                "- status: `WARN` / reason: `missing_next_trade_plan`",
+                "",
+            ]
+
+        lines: list[str] = [
+            "",
+            "## 0.3 次日交易计划 / Next Trading Day Plan",
+            "",
+            f"- scope: `{next_trade_plan.get('scope')}`",
+            f"- status: `{next_trade_plan.get('status')}` / reason: `{next_trade_plan.get('reason')}`",
+            f"- report_date: `{self._json_default(next_trade_plan.get('report_date'))}` / signal_as_of_date: `{self._json_default(next_trade_plan.get('signal_as_of_date'))}` / next_trade_date: `{self._json_default(next_trade_plan.get('next_trade_date'))}`",
+            f"- note: {next_trade_plan.get('note')}",
+            "",
+            "| campaign | status | plan_basis | target_run_id | order_run_id | planned_buy | planned_sell | planned_hold | review | reason |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        for plan in next_trade_plan.get("campaigns") or []:
+            lines.append(
+                "| "
+                f"{self._md_cell(plan.get('campaign_code'))} | "
+                f"{self._md_cell(plan.get('status'))} | "
+                f"{self._md_cell(plan.get('plan_basis'))} | "
+                f"{plan.get('target_run_id')} | "
+                f"{plan.get('order_run_id')} | "
+                f"{plan.get('planned_buy_count')} | "
+                f"{plan.get('planned_sell_count')} | "
+                f"{plan.get('planned_hold_count')} | "
+                f"{plan.get('planned_review_count')} | "
+                f"{self._md_cell(plan.get('reason'))} |"
+            )
+
+        for plan in next_trade_plan.get("campaigns") or []:
+            campaign_code = plan.get("campaign_code") or "unknown_campaign"
+            lines.extend([
+                "",
+                f"### 0.3 Campaign: {campaign_code}",
+                "",
+                f"- strategy: `{plan.get('strategy_code')}` / `{plan.get('strategy_version_code')}`",
+                f"- portfolio_id: `{plan.get('portfolio_id')}` / current_position_run_id: `{plan.get('current_position_run_id')}`",
+                f"- plan_basis: `{plan.get('plan_basis')}`",
+                "",
+                "#### 明日计划买入 / 加仓",
+                "",
+            ])
+            lines.extend(
+                self._render_next_trade_plan_action_rows(
+                    rows=plan.get("planned_buy_rows") or [],
+                    empty_note="未观察到 next_trade_date 的 BUY order 或目标加仓候选。",
+                )
+            )
+            lines.extend([
+                "",
+                "#### 明日计划卖出 / 减仓",
+                "",
+            ])
+            lines.extend(
+                self._render_next_trade_plan_action_rows(
+                    rows=plan.get("planned_sell_rows") or [],
+                    empty_note="未观察到 next_trade_date 的 SELL order 或减仓/退出候选；若正式卖点规则尚未落表，不能解释为卖点未触发。",
+                )
+            )
+            lines.extend([
+                "",
+                "#### 明日继续持有 / 观察",
+                "",
+            ])
+            hold_rows = plan.get("planned_hold_rows") or []
+            review_rows = plan.get("current_position_review_rows") or []
+            if hold_rows:
+                lines.extend(
+                    self._render_next_trade_plan_action_rows(
+                        rows=hold_rows,
+                        empty_note="未观察到 next_trade_date 的 HOLD target。",
+                    )
+                )
+            elif review_rows:
+                lines.extend([
+                    "- 当前尚未观察到 next_trade_date target/order，下面仅列出当前持仓，供下一次计划生成后复核；不是正式持有建议。",
+                    "",
+                    "| code | name | quantity | weight | market_value | total_pnl | status | reason |",
+                    "|---|---|---:|---:|---:|---:|---|---|",
+                ])
+                for row in review_rows[:15]:
+                    code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+                    lines.append(
+                        "| "
+                        f"{self._md_cell(code)} | "
+                        f"{self._md_cell(row.get('display_name'))} | "
+                        f"{self._fmt_quantity(row.get('quantity'))} | "
+                        f"{self._fmt_percent(row.get('position_weight'), 2)} | "
+                        f"{self._fmt_money(row.get('market_value'))} | "
+                        f"{self._fmt_money(row.get('total_pnl'))} | "
+                        f"{self._md_cell(row.get('position_status'))} | "
+                        "pending_next_trade_plan_materialization |"
+                    )
+            else:
+                lines.append("- 未观察到 next_trade_date 的 HOLD target，且没有可展示的当前持仓复核列表。")
+            lines.append("")
+        return lines
+
+    def _render_next_trade_plan_action_rows(self, *, rows: list[dict[str, Any]], empty_note: str) -> list[str]:
+        if not rows:
+            return [f"- {empty_note}"]
+        lines = [
+            "| action | code | name | rank | target_weight | current_qty | target_qty | order_qty | price_or_policy | status | reason |",
+            "|---|---|---|---:|---:|---:|---:|---:|---|---|---|",
+        ]
+        for row in rows[:30]:
+            code = row.get("instrument_code") or row.get("symbol") or row.get("instrument_id")
+            action = row.get("plan_action") or row.get("order_side") or "OBSERVE"
+            price_or_policy = self._dedupe_join(
+                [
+                    row.get("price_fill_rule"),
+                    f"estimated_price={self._fmt_money(row.get('estimated_price'))}" if row.get("estimated_price") is not None else None,
+                    row.get("plan_reason"),
+                ],
+                separator="; ",
+            )
+            reason = self._dedupe_join(
+                [
+                    row.get("target_reason_code"),
+                    row.get("signal_reason_code"),
+                    row.get("target_status_reason"),
+                    row.get("reject_reason"),
+                    row.get("plan_reason"),
+                ],
+                separator="; ",
+            )
+            status = row.get("order_status") or row.get("current_position_status") or "TARGET_OBSERVED"
+            lines.append(
+                "| "
+                f"{self._md_cell(action)} | "
+                f"{self._md_cell(code)} | "
+                f"{self._md_cell(row.get('display_name'))} | "
+                f"{row.get('rank_no') or ''} | "
+                f"{self._fmt_percent(row.get('target_weight'), 2)} | "
+                f"{self._fmt_quantity(row.get('current_quantity'))} | "
+                f"{self._fmt_quantity(row.get('target_quantity'))} | "
+                f"{self._fmt_quantity(row.get('order_quantity'))} | "
+                f"{self._md_cell(price_or_policy)} | "
+                f"{self._md_cell(status)} | "
+                f"{self._md_cell(reason)} |"
+            )
+        return lines
+
     def _render_strategy_trade_decision_explanation(
         self,
         campaign: dict[str, Any],
@@ -3284,6 +3856,8 @@ class ProductionDailyObservationReportBuilder:
             lines.append(
                 f"| {self._md_cell(row.get('check_name'))} | {self._json_default(row.get('used_date'))} | {self._json_default(row.get('expected_max_date'))} | {row.get('status')} | {self._md_cell(row.get('reason'))} |"
             )
+
+        lines.extend(self._render_next_trade_plan(payload.get("next_trade_plan") or {}))
 
         lines.extend([
             "",
@@ -3645,6 +4219,10 @@ class ProductionDailyObservationReportBuilder:
         rows.append({"section": "market_context", "source": "market_breadth", "value": (market_context.get("breadth") or {}).get("market_breadth_state"), "status": market_context.get("status")})
         rows.append({"section": "market_context", "source": "industry_strength", "value": (market_context.get("industry_strength") or {}).get("reason"), "status": (market_context.get("industry_strength") or {}).get("status")})
         rows.append({"section": "market_context", "source": "concept_strength", "value": (market_context.get("concept_strength") or {}).get("reason"), "status": (market_context.get("concept_strength") or {}).get("status")})
+        next_trade_plan = payload.get("next_trade_plan") or {}
+        rows.append({"section": "next_trade_plan", "source": "meta_trading_calendar", "value": next_trade_plan.get("next_trade_date"), "status": next_trade_plan.get("status")})
+        for plan in next_trade_plan.get("campaigns") or []:
+            rows.append({"section": "next_trade_plan", "source": plan.get("campaign_code"), "value": plan.get("plan_basis"), "status": plan.get("status")})
         for campaign in payload.get("campaigns") or []:
             rows.append({"section": "campaign", "source": campaign.get("campaign_code"), "value": campaign.get("portfolio_id"), "status": campaign.get("status")})
         return rows
