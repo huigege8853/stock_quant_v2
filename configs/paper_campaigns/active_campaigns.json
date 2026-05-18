@@ -9,11 +9,16 @@
     "initial_cash": 10000000,
     "planned_trading_days": 20,
     "start_trade_date": "2026-05-06",
-    "status": "ACTIVE",
-    "run_mode": "auto",
+    "status": "DISABLED",
+    "run_mode": "manual",
     "target_count": 30,
     "replace_existing": false,
-    "allow_main_portfolio": false
+    "allow_main_portfolio": false,
+    "execution_context": "legacy_paper_campaign",
+    "validation_stage": "Legacy pre-Stage 6.18g",
+    "validation_scope": "Historical forward paper campaign kept for artifact/reference only; disabled from production daily auto run during Stage 6.18h-4B semantics cleanup.",
+    "disabled_stage": "Stage 6.18h-4B",
+    "disabled_reason": "Legacy campaign lacks production_paper_campaign validation semantics; r5 remains the active production daily observation campaign."
   },
   {
     "campaign_code": "sim_regime_sector_industry_v1sm_20d_202605_r5",
