@@ -40,7 +40,18 @@ class PaperCampaignConfigLoader:
         if not isinstance(items, list):
             raise ValueError("paper campaign config must be a list or {'campaigns': [...]} object")
 
-        return [self._parse_item(item) for item in items]
+        # DISABLED campaigns are kept in active_campaigns.json for history and
+        # traceability, but they must not be parsed into runnable M6.5 configs.
+        # This intentionally happens before _parse_item(), because legacy
+        # disabled campaigns may use archival-only values such as
+        # run_mode=manual that are not valid for the automatic daily runner.
+        return [self._parse_item(item) for item in items if not self._is_disabled_item(item)]
+
+    @staticmethod
+    def _is_disabled_item(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        return str(item.get("status") or "ACTIVE").strip().upper() == "DISABLED"
 
     @staticmethod
     def _parse_item(item: dict[str, Any]) -> PaperCampaignConfig:
