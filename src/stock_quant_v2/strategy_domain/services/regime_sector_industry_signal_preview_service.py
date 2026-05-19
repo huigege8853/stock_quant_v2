@@ -37,6 +37,28 @@ V1_1_SCORE_MODE = "M4_V1_1_CONCEPT_CAPITAL_SCORING_PREVIEW_ONLY"
 CONCEPT_TAG_TYPE = "CONCEPT_EM"
 CONCEPT_TAXONOMY_SOURCE = "EASTMONEY"
 INDUSTRY_TAXONOMY_SOURCE = "SW_2021"
+
+# Concept labels from public vendors often include trading channels, market-state
+# tags, style labels, or heat labels. They are useful for observation, but must
+# not be treated as theme/mainline strength in M4 v1.1 scoring preview. This
+# artifact-only filter is intentionally conservative; filtered names are kept in
+# preview outputs for manual review.
+GENERIC_CONCEPT_TAG_NAMES: frozenset[str] = frozenset(
+    {
+        "融资融券", "沪股通", "深股通", "富时罗素", "标普道琼斯A股", "MSCI概念",
+        "证金持股", "QFII重仓", "机构重仓", "社保重仓", "基金重仓",
+        "百元股", "小盘股", "中盘股", "大盘股", "低价股", "高价股",
+        "创业板综", "上证180", "上证380", "深证100R", "中证500", "中证1000", "沪深300",
+        "昨日涨停", "昨日连板", "昨日触板", "昨日高振幅", "昨日高换手",
+        "近期新高", "百日新高", "历史新高", "东方财富热股", "同花顺热股", "热门股",
+        "破净股", "预盈预增", "送转填权", "转债标的", "注册制次新股", "次新股", "ST股",
+    }
+)
+GENERIC_CONCEPT_KEYWORDS: tuple[str, ...] = (
+    "融资融券", "沪股通", "深股通", "QFII", "机构重仓", "基金重仓", "社保重仓",
+    "百元股", "小盘股", "中盘股", "大盘股", "创业板综", "昨日", "新高", "热股",
+    "高振幅", "高换手", "次新股", "ST股",
+)
 DB_ENV_KEYS = (
     "V2_SQLALCHEMY_URL",
     "STOCK_QUANT_V2_DATABASE_URL",
@@ -148,10 +170,20 @@ SIGNAL_PREVIEW_COLUMNS = (
     "concept_score",
     "concept_status",
     "concept_top_drivers_json",
+    "cleaned_concept_count",
+    "cleaned_concept_names",
+    "cleaned_concept_score",
+    "cleaned_concept_status",
+    "cleaned_concept_top_drivers_json",
+    "filtered_generic_concept_count",
+    "filtered_generic_concept_names",
+    "concept_cleaning_status",
     "sw_l2_names",
     "sw_l3_names",
     "v1_1_preview_score",
     "v1_1_score_delta",
+    "cleaned_v1_1_preview_score",
+    "cleaned_v1_1_score_delta",
     "v1_1_scoring_mode",
 )
 
@@ -642,10 +674,20 @@ class RegimeSectorIndustrySignalPreviewService:
                     "concept_score": row.get("concept_score"),
                     "concept_status": row.get("concept_status"),
                     "concept_top_drivers_json": row.get("concept_top_drivers_json"),
+                    "cleaned_concept_count": row.get("cleaned_concept_count"),
+                    "cleaned_concept_names": row.get("cleaned_concept_names"),
+                    "cleaned_concept_score": row.get("cleaned_concept_score"),
+                    "cleaned_concept_status": row.get("cleaned_concept_status"),
+                    "cleaned_concept_top_drivers_json": row.get("cleaned_concept_top_drivers_json"),
+                    "filtered_generic_concept_count": row.get("filtered_generic_concept_count"),
+                    "filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
+                    "concept_cleaning_status": row.get("concept_cleaning_status"),
                     "sw_l2_names": row.get("sw_l2_names"),
                     "sw_l3_names": row.get("sw_l3_names"),
                     "v1_1_preview_score": row.get("v1_1_preview_score"),
                     "v1_1_score_delta": row.get("v1_1_score_delta"),
+                    "cleaned_v1_1_preview_score": row.get("cleaned_v1_1_preview_score"),
+                    "cleaned_v1_1_score_delta": row.get("cleaned_v1_1_score_delta"),
                     "v1_1_scoring_mode": row.get("v1_1_scoring_mode"),
                 }
             )
@@ -685,8 +727,11 @@ class RegimeSectorIndustrySignalPreviewService:
                 "tradable_flag": row.get("feat_tradable_flag"),
                 "capital_activity_score": row.get("capital_activity_score"),
                 "concept_score": row.get("concept_score"),
+                "cleaned_concept_score": row.get("cleaned_concept_score"),
                 "v1_1_preview_score": row.get("v1_1_preview_score"),
                 "v1_1_score_delta": row.get("v1_1_score_delta"),
+                "cleaned_v1_1_preview_score": row.get("cleaned_v1_1_preview_score"),
+                "cleaned_v1_1_score_delta": row.get("cleaned_v1_1_score_delta"),
             },
             "route_config": route_config,
             "market_inputs": {
@@ -703,6 +748,11 @@ class RegimeSectorIndustrySignalPreviewService:
                 "concept_score": row.get("concept_score"),
                 "concept_names": row.get("concept_names"),
                 "concept_top_drivers_json": row.get("concept_top_drivers_json"),
+                "cleaned_concept_score": row.get("cleaned_concept_score"),
+                "cleaned_concept_names": row.get("cleaned_concept_names"),
+                "cleaned_concept_top_drivers_json": row.get("cleaned_concept_top_drivers_json"),
+                "filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
+                "concept_cleaning_status": row.get("concept_cleaning_status"),
                 "capital_activity_score": row.get("capital_activity_score"),
                 "capital_activity_status": row.get("capital_activity_status"),
                 "pct_change": row.get("pct_change"),
@@ -741,6 +791,7 @@ class RegimeSectorIndustrySignalPreviewService:
                 "risk_penalty_score": "0.70*feat_volatility_rank_20 + 0.30*(1-feat_tradability_score)",
                 "final_preview_score": "route.industry_strength_weight*feat_industry_strength_20 + route.stock_alpha_weight*stock_alpha_score - route.risk_penalty_weight*risk_penalty_score",
                 "v1_1_preview_score": "clamp(0.70*normalized_score + 0.15*concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
+                "cleaned_v1_1_preview_score": "clamp(0.70*normalized_score + 0.15*cleaned_concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
             },
             "industry_tag_type": "SW_INDUSTRY_L2",
             "concept_strength_enabled": True,
@@ -837,6 +888,8 @@ class RegimeSectorIndustrySignalPreviewService:
 
         enriched_count = 0
         concept_score_count = 0
+        cleaned_concept_score_count = 0
+        filtered_generic_concept_row_count = 0
         capital_score_count = 0
         st_penalty_count = 0
         for row in rows:
@@ -850,9 +903,14 @@ class RegimeSectorIndustrySignalPreviewService:
             self._apply_tag_enrichment(row, tags)
 
             concept_score = to_decimal(row.get("concept_score"))
+            cleaned_concept_score = to_decimal(row.get("cleaned_concept_score"))
             capital_score = to_decimal(row.get("capital_activity_score"))
             if concept_score is not None:
                 concept_score_count += 1
+            if cleaned_concept_score is not None:
+                cleaned_concept_score_count += 1
+            if safe_int(row.get("filtered_generic_concept_count")):
+                filtered_generic_concept_row_count += 1
             if capital_score is not None:
                 capital_score_count += 1
 
@@ -872,6 +930,19 @@ class RegimeSectorIndustrySignalPreviewService:
             else:
                 row["v1_1_preview_score"] = None
                 row["v1_1_score_delta"] = None
+
+            if base is not None and cleaned_concept_score is not None and capital_score is not None:
+                cleaned_v1_1_score = clamp_score(
+                    Decimal("0.70") * base
+                    + Decimal("0.15") * cleaned_concept_score
+                    + Decimal("0.15") * capital_score
+                    - observation_penalty
+                )
+                row["cleaned_v1_1_preview_score"] = cleaned_v1_1_score
+                row["cleaned_v1_1_score_delta"] = quantize(cleaned_v1_1_score - base) if cleaned_v1_1_score is not None else None
+            else:
+                row["cleaned_v1_1_preview_score"] = None
+                row["cleaned_v1_1_score_delta"] = None
             row["v1_1_scoring_mode"] = V1_1_SCORE_MODE
 
             # Rebuild reason payload after enrichment so the JSON includes v1.1 fields.
@@ -887,6 +958,11 @@ class RegimeSectorIndustrySignalPreviewService:
                 "concept_score": row.get("concept_score"),
                 "concept_names": row.get("concept_names"),
                 "concept_top_drivers_json": row.get("concept_top_drivers_json"),
+                "cleaned_concept_score": row.get("cleaned_concept_score"),
+                "cleaned_concept_names": row.get("cleaned_concept_names"),
+                "cleaned_concept_top_drivers_json": row.get("cleaned_concept_top_drivers_json"),
+                "filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
+                "concept_cleaning_status": row.get("concept_cleaning_status"),
                 "capital_activity_score": row.get("capital_activity_score"),
                 "capital_activity_status": row.get("capital_activity_status"),
                 "pct_change": row.get("pct_change"),
@@ -900,9 +976,12 @@ class RegimeSectorIndustrySignalPreviewService:
             payload["score_components"].update(
                 {
                     "concept_score": row.get("concept_score"),
+                    "cleaned_concept_score": row.get("cleaned_concept_score"),
                     "capital_activity_score": row.get("capital_activity_score"),
                     "v1_1_preview_score": row.get("v1_1_preview_score"),
                     "v1_1_score_delta": row.get("v1_1_score_delta"),
+                    "cleaned_v1_1_preview_score": row.get("cleaned_v1_1_preview_score"),
+                    "cleaned_v1_1_score_delta": row.get("cleaned_v1_1_score_delta"),
                 }
             )
             row["reason_payload_json"] = json.dumps(payload, ensure_ascii=False, default=json_default, sort_keys=True)
@@ -915,9 +994,13 @@ class RegimeSectorIndustrySignalPreviewService:
             "requested_instrument_count": len(instrument_ids),
             "enriched_row_count": enriched_count,
             "concept_score_count": concept_score_count,
+            "cleaned_concept_score_count": cleaned_concept_score_count,
+            "filtered_generic_concept_row_count": filtered_generic_concept_row_count,
             "capital_activity_score_count": capital_score_count,
             "observation_penalty_count": st_penalty_count,
             "formula": "clamp(0.70*normalized_score + 0.15*concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
+            "cleaned_formula": "clamp(0.70*normalized_score + 0.15*cleaned_concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
+            "concept_cleaning_scope": "Generic/channel/state/style tags are filtered out of cleaned_concept_score but preserved in filtered_generic_concept_names for manual review.",
             "scope": "artifact-only M4 v1.1 scoring preview; no strategy_signal write, no M5, no M6, no buy/sell decision.",
         }
         if concept_score_count == 0 or capital_score_count == 0:
@@ -1168,16 +1251,64 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
     def _apply_tag_enrichment(self, row: dict[str, Any], tags: Mapping[str, Any]) -> None:
         concepts = list(tags.get("concepts") or [])
         concepts.sort(key=lambda item: (item.get("concept_hot_score") is None, -(item.get("concept_hot_score") or 0), item.get("concept_name") or ""))
+        cleaned_concepts: list[dict[str, Any]] = []
+        filtered_generic_concepts: list[dict[str, Any]] = []
+        for concept in concepts:
+            concept_name = str(concept.get("concept_name") or "").strip()
+            if self._is_generic_concept_tag(concept_name):
+                filtered_generic_concepts.append(concept)
+            else:
+                cleaned_concepts.append(concept)
+
         top_concepts = concepts[:5]
+        cleaned_top_concepts = cleaned_concepts[:5]
         scores = [to_decimal(item.get("concept_hot_score")) for item in top_concepts]
         scores = [score for score in scores if score is not None]
+        cleaned_scores = [to_decimal(item.get("concept_hot_score")) for item in cleaned_top_concepts]
+        cleaned_scores = [score for score in cleaned_scores if score is not None]
+
         row["concept_count"] = len(concepts)
         row["concept_names"] = ",".join(item.get("concept_name") or "" for item in concepts[:20])
         row["concept_top_drivers_json"] = json.dumps(top_concepts, ensure_ascii=False, default=json_default)
         row["concept_score"] = quantize(sum(scores) / Decimal(len(scores))) if scores else None
         row["concept_status"] = "READY_FOR_M4_SCORING_PREVIEW" if scores else "NO_CONCEPT_SCORE"
+
+        row["cleaned_concept_count"] = len(cleaned_concepts)
+        row["cleaned_concept_names"] = ",".join(item.get("concept_name") or "" for item in cleaned_concepts[:20])
+        row["cleaned_concept_top_drivers_json"] = json.dumps(cleaned_top_concepts, ensure_ascii=False, default=json_default)
+        if cleaned_scores:
+            row["cleaned_concept_score"] = quantize(sum(cleaned_scores) / Decimal(len(cleaned_scores)))
+            row["cleaned_concept_status"] = "READY_FOR_M4_CLEANED_SCORING_PREVIEW"
+        elif concepts:
+            # Generic/channel/state-only labels should contribute zero theme strength,
+            # not NULL. Keeping a numeric zero lets cleaned_v1_1_preview_score remain
+            # comparable while filtered_generic_concept_names preserves review evidence.
+            row["cleaned_concept_score"] = Decimal("0")
+            row["cleaned_concept_status"] = "GENERIC_ONLY_ZERO_THEME_SCORE"
+        else:
+            row["cleaned_concept_score"] = None
+            row["cleaned_concept_status"] = "NO_CONCEPT_TAGS"
+        row["filtered_generic_concept_count"] = len(filtered_generic_concepts)
+        row["filtered_generic_concept_names"] = ",".join(item.get("concept_name") or "" for item in filtered_generic_concepts[:20])
+        if concepts and filtered_generic_concepts and cleaned_concepts:
+            row["concept_cleaning_status"] = "FILTERED_GENERIC_AND_RETAINED_THEME"
+        elif concepts and filtered_generic_concepts and not cleaned_concepts:
+            row["concept_cleaning_status"] = "FILTERED_GENERIC_ONLY"
+        elif concepts:
+            row["concept_cleaning_status"] = "NO_GENERIC_FILTERED"
+        else:
+            row["concept_cleaning_status"] = "NO_CONCEPT_TAGS"
+
         row["sw_l2_names"] = ",".join(tags.get("sw_l2") or [])
         row["sw_l3_names"] = ",".join(tags.get("sw_l3") or [])
+
+    def _is_generic_concept_tag(self, tag_name: str) -> bool:
+        normalized = str(tag_name or "").strip()
+        if not normalized:
+            return False
+        if normalized in GENERIC_CONCEPT_TAG_NAMES:
+            return True
+        return any(keyword in normalized for keyword in GENERIC_CONCEPT_KEYWORDS)
 
     def _observation_penalty(self, row: Mapping[str, Any]) -> Decimal:
         penalty = Decimal("0")
@@ -1196,11 +1327,17 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
         base_summary = str(row.get("reason_summary") or "").strip()
         if not base_summary:
             base_summary = self._fallback_reason_summary(row, s2_payload={})
+        def _score_text(value: Any) -> Any:
+            return "NA" if value is None else value
+
         return (
-            f"{base_summary} v1.1预览：concept_score={row.get('concept_score') or 'NA'}，"
-            f"capital_activity_score={row.get('capital_activity_score') or 'NA'}，"
-            f"v1_1_preview_score={row.get('v1_1_preview_score') or 'NA'}。"
-            "概念/资金活跃度仅进入选股评分预览，不进入买卖点、M5提交、M6晋级或实盘。"
+            f"{base_summary} v1.1预览：concept_score={_score_text(row.get('concept_score'))}，"
+            f"cleaned_concept_score={_score_text(row.get('cleaned_concept_score'))}，"
+            f"capital_activity_score={_score_text(row.get('capital_activity_score'))}，"
+            f"v1_1_preview_score={_score_text(row.get('v1_1_preview_score'))}，"
+            f"cleaned_v1_1_preview_score={_score_text(row.get('cleaned_v1_1_preview_score'))}。"
+            "概念/资金活跃度仅进入选股评分预览，不进入买卖点、M5提交、M6晋级或实盘；"
+            "cleaned_concept_score 已剔除泛化/通道/状态类标签，仅用于研究评审。"
         )
 
     def _build_reason_payload_preview_rows(self, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1257,7 +1394,10 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
         raw_scores: list[Decimal] = []
         confidence_scores: list[Decimal] = []
         v1_1_scores: list[Decimal] = []
+        cleaned_v1_1_scores: list[Decimal] = []
         concept_scores: list[Decimal] = []
+        cleaned_concept_scores: list[Decimal] = []
+        filtered_generic_concept_row_count = 0
         capital_scores: list[Decimal] = []
         for row in rows:
             reason = str(row.get("reason_code") or "UNKNOWN")
@@ -1271,12 +1411,20 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
             if confidence is not None:
                 confidence_scores.append(confidence)
             v1_1 = to_decimal(row.get("v1_1_preview_score"))
+            cleaned_v1_1 = to_decimal(row.get("cleaned_v1_1_preview_score"))
             concept = to_decimal(row.get("concept_score"))
+            cleaned_concept = to_decimal(row.get("cleaned_concept_score"))
             capital = to_decimal(row.get("capital_activity_score"))
             if v1_1 is not None:
                 v1_1_scores.append(v1_1)
+            if cleaned_v1_1 is not None:
+                cleaned_v1_1_scores.append(cleaned_v1_1)
             if concept is not None:
                 concept_scores.append(concept)
+            if cleaned_concept is not None:
+                cleaned_concept_scores.append(cleaned_concept)
+            if safe_int(row.get("filtered_generic_concept_count")):
+                filtered_generic_concept_row_count += 1
             if capital is not None:
                 capital_scores.append(capital)
         top_industries = [
@@ -1299,12 +1447,19 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
             "v1_1_scoring_mode": V1_1_SCORE_MODE,
             "v1_1_enrichment_summary": dict(enrichment_summary or {}),
             "v1_1_score_nonnull_count": len(v1_1_scores),
+            "cleaned_v1_1_score_nonnull_count": len(cleaned_v1_1_scores),
             "concept_score_nonnull_count": len(concept_scores),
+            "cleaned_concept_score_nonnull_count": len(cleaned_concept_scores),
+            "filtered_generic_concept_row_count": filtered_generic_concept_row_count,
             "capital_activity_score_nonnull_count": len(capital_scores),
             "max_v1_1_preview_score": max(v1_1_scores) if v1_1_scores else None,
             "min_v1_1_preview_score": min(v1_1_scores) if v1_1_scores else None,
+            "max_cleaned_v1_1_preview_score": max(cleaned_v1_1_scores) if cleaned_v1_1_scores else None,
+            "min_cleaned_v1_1_preview_score": min(cleaned_v1_1_scores) if cleaned_v1_1_scores else None,
             "max_concept_score": max(concept_scores) if concept_scores else None,
             "min_concept_score": min(concept_scores) if concept_scores else None,
+            "max_cleaned_concept_score": max(cleaned_concept_scores) if cleaned_concept_scores else None,
+            "min_cleaned_concept_score": min(cleaned_concept_scores) if cleaned_concept_scores else None,
             "max_capital_activity_score": max(capital_scores) if capital_scores else None,
             "min_capital_activity_score": min(capital_scores) if capital_scores else None,
         }
@@ -1331,6 +1486,12 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
             },
             {
                 "severity": "WARN",
+                "item": "concept_tag_cleaning_preview",
+                "reason": "cleaned_concept_score filters generic/channel/state/style labels from concept scoring but keeps filtered_generic_concept_names for review.",
+                "next_step": "Review cleaned_v1_1_preview_score and top30 changes before M5 validation; this is still artifact-only.",
+            },
+            {
+                "severity": "WARN",
                 "item": "stage_boundary",
                 "reason": "This task emits preview artifacts only and intentionally does not write strategy_signal.",
                 "next_step": "Review artifacts before starting the M4 signal DB-write design patch.",
@@ -1345,6 +1506,7 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
             "no_paper_trading",
             "no_risk_rule_change",
             "concept_capital_scoring_preview_only",
+            "concept_cleaning_preview_only",
             "concept_capital_not_buy_sell_decision",
             "requires_manual_review_before_db_write",
         ]
@@ -1405,6 +1567,11 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
             f"- capital_activity_score_nonnull_count: `{summary.get('capital_activity_score_nonnull_count')}`",
             f"- max_v1_1_preview_score: `{summary.get('max_v1_1_preview_score')}`",
             f"- min_v1_1_preview_score: `{summary.get('min_v1_1_preview_score')}`",
+            f"- cleaned_v1_1_score_nonnull_count: `{summary.get('cleaned_v1_1_score_nonnull_count')}`",
+            f"- cleaned_concept_score_nonnull_count: `{summary.get('cleaned_concept_score_nonnull_count')}`",
+            f"- filtered_generic_concept_row_count: `{summary.get('filtered_generic_concept_row_count')}`",
+            f"- max_cleaned_v1_1_preview_score: `{summary.get('max_cleaned_v1_1_preview_score')}`",
+            f"- min_cleaned_v1_1_preview_score: `{summary.get('min_cleaned_v1_1_preview_score')}`",
             "",
             "## Guardrails",
             "",
