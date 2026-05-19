@@ -247,6 +247,7 @@ class ProductionDailyObservationReportBuilder:
         md_path = output_dir / f"{stem}.md"
         sources_path = output_dir / f"{stem}_sources.csv"
         artifacts_path = output_dir / f"{stem}_artifacts.csv"
+        next_trade_plan_path = output_dir / f"{stem}_next_trade_plan.csv"
 
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
@@ -255,25 +256,30 @@ class ProductionDailyObservationReportBuilder:
         md_path.write_text(self._render_markdown(payload), encoding="utf-8")
         self._write_csv(sources_path, self._source_rows(payload))
         self._write_csv(artifacts_path, artifact_index)
+        self._write_csv(next_trade_plan_path, self._next_trade_plan_csv_rows(payload))
 
         latest_json = latest_dir / "production_daily_observation_latest.json"
         latest_md = latest_dir / "production_daily_observation_latest.md"
         latest_sources = latest_dir / "production_daily_observation_latest_sources.csv"
         latest_artifacts = latest_dir / "production_daily_observation_latest_artifacts.csv"
+        latest_next_trade_plan = latest_dir / "production_daily_observation_latest_next_trade_plan.csv"
         shutil.copyfile(json_path, latest_json)
         shutil.copyfile(md_path, latest_md)
         shutil.copyfile(sources_path, latest_sources)
         shutil.copyfile(artifacts_path, latest_artifacts)
+        shutil.copyfile(next_trade_plan_path, latest_next_trade_plan)
 
         payload["files"] = {
             "json": str(json_path),
             "markdown": str(md_path),
             "sources_csv": str(sources_path),
             "artifacts_csv": str(artifacts_path),
+            "next_trade_plan_csv": str(next_trade_plan_path),
             "latest_json": str(latest_json),
             "latest_markdown": str(latest_md),
             "latest_sources_csv": str(latest_sources),
             "latest_artifacts_csv": str(latest_artifacts),
+            "latest_next_trade_plan_csv": str(latest_next_trade_plan),
         }
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
@@ -5702,6 +5708,170 @@ class ProductionDailyObservationReportBuilder:
         lines.extend(self._render_manual_review_checklist(payload.get("manual_review_checklist") or []))
         lines.append("")
         return "\n".join(lines)
+
+    def _next_trade_plan_csv_rows(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Export complete next-trade target/order plan rows to a dedicated CSV.
+
+        Markdown intentionally stays compact, but this CSV should include every
+        materialized next_trade_date order/target row for audit and handoff.  It
+        reads by run_id from the production tables instead of relying on preview
+        rows stored in the JSON payload.
+        """
+        next_trade_plan = payload.get("next_trade_plan") or {}
+        rows: list[dict[str, Any]] = []
+        base = {
+            "report_date": payload.get("report_date"),
+            "report_signal_as_of_date": payload.get("signal_as_of_date"),
+            "next_trade_date": next_trade_plan.get("next_trade_date") or payload.get("next_trade_date"),
+            "next_trade_plan_status": next_trade_plan.get("status"),
+            "next_trade_plan_reason": next_trade_plan.get("reason"),
+            "plan_basis": next_trade_plan.get("plan_basis"),
+        }
+        for plan in next_trade_plan.get("campaigns") or []:
+            campaign_base = {
+                **base,
+                "campaign_code": plan.get("campaign_code"),
+                "portfolio_id": plan.get("portfolio_id"),
+                "strategy_code": plan.get("strategy_code"),
+                "strategy_version_code": plan.get("strategy_version_code"),
+                "next_plan_signal_as_of_date": plan.get("next_plan_signal_as_of_date"),
+                "next_plan_signal_run_id": plan.get("next_plan_signal_run_id"),
+                "next_plan_signal_effective_date": plan.get("next_plan_signal_effective_date"),
+                "target_run_id": plan.get("target_run_id"),
+                "order_run_id": plan.get("order_run_id"),
+                "current_position_run_id": plan.get("current_position_run_id"),
+                "campaign_status": plan.get("status"),
+                "campaign_reason": plan.get("reason"),
+                "campaign_plan_basis": plan.get("plan_basis"),
+            }
+            try:
+                order_run_id = self._optional_int(plan.get("order_run_id"))
+                target_run_id = self._optional_int(plan.get("target_run_id"))
+                if order_run_id is not None:
+                    rows.extend(self._next_trade_order_export_rows(campaign_base, order_run_id=order_run_id))
+                elif target_run_id is not None:
+                    rows.extend(self._next_trade_target_export_rows(campaign_base, target_run_id=target_run_id))
+                else:
+                    rows.append({**campaign_base, "row_source": "no_materialized_next_trade_plan"})
+            except Exception as exc:
+                self._rollback_session_safely()
+                rows.append({
+                    **campaign_base,
+                    "row_source": "next_trade_plan_csv_query_failed",
+                    "csv_status": "WARN",
+                    "csv_reason": f"{type(exc).__name__}:{exc}",
+                })
+        return rows
+
+    def _next_trade_order_export_rows(self, base: dict[str, Any], *, order_run_id: int) -> list[dict[str, Any]]:
+        sql = """
+        select
+            o.id as order_id,
+            o.run_id as order_run_id,
+            o.effective_date,
+            o.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            upper(o.order_side) as order_side,
+            o.order_type,
+            o.price_fill_rule,
+            o.target_quantity,
+            o.order_quantity,
+            o.estimated_price,
+            o.estimated_gross_amount,
+            o.estimated_fee,
+            o.estimated_net_amount,
+            o.status as order_status,
+            o.reject_reason,
+            t.id as target_position_id,
+            t.run_id as target_run_id,
+            t.rank_no,
+            t.score,
+            t.target_weight,
+            t.reason_code as target_reason_code,
+            t.status_reason as target_status_reason,
+            ss.run_id as source_signal_run_id,
+            ss.as_of_date as source_signal_as_of_date,
+            ss.effective_date as source_signal_effective_date,
+            ss.rank_in_batch as source_rank,
+            ss.raw_score as source_raw_score,
+            ss.normalized_score as source_normalized_score,
+            ss.confidence_score as source_confidence_score,
+            ss.reason_code as signal_reason_code
+        from public.trading_paper_order o
+        left join public.trading_paper_target_position t on t.id = o.target_position_id
+        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.meta_instrument mi on mi.id = o.instrument_id
+        where o.run_id = :order_run_id
+        order by case when upper(o.order_side) = 'BUY' then 0 when upper(o.order_side) = 'SELL' then 1 else 2 end,
+                 t.rank_no nulls last,
+                 o.id
+        """
+        out: list[dict[str, Any]] = []
+        for row in self._rows(sql, {"order_run_id": order_run_id}):
+            side = str(row.get("order_side") or "").upper()
+            out.append({
+                **base,
+                "row_source": "trading_paper_order",
+                "plan_action": side or "ORDER",
+                "plan_reason": "next_trade_date_order",
+                **row,
+            })
+        return out
+
+    def _next_trade_target_export_rows(self, base: dict[str, Any], *, target_run_id: int) -> list[dict[str, Any]]:
+        sql = """
+        select
+            t.id as target_position_id,
+            t.run_id as target_run_id,
+            t.effective_date,
+            t.instrument_id,
+            mi.instrument_code,
+            mi.symbol,
+            mi.display_name,
+            t.rank_no,
+            t.score,
+            t.target_weight,
+            t.target_quantity,
+            t.reason_code as target_reason_code,
+            t.status_reason as target_status_reason,
+            ss.run_id as source_signal_run_id,
+            ss.as_of_date as source_signal_as_of_date,
+            ss.effective_date as source_signal_effective_date,
+            ss.rank_in_batch as source_rank,
+            ss.raw_score as source_raw_score,
+            ss.normalized_score as source_normalized_score,
+            ss.confidence_score as source_confidence_score,
+            ss.reason_code as signal_reason_code
+        from public.trading_paper_target_position t
+        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.meta_instrument mi on mi.id = t.instrument_id
+        where t.run_id = :target_run_id
+        order by t.rank_no nulls last, t.score desc nulls last, t.instrument_id
+        """
+        out: list[dict[str, Any]] = []
+        for row in self._rows(sql, {"target_run_id": target_run_id}):
+            out.append({
+                **base,
+                "row_source": "trading_paper_target_position",
+                "plan_action": "TARGET",
+                "plan_reason": "next_trade_date_target",
+                "order_id": None,
+                "order_run_id": None,
+                "order_side": None,
+                "order_type": None,
+                "price_fill_rule": None,
+                "order_quantity": None,
+                "estimated_price": None,
+                "estimated_gross_amount": None,
+                "estimated_fee": None,
+                "estimated_net_amount": None,
+                "order_status": None,
+                "reject_reason": None,
+                **row,
+            })
+        return out
 
     def _source_rows(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
