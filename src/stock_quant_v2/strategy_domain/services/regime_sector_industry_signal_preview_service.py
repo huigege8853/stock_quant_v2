@@ -47,17 +47,76 @@ GENERIC_CONCEPT_TAG_NAMES: frozenset[str] = frozenset(
     {
         "融资融券", "沪股通", "深股通", "富时罗素", "标普道琼斯A股", "MSCI概念",
         "证金持股", "QFII重仓", "机构重仓", "社保重仓", "基金重仓",
-        "百元股", "小盘股", "中盘股", "大盘股", "低价股", "高价股",
-        "创业板综", "上证180", "上证380", "深证100R", "中证500", "中证1000", "沪深300",
+        "百元股", "小盘股", "中盘股", "大盘股", "低价股", "高价股", "周期股", "微利股",
+        "创业板综", "上证180", "上证380", "深证100R", "深成500", "中证500", "中证1000", "沪深300",
+        "标准普尔", "HS300_", "创业成份",
         "昨日涨停", "昨日连板", "昨日触板", "昨日高振幅", "昨日高换手",
         "近期新高", "百日新高", "历史新高", "东方财富热股", "同花顺热股", "热门股",
-        "破净股", "预盈预增", "送转填权", "转债标的", "注册制次新股", "次新股", "ST股",
+        "破净股", "破发股", "预盈预增", "股权激励", "送转填权", "转债标的", "注册制次新股", "次新股", "ST股",
+        "最近多板", "2025年报扭亏", "2025年报预减", "2025年报预增", "2026—季报预增", "养老金",
     }
 )
 GENERIC_CONCEPT_KEYWORDS: tuple[str, ...] = (
     "融资融券", "沪股通", "深股通", "QFII", "机构重仓", "基金重仓", "社保重仓",
-    "百元股", "小盘股", "中盘股", "大盘股", "创业板综", "昨日", "新高", "热股",
-    "高振幅", "高换手", "次新股", "ST股",
+    "百元股", "小盘股", "中盘股", "大盘股", "创业板综", "标准普尔", "HS300", "创业成份", "昨日", "新高", "热股",
+    "高振幅", "高换手", "多板", "破发", "年报", "季报", "扭亏", "预减", "养老金", "次新股", "ST股",
+    "周期股", "微利股", "股权激励",
+)
+
+# Stage 6.19B-1B-v2: split vendor concept labels into L0-L9 aligned
+# observation buckets. Only L7_TRUE_THEME contributes to true_theme_score /
+# cleaned_concept_score. The other buckets are preserved as evidence fields so
+# later research can route them to L5/L8/L9 without polluting theme strength.
+CONCEPT_TAG_CLASS_TRUE_THEME = "L7_TRUE_THEME"
+CONCEPT_TAG_CLASS_STYLE = "L8_STYLE"
+CONCEPT_TAG_CLASS_STATE_EVENT = "L5_STATE_EVENT"
+CONCEPT_TAG_CLASS_INDEX_CHANNEL = "INDEX_CHANNEL"
+CONCEPT_TAG_CLASS_HOLDING_STRUCTURE = "L9_HOLDING_STRUCTURE"
+CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE = "POLICY_ATTRIBUTE"
+CONCEPT_TAG_CLASS_GENERIC_OTHER = "GENERIC_OTHER"
+
+INDEX_CHANNEL_TAG_NAMES: frozenset[str] = frozenset(
+    {
+        "融资融券", "沪股通", "深股通", "富时罗素", "标普道琼斯A股",
+        "MSCI概念", "MSCI中国", "标准普尔", "标普道琼斯A股", "上证180", "上证380", "深证100R",
+        "深成500", "中证500", "中证1000", "沪深300", "HS300_", "创业板综", "创业成份",
+    }
+)
+INDEX_CHANNEL_KEYWORDS: tuple[str, ...] = ("沪股通", "深股通", "MSCI", "富时罗素", "标准普尔", "标普", "HS300", "创业成份", "中证", "上证", "深成", "沪深")
+
+STYLE_TAG_NAMES: frozenset[str] = frozenset(
+    {"小盘股", "中盘股", "大盘股", "低价股", "高价股", "百元股", "小盘成长", "中盘成长", "大盘成长", "周期股", "微利股"}
+)
+STYLE_TAG_KEYWORDS: tuple[str, ...] = ("小盘", "中盘", "大盘", "低价", "高价", "百元股", "成长", "价值", "红利", "周期股", "微利股")
+
+STATE_EVENT_TAG_NAMES: frozenset[str] = frozenset(
+    {
+        "昨日涨停", "昨日连板", "昨日触板", "昨日高振幅", "昨日高换手",
+        "近期新高", "百日新高", "历史新高", "东方财富热股", "同花顺热股",
+        "热门股", "最近多板", "破净股", "破发股", "预盈预增", "股权激励", "2025年报预增",
+        "2025年报扭亏", "2025年报预减", "2026—季报预增", "送转填权",
+        "注册制次新股", "次新股", "ST股",
+    }
+)
+STATE_EVENT_KEYWORDS: tuple[str, ...] = ("昨日", "新高", "热股", "高振幅", "高换手", "多板", "预增", "预盈", "年报", "季报", "扭亏", "预减", "破净", "破发", "股权激励", "次新", "ST")
+
+HOLDING_STRUCTURE_TAG_NAMES: frozenset[str] = frozenset({"证金持股", "QFII重仓", "机构重仓", "社保重仓", "基金重仓", "养老金"})
+HOLDING_STRUCTURE_KEYWORDS: tuple[str, ...] = ("重仓", "持股", "QFII", "基金", "机构", "社保", "证金", "养老金")
+
+POLICY_ATTRIBUTE_TAG_NAMES: frozenset[str] = frozenset(
+    {"专精特新", "央企改革", "国企改革", "一带一路", "深圳特区", "雄安新区", "共同富裕示范区", "长江三角", "西部大开发"}
+)
+POLICY_ATTRIBUTE_KEYWORDS: tuple[str, ...] = ("专精特新", "改革", "一带一路", "特区", "新区", "示范区", "长江三角", "西部大开发")
+
+NON_THEME_CONCEPT_TAG_CLASSES: frozenset[str] = frozenset(
+    {
+        CONCEPT_TAG_CLASS_STYLE,
+        CONCEPT_TAG_CLASS_STATE_EVENT,
+        CONCEPT_TAG_CLASS_INDEX_CHANNEL,
+        CONCEPT_TAG_CLASS_HOLDING_STRUCTURE,
+        CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE,
+        CONCEPT_TAG_CLASS_GENERIC_OTHER,
+    }
 )
 DB_ENV_KEYS = (
     "V2_SQLALCHEMY_URL",
@@ -175,9 +234,26 @@ SIGNAL_PREVIEW_COLUMNS = (
     "cleaned_concept_score",
     "cleaned_concept_status",
     "cleaned_concept_top_drivers_json",
+    "true_theme_count",
+    "true_theme_names",
+    "true_theme_score",
+    "true_theme_top_drivers_json",
+    "style_tag_count",
+    "style_tag_names",
+    "state_event_tag_count",
+    "state_event_tag_names",
+    "index_channel_tag_count",
+    "index_channel_tag_names",
+    "holding_structure_tag_count",
+    "holding_structure_tag_names",
+    "policy_attribute_tag_count",
+    "policy_attribute_tag_names",
+    "other_tag_count",
+    "other_tag_names",
     "filtered_generic_concept_count",
     "filtered_generic_concept_names",
     "concept_cleaning_status",
+    "tag_classification_status",
     "sw_l2_names",
     "sw_l3_names",
     "v1_1_preview_score",
@@ -751,8 +827,17 @@ class RegimeSectorIndustrySignalPreviewService:
                 "cleaned_concept_score": row.get("cleaned_concept_score"),
                 "cleaned_concept_names": row.get("cleaned_concept_names"),
                 "cleaned_concept_top_drivers_json": row.get("cleaned_concept_top_drivers_json"),
+                "true_theme_score": row.get("true_theme_score"),
+                "true_theme_names": row.get("true_theme_names"),
+                "style_tag_names": row.get("style_tag_names"),
+                "state_event_tag_names": row.get("state_event_tag_names"),
+                "index_channel_tag_names": row.get("index_channel_tag_names"),
+                "holding_structure_tag_names": row.get("holding_structure_tag_names"),
+                "policy_attribute_tag_names": row.get("policy_attribute_tag_names"),
+                "other_tag_names": row.get("other_tag_names"),
                 "filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
                 "concept_cleaning_status": row.get("concept_cleaning_status"),
+                "tag_classification_status": row.get("tag_classification_status"),
                 "capital_activity_score": row.get("capital_activity_score"),
                 "capital_activity_status": row.get("capital_activity_status"),
                 "pct_change": row.get("pct_change"),
@@ -976,6 +1061,7 @@ class RegimeSectorIndustrySignalPreviewService:
             payload["score_components"].update(
                 {
                     "concept_score": row.get("concept_score"),
+                    "true_theme_score": row.get("true_theme_score"),
                     "cleaned_concept_score": row.get("cleaned_concept_score"),
                     "capital_activity_score": row.get("capital_activity_score"),
                     "v1_1_preview_score": row.get("v1_1_preview_score"),
@@ -999,8 +1085,9 @@ class RegimeSectorIndustrySignalPreviewService:
             "capital_activity_score_count": capital_score_count,
             "observation_penalty_count": st_penalty_count,
             "formula": "clamp(0.70*normalized_score + 0.15*concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
-            "cleaned_formula": "clamp(0.70*normalized_score + 0.15*cleaned_concept_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
-            "concept_cleaning_scope": "Generic/channel/state/style tags are filtered out of cleaned_concept_score but preserved in filtered_generic_concept_names for manual review.",
+            "cleaned_formula": "clamp(0.70*normalized_score + 0.15*true_theme_score + 0.15*capital_activity_score - observation_penalty, 0, 1)",
+            "concept_cleaning_scope": "Only L7 true-theme tags contribute to cleaned_concept_score/true_theme_score; style, state/event, index/channel, holding-structure and policy-attribute labels are preserved as observation fields.",
+            "tag_classification_scope": "Stage 6.19B-1B-v2 L0-L9 aligned tag classification preview; still artifact-only and not a production signal.",
             "scope": "artifact-only M4 v1.1 scoring preview; no strategy_signal write, no M5, no M6, no buy/sell decision.",
         }
         if concept_score_count == 0 or capital_score_count == 0:
@@ -1251,21 +1338,36 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
     def _apply_tag_enrichment(self, row: dict[str, Any], tags: Mapping[str, Any]) -> None:
         concepts = list(tags.get("concepts") or [])
         concepts.sort(key=lambda item: (item.get("concept_hot_score") is None, -(item.get("concept_hot_score") or 0), item.get("concept_name") or ""))
-        cleaned_concepts: list[dict[str, Any]] = []
-        filtered_generic_concepts: list[dict[str, Any]] = []
+
+        concept_groups: dict[str, list[dict[str, Any]]] = {
+            CONCEPT_TAG_CLASS_TRUE_THEME: [],
+            CONCEPT_TAG_CLASS_STYLE: [],
+            CONCEPT_TAG_CLASS_STATE_EVENT: [],
+            CONCEPT_TAG_CLASS_INDEX_CHANNEL: [],
+            CONCEPT_TAG_CLASS_HOLDING_STRUCTURE: [],
+            CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE: [],
+            CONCEPT_TAG_CLASS_GENERIC_OTHER: [],
+        }
         for concept in concepts:
             concept_name = str(concept.get("concept_name") or "").strip()
-            if self._is_generic_concept_tag(concept_name):
-                filtered_generic_concepts.append(concept)
-            else:
-                cleaned_concepts.append(concept)
+            concept_class = self._classify_concept_tag(concept_name)
+            enriched_concept = dict(concept)
+            enriched_concept["tag_class"] = concept_class
+            concept_groups.setdefault(concept_class, []).append(enriched_concept)
+
+        true_theme_concepts = concept_groups.get(CONCEPT_TAG_CLASS_TRUE_THEME, [])
+        filtered_generic_concepts = [
+            item
+            for class_name in NON_THEME_CONCEPT_TAG_CLASSES
+            for item in concept_groups.get(class_name, [])
+        ]
 
         top_concepts = concepts[:5]
-        cleaned_top_concepts = cleaned_concepts[:5]
+        true_theme_top_concepts = true_theme_concepts[:5]
         scores = [to_decimal(item.get("concept_hot_score")) for item in top_concepts]
         scores = [score for score in scores if score is not None]
-        cleaned_scores = [to_decimal(item.get("concept_hot_score")) for item in cleaned_top_concepts]
-        cleaned_scores = [score for score in cleaned_scores if score is not None]
+        true_theme_scores = [to_decimal(item.get("concept_hot_score")) for item in true_theme_top_concepts]
+        true_theme_scores = [score for score in true_theme_scores if score is not None]
 
         row["concept_count"] = len(concepts)
         row["concept_names"] = ",".join(item.get("concept_name") or "" for item in concepts[:20])
@@ -1273,42 +1375,98 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
         row["concept_score"] = quantize(sum(scores) / Decimal(len(scores))) if scores else None
         row["concept_status"] = "READY_FOR_M4_SCORING_PREVIEW" if scores else "NO_CONCEPT_SCORE"
 
-        row["cleaned_concept_count"] = len(cleaned_concepts)
-        row["cleaned_concept_names"] = ",".join(item.get("concept_name") or "" for item in cleaned_concepts[:20])
-        row["cleaned_concept_top_drivers_json"] = json.dumps(cleaned_top_concepts, ensure_ascii=False, default=json_default)
-        if cleaned_scores:
-            row["cleaned_concept_score"] = quantize(sum(cleaned_scores) / Decimal(len(cleaned_scores)))
+        true_theme_score = quantize(sum(true_theme_scores) / Decimal(len(true_theme_scores))) if true_theme_scores else None
+        row["true_theme_count"] = len(true_theme_concepts)
+        row["true_theme_names"] = ",".join(item.get("concept_name") or "" for item in true_theme_concepts[:20])
+        row["true_theme_top_drivers_json"] = json.dumps(true_theme_top_concepts, ensure_ascii=False, default=json_default)
+        if true_theme_score is not None:
+            row["true_theme_score"] = true_theme_score
+            row["cleaned_concept_score"] = true_theme_score
+            row["true_theme_status"] = "READY_FOR_M4_TRUE_THEME_SCORING_PREVIEW"
             row["cleaned_concept_status"] = "READY_FOR_M4_CLEANED_SCORING_PREVIEW"
         elif concepts:
-            # Generic/channel/state-only labels should contribute zero theme strength,
-            # not NULL. Keeping a numeric zero lets cleaned_v1_1_preview_score remain
-            # comparable while filtered_generic_concept_names preserves review evidence.
+            row["true_theme_score"] = Decimal("0")
             row["cleaned_concept_score"] = Decimal("0")
+            row["true_theme_status"] = "NON_THEME_ONLY_ZERO_THEME_SCORE"
             row["cleaned_concept_status"] = "GENERIC_ONLY_ZERO_THEME_SCORE"
         else:
+            row["true_theme_score"] = None
             row["cleaned_concept_score"] = None
+            row["true_theme_status"] = "NO_CONCEPT_TAGS"
             row["cleaned_concept_status"] = "NO_CONCEPT_TAGS"
+
+        # Backward-compatible cleaned_* fields now mean L7 true-theme-only fields.
+        row["cleaned_concept_count"] = len(true_theme_concepts)
+        row["cleaned_concept_names"] = row["true_theme_names"]
+        row["cleaned_concept_top_drivers_json"] = row["true_theme_top_drivers_json"]
+
+        def _names(class_name: str, limit: int = 20) -> str:
+            return ",".join(item.get("concept_name") or "" for item in concept_groups.get(class_name, [])[:limit])
+
+        row["style_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_STYLE, []))
+        row["style_tag_names"] = _names(CONCEPT_TAG_CLASS_STYLE)
+        row["state_event_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_STATE_EVENT, []))
+        row["state_event_tag_names"] = _names(CONCEPT_TAG_CLASS_STATE_EVENT)
+        row["index_channel_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_INDEX_CHANNEL, []))
+        row["index_channel_tag_names"] = _names(CONCEPT_TAG_CLASS_INDEX_CHANNEL)
+        row["holding_structure_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_HOLDING_STRUCTURE, []))
+        row["holding_structure_tag_names"] = _names(CONCEPT_TAG_CLASS_HOLDING_STRUCTURE)
+        row["policy_attribute_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE, []))
+        row["policy_attribute_tag_names"] = _names(CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE)
+        row["other_tag_count"] = len(concept_groups.get(CONCEPT_TAG_CLASS_GENERIC_OTHER, []))
+        row["other_tag_names"] = _names(CONCEPT_TAG_CLASS_GENERIC_OTHER)
+
         row["filtered_generic_concept_count"] = len(filtered_generic_concepts)
         row["filtered_generic_concept_names"] = ",".join(item.get("concept_name") or "" for item in filtered_generic_concepts[:20])
-        if concepts and filtered_generic_concepts and cleaned_concepts:
-            row["concept_cleaning_status"] = "FILTERED_GENERIC_AND_RETAINED_THEME"
-        elif concepts and filtered_generic_concepts and not cleaned_concepts:
-            row["concept_cleaning_status"] = "FILTERED_GENERIC_ONLY"
+        if concepts and filtered_generic_concepts and true_theme_concepts:
+            row["concept_cleaning_status"] = "CLASSIFIED_RETAINED_TRUE_THEME_FILTERED_NON_THEME"
+        elif concepts and filtered_generic_concepts and not true_theme_concepts:
+            row["concept_cleaning_status"] = "CLASSIFIED_NON_THEME_ONLY_ZERO_THEME_SCORE"
         elif concepts:
-            row["concept_cleaning_status"] = "NO_GENERIC_FILTERED"
+            row["concept_cleaning_status"] = "CLASSIFIED_TRUE_THEME_ONLY"
         else:
             row["concept_cleaning_status"] = "NO_CONCEPT_TAGS"
+        row["tag_classification_status"] = self._tag_classification_status(concept_groups, has_concepts=bool(concepts))
 
         row["sw_l2_names"] = ",".join(tags.get("sw_l2") or [])
         row["sw_l3_names"] = ",".join(tags.get("sw_l3") or [])
 
-    def _is_generic_concept_tag(self, tag_name: str) -> bool:
+
+    def _classify_concept_tag(self, tag_name: str) -> str:
         normalized = str(tag_name or "").strip()
         if not normalized:
-            return False
-        if normalized in GENERIC_CONCEPT_TAG_NAMES:
-            return True
-        return any(keyword in normalized for keyword in GENERIC_CONCEPT_KEYWORDS)
+            return CONCEPT_TAG_CLASS_GENERIC_OTHER
+
+        def _matches(names: frozenset[str], keywords: tuple[str, ...]) -> bool:
+            return normalized in names or any(keyword in normalized for keyword in keywords)
+
+        if _matches(INDEX_CHANNEL_TAG_NAMES, INDEX_CHANNEL_KEYWORDS):
+            return CONCEPT_TAG_CLASS_INDEX_CHANNEL
+        if _matches(STYLE_TAG_NAMES, STYLE_TAG_KEYWORDS):
+            return CONCEPT_TAG_CLASS_STYLE
+        if _matches(STATE_EVENT_TAG_NAMES, STATE_EVENT_KEYWORDS):
+            return CONCEPT_TAG_CLASS_STATE_EVENT
+        if _matches(HOLDING_STRUCTURE_TAG_NAMES, HOLDING_STRUCTURE_KEYWORDS):
+            return CONCEPT_TAG_CLASS_HOLDING_STRUCTURE
+        if _matches(POLICY_ATTRIBUTE_TAG_NAMES, POLICY_ATTRIBUTE_KEYWORDS):
+            return CONCEPT_TAG_CLASS_POLICY_ATTRIBUTE
+        if normalized in GENERIC_CONCEPT_TAG_NAMES or any(keyword in normalized for keyword in GENERIC_CONCEPT_KEYWORDS):
+            return CONCEPT_TAG_CLASS_GENERIC_OTHER
+        return CONCEPT_TAG_CLASS_TRUE_THEME
+
+    def _tag_classification_status(self, groups: Mapping[str, Sequence[Mapping[str, Any]]], *, has_concepts: bool) -> str:
+        if not has_concepts:
+            return "NO_CONCEPT_TAGS"
+        true_theme_count = len(groups.get(CONCEPT_TAG_CLASS_TRUE_THEME, []) or [])
+        non_theme_count = sum(len(groups.get(class_name, []) or []) for class_name in NON_THEME_CONCEPT_TAG_CLASSES)
+        if true_theme_count and non_theme_count:
+            return "MIXED_TRUE_THEME_AND_NON_THEME_TAGS"
+        if true_theme_count:
+            return "TRUE_THEME_ONLY"
+        return "NON_THEME_ONLY"
+
+    def _is_generic_concept_tag(self, tag_name: str) -> bool:
+        return self._classify_concept_tag(tag_name) in NON_THEME_CONCEPT_TAG_CLASSES
 
     def _observation_penalty(self, row: Mapping[str, Any]) -> Decimal:
         penalty = Decimal("0")
@@ -1332,12 +1490,13 @@ order by instrument_id, tag_type, concept_hot_score desc nulls last, tag_name
 
         return (
             f"{base_summary} v1.1预览：concept_score={_score_text(row.get('concept_score'))}，"
+            f"true_theme_score={_score_text(row.get('true_theme_score'))}，"
             f"cleaned_concept_score={_score_text(row.get('cleaned_concept_score'))}，"
             f"capital_activity_score={_score_text(row.get('capital_activity_score'))}，"
             f"v1_1_preview_score={_score_text(row.get('v1_1_preview_score'))}，"
             f"cleaned_v1_1_preview_score={_score_text(row.get('cleaned_v1_1_preview_score'))}。"
             "概念/资金活跃度仅进入选股评分预览，不进入买卖点、M5提交、M6晋级或实盘；"
-            "cleaned_concept_score 已剔除泛化/通道/状态类标签，仅用于研究评审。"
+            "cleaned_concept_score 仅使用 L7 真实主题标签，风格/状态/指数通道/持仓结构/政策属性标签仅保留观察。"
         )
 
     def _build_reason_payload_preview_rows(self, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
