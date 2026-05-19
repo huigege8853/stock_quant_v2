@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -388,6 +389,26 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         ("SQV2_M6_5_CAMPAIGN_SUMMARY_EXECUTION_CONTEXT",),
         "production_paper_campaign",
     )
+    args.enable_next_trade_plan = _resolve_bool_option(
+        args.enable_next_trade_plan,
+        ("SQV2_DAILY_ENABLE_NEXT_TRADE_PLAN", "SQV2_ENABLE_NEXT_TRADE_PLAN"),
+        bool(args.enable_m6_5_campaign),
+    )
+    args.next_trade_plan_execution_context = _resolve_string_option(
+        args.next_trade_plan_execution_context,
+        ("SQV2_NEXT_TRADE_PLAN_EXECUTION_CONTEXT",),
+        "production_paper_campaign",
+    )
+    args.next_trade_plan_effective_date = _resolve_string_option(
+        args.next_trade_plan_effective_date,
+        ("SQV2_NEXT_TRADE_PLAN_EFFECTIVE_DATE",),
+        "",
+    )
+    args.next_trade_plan_replace_existing = _resolve_bool_option(
+        args.next_trade_plan_replace_existing,
+        ("SQV2_NEXT_TRADE_PLAN_REPLACE_EXISTING",),
+        True,
+    )
     args.enable_production_daily_observation_report = _resolve_bool_option(
         args.enable_production_daily_observation_report,
         ("SQV2_DAILY_ENABLE_PRODUCTION_DAILY_OBSERVATION_REPORT",),
@@ -598,6 +619,31 @@ class DatabaseInspector:
             fallback = self._safe_scalar(session, "SELECT MAX(trade_date) FROM core_daily_bar")
             return self._coerce_to_date(fallback)
 
+    def next_trading_day(self, after_date: date) -> date | None:
+        candidates = [
+            ("meta_trading_calendar", "trade_date", "is_open"),
+            ("meta_trading_calendar", "calendar_date", "is_open"),
+            ("meta_trading_calendar", "trade_date", "is_trading_day"),
+            ("meta_trading_calendar", "calendar_date", "is_trading_day"),
+        ]
+
+        from stock_quant_v2.db.session import SessionLocal
+
+        with SessionLocal() as session:
+            for table_name, date_col, open_col in candidates:
+                sql = f"""
+                SELECT MIN({date_col})
+                FROM {table_name}
+                WHERE {open_col} = TRUE
+                  AND {date_col} > :after_date
+                """
+                value = self._safe_scalar(session, sql, {"after_date": after_date})
+                coerced = self._coerce_to_date(value)
+                if coerced is not None:
+                    return coerced
+
+        return None
+
     def has_previous_snapshot(self, portfolio_id: int, effective_date: date) -> bool:
         sql = """
         select 1
@@ -691,6 +737,114 @@ def _resolve_paper_step(args: argparse.Namespace) -> ChainStep | None:
     )
 
 
+def _resolve_relative_path(project_root: Path, value: str | None) -> Path | None:
+    if value is None or str(value).strip() == "":
+        return None
+
+    path = Path(str(value).strip())
+    if path.is_absolute():
+        return path
+    return project_root / path
+
+
+def _load_next_trade_plan_campaigns(
+    *,
+    project_root: Path,
+    config_path: str | None,
+    execution_context: str,
+) -> list[dict]:
+    resolved_config = _resolve_relative_path(project_root, config_path)
+    if resolved_config is None:
+        default_config = project_root / "configs" / "paper_campaigns" / "active_campaigns.json"
+        resolved_config = default_config if default_config.exists() else None
+
+    if resolved_config is None or not resolved_config.exists():
+        return []
+
+    data = json.loads(resolved_config.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"campaign config must be a list: {resolved_config}")
+
+    campaigns: list[dict] = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status") or "").upper()
+        run_mode = str(raw.get("run_mode") or "").lower()
+        raw_execution_context = str(raw.get("execution_context") or "")
+        portfolio_id = raw.get("portfolio_id")
+
+        if status != "ACTIVE":
+            continue
+        if run_mode != "auto":
+            continue
+        if raw_execution_context != execution_context:
+            continue
+        if portfolio_id in (None, ""):
+            continue
+
+        campaigns.append(raw)
+
+    return campaigns
+
+
+def _resolve_next_trade_plan_effective_date(args: argparse.Namespace) -> date | None:
+    if getattr(args, "next_trade_plan_effective_date", None):
+        return date.fromisoformat(str(args.next_trade_plan_effective_date))
+
+    inspector = DatabaseInspector()
+    latest_day = inspector.latest_trading_day()
+    if latest_day is None:
+        return None
+    return inspector.next_trading_day(latest_day)
+
+
+def _build_next_trade_plan_steps(project_root: Path, args: argparse.Namespace) -> list[ChainStep]:
+    if not getattr(args, "enable_next_trade_plan", False):
+        return []
+
+    effective_date = _resolve_next_trade_plan_effective_date(args)
+    if effective_date is None:
+        return []
+
+    campaigns = _load_next_trade_plan_campaigns(
+        project_root=project_root,
+        config_path=getattr(args, "m6_5_campaign_config", None),
+        execution_context=str(args.next_trade_plan_execution_context),
+    )
+    steps: list[ChainStep] = []
+
+    for campaign in campaigns:
+        portfolio_id = int(campaign["portfolio_id"])
+        campaign_code = str(campaign.get("campaign_code") or f"portfolio_{portfolio_id}")
+        step_name = f"m7_next_trade_plan_only_p{portfolio_id}"
+        extra_args = [
+            "--portfolio-id",
+            str(portfolio_id),
+            "--effective-date",
+            effective_date.isoformat(),
+            "--plan-only",
+        ]
+        if getattr(args, "next_trade_plan_replace_existing", True):
+            extra_args.append("--replace-existing")
+
+        steps.append(
+            ChainStep(
+                step_name,
+                "stock_quant_v2.scripts.bootstrap_m7_daily_refresh_chain",
+                extra_args=tuple(extra_args),
+                optional=True,
+                soft_fail=True,
+                extra_env={
+                    "SQV2_NEXT_TRADE_PLAN_CAMPAIGN_CODE": campaign_code,
+                    "SQV2_NEXT_TRADE_PLAN_EFFECTIVE_DATE": effective_date.isoformat(),
+                },
+            )
+        )
+
+    return steps
+
+
 def _build_taxonomy_daily_refresh_args(report_date: str | None) -> tuple[str, ...]:
     args: list[str] = [
         "--daily-refresh",
@@ -721,7 +875,7 @@ def _build_taxonomy_daily_refresh_args(report_date: str | None) -> tuple[str, ..
     return tuple(args)
 
 
-def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
+def _build_runtime_steps(args: argparse.Namespace, project_root: Path) -> list[ChainStep]:
     steps: list[ChainStep] = [
         ChainStep("m2_data_refresh", "stock_quant_v2.scripts.bootstrap_m2_data_refresh_chain"),
         ChainStep("m3_analytics_refresh", "stock_quant_v2.scripts.bootstrap_m3_analytics_refresh_chain"),
@@ -757,6 +911,8 @@ def _build_runtime_steps(args: argparse.Namespace) -> list[ChainStep]:
                 soft_fail=True,
             )
         )
+
+        steps.extend(_build_next_trade_plan_steps(project_root, args))
 
         if getattr(args, "enable_m6_5_campaign_summary", False):
             summary_args: list[str] = [
@@ -948,16 +1104,16 @@ def _build_research_steps(
 
     return steps
 
-def _build_steps(args: argparse.Namespace) -> list[ChainStep]:
+def _build_steps(args: argparse.Namespace, project_root: Path) -> list[ChainStep]:
     if args.profile == "runtime":
-        return _build_runtime_steps(args)
+        return _build_runtime_steps(args, project_root)
 
     if args.profile == "research":
         return _build_research_steps(args, include_m5_refresh=True)
 
     if args.profile == "full":
         return [
-            *_build_runtime_steps(args),
+            *_build_runtime_steps(args, project_root),
             *_build_research_steps(args, include_m5_refresh=False),
         ]
 
@@ -1130,6 +1286,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-next-trade-plan",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable automatic M7 plan-only next-trade target/order generation after M6.5 daily campaign. "
+            "This writes target/order rows only and must not write fill, position, or snapshot rows. "
+            "Default follows --enable-m6-5-campaign. Env: SQV2_DAILY_ENABLE_NEXT_TRADE_PLAN."
+        ),
+    )
+    parser.add_argument(
+        "--next-trade-plan-execution-context",
+        default=None,
+        help=(
+            "Campaign execution_context filter for automatic next-trade plan-only generation. "
+            "Default: production_paper_campaign. Env: SQV2_NEXT_TRADE_PLAN_EXECUTION_CONTEXT."
+        ),
+    )
+    parser.add_argument(
+        "--next-trade-plan-effective-date",
+        default=None,
+        help=(
+            "Optional override for next-trade plan effective_date, format YYYY-MM-DD. "
+            "Default: next open trading day after latest trading day. Env: SQV2_NEXT_TRADE_PLAN_EFFECTIVE_DATE."
+        ),
+    )
+    parser.add_argument(
+        "--next-trade-plan-replace-existing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pass --replace-existing to M7 plan-only next-trade generation. "
+            "Default: true for daily runtime idempotency. Env: SQV2_NEXT_TRADE_PLAN_REPLACE_EXISTING."
+        ),
+    )
+    parser.add_argument(
         "--enable-production-daily-observation-report",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1165,7 +1356,7 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
     args = _resolve_options_from_env(args)
 
     env = _build_runtime_env(project_root, args.report_date)
-    steps = _build_steps(args)
+    steps = _build_steps(args, project_root)
 
     print(f"[DAILY] Project {args.profile} chain started.", flush=True)
     print(f"[DAILY] project_root = {project_root}", flush=True)
