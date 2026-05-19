@@ -1831,6 +1831,7 @@ class ProductionDailyObservationReportBuilder:
             order_rows = self._next_trade_order_rows(
                 portfolio_id=portfolio_id,
                 next_trade_date=next_trade_date,
+                current_position_run_id=current_position_run_id,
                 # Fetch enough rows to calculate true side counts even when the
                 # markdown preview is capped by detail_limit.  A 30-stock rebalance
                 # can produce 60 order rows (30 SELL + 30 BUY).
@@ -1986,6 +1987,7 @@ class ProductionDailyObservationReportBuilder:
         *,
         portfolio_id: int,
         next_trade_date: date,
+        current_position_run_id: int | None,
         limit: int,
     ) -> list[dict[str, Any]]:
         sql = """
@@ -1994,6 +1996,17 @@ class ProductionDailyObservationReportBuilder:
             from public.trading_paper_order
             where portfolio_id = :portfolio_id
               and effective_date = :next_trade_date
+        ),
+        current_pos as (
+            select
+                instrument_id,
+                quantity as current_quantity,
+                market_value as current_market_value,
+                total_pnl as current_total_pnl,
+                position_status as current_position_status
+            from public.trading_paper_position
+            where portfolio_id = :portfolio_id
+              and run_id = :current_position_run_id
         )
         select
             o.run_id as order_run_id,
@@ -2024,11 +2037,37 @@ class ProductionDailyObservationReportBuilder:
             ss.effective_date as source_signal_effective_date,
             ss.rank_in_batch as source_rank,
             ss.reason_code as signal_reason_code,
+            cp.current_quantity,
+            cp.current_market_value,
+            cp.current_total_pnl,
+            cp.current_position_status,
             upper(o.order_side) as plan_action,
-            'next_trade_date_order' as plan_reason
+            case
+                when upper(o.order_side) = 'SELL' and t.id is null then
+                    'SELL_NOT_IN_NEXT_TARGET;TARGET_QUANTITY_ZERO;REBALANCE_ROTATION'
+                when upper(o.order_side) = 'SELL' and coalesce(o.target_quantity, t.target_quantity, 0) = 0 then
+                    'TARGET_QUANTITY_ZERO;SELL_TO_EXIT'
+                when upper(o.order_side) = 'SELL'
+                     and cp.instrument_id is not null
+                     and coalesce(t.target_quantity, o.target_quantity, 0) < coalesce(cp.current_quantity, 0) then
+                    'TARGET_QUANTITY_REDUCED;SELL_REBALANCE'
+                when upper(o.order_side) = 'SELL' then
+                    'SELL_ORDER_OBSERVED'
+                when upper(o.order_side) = 'BUY'
+                     and (cp.instrument_id is null or coalesce(cp.current_quantity, 0) = 0) then
+                    'BUY_NEW_NEXT_TARGET;NEXT_SIGNAL_TOP_SELECTED'
+                when upper(o.order_side) = 'BUY'
+                     and coalesce(t.target_quantity, o.target_quantity, 0) > coalesce(cp.current_quantity, 0) then
+                    'TARGET_QUANTITY_INCREASED;BUY_REBALANCE'
+                when upper(o.order_side) = 'BUY' then
+                    'BUY_ORDER_OBSERVED'
+                else
+                    'next_trade_date_order'
+            end as plan_reason
         from public.trading_paper_order o
         join order_run r on r.order_run_id = o.run_id
         left join public.trading_paper_target_position t on t.id = o.target_position_id
+        left join current_pos cp on cp.instrument_id = o.instrument_id
         left join public.strategy_signal ss on ss.id = t.strategy_signal_id
         left join public.meta_instrument mi on mi.id = o.instrument_id
         where o.portfolio_id = :portfolio_id
@@ -2041,6 +2080,7 @@ class ProductionDailyObservationReportBuilder:
             {
                 "portfolio_id": portfolio_id,
                 "next_trade_date": next_trade_date,
+                "current_position_run_id": current_position_run_id,
                 "limit": limit,
             },
         )
@@ -4978,6 +5018,7 @@ class ProductionDailyObservationReportBuilder:
                 f"- plan_basis: `{plan.get('plan_basis')}`",
                 f"- next_plan_signal_as_of_date: `{self._json_default(plan.get('next_plan_signal_as_of_date'))}` / next_plan_signal_run_id: `{self._json_default(plan.get('next_plan_signal_run_id'))}` / next_plan_signal_effective_date: `{self._json_default(plan.get('next_plan_signal_effective_date'))}`",
                 f"- preview_count: buy `{plan.get('planned_buy_preview_count')}` / sell `{plan.get('planned_sell_preview_count')}` / hold `{plan.get('planned_hold_preview_count')}`",
+                "- sell_reason_scope: 仅基于当前持仓、next target/order、next signal 做调仓归因；止损、20日退出、利润回撤、风险减仓等正式卖点规则尚未在本节判定。",
                 "",
                 "#### 明日计划买入 / 加仓",
                 "",
@@ -5748,7 +5789,7 @@ class ProductionDailyObservationReportBuilder:
                 order_run_id = self._optional_int(plan.get("order_run_id"))
                 target_run_id = self._optional_int(plan.get("target_run_id"))
                 if order_run_id is not None:
-                    rows.extend(self._next_trade_order_export_rows(campaign_base, order_run_id=order_run_id))
+                    rows.extend(self._next_trade_order_export_rows(campaign_base, order_run_id=order_run_id, current_position_run_id=self._optional_int(plan.get("current_position_run_id"))))
                 elif target_run_id is not None:
                     rows.extend(self._next_trade_target_export_rows(campaign_base, target_run_id=target_run_id))
                 else:
@@ -5763,8 +5804,18 @@ class ProductionDailyObservationReportBuilder:
                 })
         return rows
 
-    def _next_trade_order_export_rows(self, base: dict[str, Any], *, order_run_id: int) -> list[dict[str, Any]]:
+    def _next_trade_order_export_rows(self, base: dict[str, Any], *, order_run_id: int, current_position_run_id: int | None) -> list[dict[str, Any]]:
         sql = """
+        with current_pos as (
+            select
+                instrument_id,
+                quantity as current_quantity,
+                market_value as current_market_value,
+                total_pnl as current_total_pnl,
+                position_status as current_position_status
+            from public.trading_paper_position
+            where run_id = :current_position_run_id
+        )
         select
             o.id as order_id,
             o.run_id as order_run_id,
@@ -5798,9 +5849,36 @@ class ProductionDailyObservationReportBuilder:
             ss.raw_score as source_raw_score,
             ss.normalized_score as source_normalized_score,
             ss.confidence_score as source_confidence_score,
-            ss.reason_code as signal_reason_code
+            ss.reason_code as signal_reason_code,
+            cp.current_quantity,
+            cp.current_market_value,
+            cp.current_total_pnl,
+            cp.current_position_status,
+            case
+                when upper(o.order_side) = 'SELL' and t.id is null then
+                    'SELL_NOT_IN_NEXT_TARGET;TARGET_QUANTITY_ZERO;REBALANCE_ROTATION'
+                when upper(o.order_side) = 'SELL' and coalesce(o.target_quantity, t.target_quantity, 0) = 0 then
+                    'TARGET_QUANTITY_ZERO;SELL_TO_EXIT'
+                when upper(o.order_side) = 'SELL'
+                     and cp.instrument_id is not null
+                     and coalesce(t.target_quantity, o.target_quantity, 0) < coalesce(cp.current_quantity, 0) then
+                    'TARGET_QUANTITY_REDUCED;SELL_REBALANCE'
+                when upper(o.order_side) = 'SELL' then
+                    'SELL_ORDER_OBSERVED'
+                when upper(o.order_side) = 'BUY'
+                     and (cp.instrument_id is null or coalesce(cp.current_quantity, 0) = 0) then
+                    'BUY_NEW_NEXT_TARGET;NEXT_SIGNAL_TOP_SELECTED'
+                when upper(o.order_side) = 'BUY'
+                     and coalesce(t.target_quantity, o.target_quantity, 0) > coalesce(cp.current_quantity, 0) then
+                    'TARGET_QUANTITY_INCREASED;BUY_REBALANCE'
+                when upper(o.order_side) = 'BUY' then
+                    'BUY_ORDER_OBSERVED'
+                else
+                    'next_trade_date_order'
+            end as derived_plan_reason
         from public.trading_paper_order o
         left join public.trading_paper_target_position t on t.id = o.target_position_id
+        left join current_pos cp on cp.instrument_id = o.instrument_id
         left join public.strategy_signal ss on ss.id = t.strategy_signal_id
         left join public.meta_instrument mi on mi.id = o.instrument_id
         where o.run_id = :order_run_id
@@ -5809,13 +5887,13 @@ class ProductionDailyObservationReportBuilder:
                  o.id
         """
         out: list[dict[str, Any]] = []
-        for row in self._rows(sql, {"order_run_id": order_run_id}):
+        for row in self._rows(sql, {"order_run_id": order_run_id, "current_position_run_id": current_position_run_id}):
             side = str(row.get("order_side") or "").upper()
             out.append({
                 **base,
                 "row_source": "trading_paper_order",
                 "plan_action": side or "ORDER",
-                "plan_reason": "next_trade_date_order",
+                "plan_reason": row.get("derived_plan_reason") or "next_trade_date_order",
                 **row,
             })
         return out
