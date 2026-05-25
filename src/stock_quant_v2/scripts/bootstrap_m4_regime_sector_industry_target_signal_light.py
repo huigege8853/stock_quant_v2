@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -159,7 +160,81 @@ def fetch_target_signal_summary(engine, strategy_code: str, strategy_version_cod
     return payload
 
 
-def run_module(module: str, *, report_date: date, effective_date: date, output_root: pathlib.Path) -> dict[str, Any]:
+def _append_env_file(cmd: list[str], env_file: str | None) -> None:
+    if env_file and str(env_file).strip():
+        cmd.extend(["--env-file", str(env_file).strip()])
+
+
+def _module_output_dir(module: str, output_root: pathlib.Path) -> pathlib.Path:
+    if module.endswith("bootstrap_m4_industry_strength_feature_s1_2"):
+        return output_root / "s1_industry_strength"
+    if module.endswith("bootstrap_m4_regime_sector_industry_rule_validation_s2"):
+        return output_root / "s2_rule_validation"
+    if module.endswith("bootstrap_m4_regime_sector_industry_signal_preview_s3"):
+        return output_root / "s3_signal_preview"
+    return output_root / module.replace(".", "_")
+
+
+def build_module_cmd(
+    module: str,
+    *,
+    project_root: pathlib.Path,
+    report_date: date,
+    effective_date: date,
+    output_root: pathlib.Path,
+    strategy_version_code: str,
+    env_file: str | None,
+) -> tuple[list[str], pathlib.Path]:
+    d = report_date.isoformat()
+    e = effective_date.isoformat()
+    module_out = _module_output_dir(module, output_root)
+    module_out.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        module,
+        "--project-root",
+        str(project_root),
+        "--report-date",
+        d,
+        "--output-dir",
+        str(module_out),
+    ]
+    _append_env_file(cmd, env_file)
+
+    if module.endswith("bootstrap_m4_industry_strength_feature_s1_2"):
+        # S1.2 requires both --report-date and --trade-date.
+        # This route intentionally skips taxonomy p0 and only refreshes the target date's industry-strength features.
+        cmd.extend(["--trade-date", d, "--no-progress"])
+    elif module.endswith("bootstrap_m4_regime_sector_industry_rule_validation_s2"):
+        # S2 requires both --report-date and --trade-date.
+        cmd.extend(["--trade-date", d, "--no-progress"])
+    elif module.endswith("bootstrap_m4_regime_sector_industry_signal_preview_s3"):
+        # S3 consumes the S2 output when this light route runs the full preview chain.
+        s2_dir = output_root / "s2_rule_validation"
+        if s2_dir.exists():
+            cmd.extend(["--s2-artifact-dir", str(s2_dir)])
+        cmd.extend([
+            "--effective-date",
+            e,
+            "--strategy-version-ref",
+            strategy_version_code,
+        ])
+    return cmd, module_out
+
+
+def run_module(
+    module: str,
+    *,
+    project_root: pathlib.Path,
+    report_date: date,
+    effective_date: date,
+    output_root: pathlib.Path,
+    strategy_code: str,
+    strategy_version_code: str,
+    env_file: str | None,
+) -> dict[str, Any]:
     env = os.environ.copy()
     d = report_date.isoformat()
     env.update({
@@ -167,21 +242,30 @@ def run_module(module: str, *, report_date: date, effective_date: date, output_r
         "M4_SIGNAL_AS_OF_DATE": d,
         "M4_TRADE_DATE": d,
         "M4_EFFECTIVE_DATE": effective_date.isoformat(),
-        "SQV2_RESEARCH_STRATEGY_CODE": DEFAULT_STRATEGY_CODE,
-        "SQV2_RESEARCH_STRATEGY_VERSION_CODE": DEFAULT_STRATEGY_VERSION_CODE,
+        "SQV2_RESEARCH_STRATEGY_CODE": strategy_code,
+        "SQV2_RESEARCH_STRATEGY_VERSION_CODE": strategy_version_code,
     })
     log_dir = output_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     safe_name = module.replace(".", "_")
     stdout_path = log_dir / f"{safe_name}.stdout.log"
     stderr_path = log_dir / f"{safe_name}.stderr.log"
-    cmd = [sys.executable, "-m", module]
+    cmd, module_out = build_module_cmd(
+        module,
+        project_root=project_root,
+        report_date=report_date,
+        effective_date=effective_date,
+        output_root=output_root,
+        strategy_version_code=strategy_version_code,
+        env_file=env_file,
+    )
     started = utc_now_iso()
     with stdout_path.open("w", encoding="utf-8") as out, stderr_path.open("w", encoding="utf-8") as err:
-        proc = subprocess.run(cmd, cwd=pathlib.Path.cwd(), env=env, stdout=out, stderr=err, text=True)
+        proc = subprocess.run(cmd, cwd=project_root, env=env, stdout=out, stderr=err, text=True)
     return {
         "module": module,
         "cmd": cmd,
+        "artifact_dir": str(module_out),
         "started_at_utc": started,
         "finished_at_utc": utc_now_iso(),
         "return_code": proc.returncode,
@@ -241,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build/write regime_sector_industry target M4 strategy_signal using existing production/research code paths."
     )
+    parser.add_argument("--project-root", default=".", help="Project root. The script changes cwd before resolving relative paths.")
+    parser.add_argument("--env-file", default="", help="Optional dotenv file passed to preview/db-write modules that support it.")
     parser.add_argument("--report-date", default="", help="Signal preview report/as-of date. Default: latest closed trade date.")
     parser.add_argument("--effective-date", default="", help="Signal effective date. Default: report-date.")
     parser.add_argument("--strategy-code", default=os.getenv("SQV2_RESEARCH_STRATEGY_CODE", DEFAULT_STRATEGY_CODE))
@@ -255,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--output-json", default="")
     args = parser.parse_args(argv)
+
+    project_root = pathlib.Path(args.project_root).resolve()
+    os.chdir(project_root)
 
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -281,9 +370,11 @@ def main(argv: list[str] | None = None) -> int:
             "effective_date": effective_date,
             "preview_artifact_dir": pathlib.Path(args.preview_artifact_dir),
             "output_dir": output_dir,
+            "project_root": project_root,
         },
         "pre_signal": fetch_target_signal_summary(engine, args.strategy_code, args.strategy_version_code),
         "preview_modules": [],
+        "contract_preview_artifact_dir": None,
         "contract_or_write": None,
         "post_signal": None,
         "status": "INIT",
@@ -295,21 +386,35 @@ def main(argv: list[str] | None = None) -> int:
     elif args.build_preview:
         modules = DEFAULT_BUILD_MODULES
 
+    built_preview_artifact_dir: pathlib.Path | None = None
     for module in modules:
-        step = run_module(module, report_date=report_date, effective_date=effective_date, output_root=output_dir)
+        step = run_module(
+            module,
+            project_root=project_root,
+            report_date=report_date,
+            effective_date=effective_date,
+            output_root=output_dir,
+            strategy_code=args.strategy_code,
+            strategy_version_code=args.strategy_version_code,
+            env_file=args.env_file,
+        )
         payload["preview_modules"].append(step)
+        if module.endswith("bootstrap_m4_regime_sector_industry_signal_preview_s3") and step["return_code"] == 0:
+            built_preview_artifact_dir = pathlib.Path(step["artifact_dir"])
         if step["return_code"] != 0:
             payload["status"] = "FAIL_PREVIEW_MODULE"
             payload["failed_module"] = module
             break
     else:
         try:
+            contract_preview_dir = built_preview_artifact_dir or pathlib.Path(args.preview_artifact_dir)
+            payload["contract_preview_artifact_dir"] = contract_preview_dir
             payload["contract_or_write"] = run_contract_or_write(
                 engine=engine,
                 report_date=report_date,
                 effective_date=effective_date,
-                preview_artifact_dir=pathlib.Path(args.preview_artifact_dir),
-                output_dir=output_dir,
+                preview_artifact_dir=contract_preview_dir,
+                output_dir=output_dir / "db_write_contract",
                 strategy_code=args.strategy_code,
                 strategy_version_code=args.strategy_version_code,
                 write_db=bool(args.write_db),
