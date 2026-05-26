@@ -10,6 +10,7 @@ from typing import Callable
 from stock_quant_v2.strategy_domain.services.regime_sector_industry_signal_preview_db_write_service import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PREVIEW_ARTIFACT_DIR,
+    DEFAULT_SCORE_POLICY,
     DEFAULT_STRATEGY_VERSION_CODE,
     STRATEGY_CODE,
     RegimeSectorIndustrySignalPreviewDbWriteService,
@@ -31,11 +32,13 @@ def run_build_regime_sector_industry_signal_preview_db_write(
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     strategy_code: str = STRATEGY_CODE,
     strategy_version_code: str = DEFAULT_STRATEGY_VERSION_CODE,
+    score_policy: str = DEFAULT_SCORE_POLICY,
     effective_date: date | None = None,
     write_db: bool = False,
     write_confirmation: str = "",
     allow_existing_same_version_date: bool = False,
     max_rows: int | None = None,
+    allow_latest_preview_artifact_fallback: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> BuildSignalPreviewDbWriteTaskResult:
     config = SignalPreviewDbWriteContractConfig(
@@ -44,11 +47,13 @@ def run_build_regime_sector_industry_signal_preview_db_write(
         output_dir=Path(output_dir),
         strategy_code=strategy_code,
         strategy_version_code=strategy_version_code,
+        score_policy=score_policy,
         effective_date=effective_date,
         write_db=write_db,
         write_confirmation=write_confirmation,
         allow_existing_same_version_date=allow_existing_same_version_date,
         max_rows=max_rows,
+        allow_latest_preview_artifact_fallback=allow_latest_preview_artifact_fallback,
     )
     service = RegimeSectorIndustrySignalPreviewDbWriteService(engine)
     result = service.build_contract_or_write(config, progress_callback=progress_callback)

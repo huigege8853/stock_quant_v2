@@ -17,6 +17,28 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+
+def _release_identity(payload: dict) -> dict:
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    contract = payload.get("r63_fast_deploy_contract") if isinstance(payload.get("r63_fast_deploy_contract"), dict) else {}
+    return {
+        "strategy_code": payload.get("strategy_code"),
+        "version_code": payload.get("version_code") or payload.get("strategy_version_code"),
+        "parameter_version_id": (
+            payload.get("parameter_version_id")
+            or params.get("parameter_version_id")
+            or contract.get("parameter_version_id")
+        ),
+        "policy_effective_hash": (
+            payload.get("policy_effective_hash")
+            or params.get("policy_effective_hash")
+            or contract.get("policy_effective_hash")
+        ),
+        "release_profile": payload.get("release_profile") or params.get("release_profile"),
+        "checksum": payload.get("checksum"),
+    }
+
+
 def main() -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,14 +69,15 @@ def main() -> int:
         except Exception:
             current = {}
 
-    if (
-        current.get("strategy_code") == payload.get("strategy_code")
-        and current.get("version_code") == payload.get("version_code")
-    ):
+    current_identity = _release_identity(current)
+    payload_identity = _release_identity(payload)
+
+    if current_identity == payload_identity:
         print(json.dumps({
             "status": "NO_CHANGE",
             "strategy_code": payload["strategy_code"],
             "version_code": payload["version_code"],
+            "release_identity": payload_identity,
         }, ensure_ascii=False))
         return 0
 

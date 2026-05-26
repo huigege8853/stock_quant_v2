@@ -1,0 +1,905 @@
+{
+  "status": "PASS",
+  "generated_at": "2026-05-11T09:56:58+00:00",
+  "stage": "M5_ADAPTIVE_EXECUTION_POLICY_DESIGN",
+  "execution_policy_code": "adaptive_entry_exit_v1",
+  "execution_policy_version": "v1",
+  "risk_budget_policy_code": "risk_budget_policy_v1",
+  "risk_budget_policy_version": "v1",
+  "candidate_pool_provider": {
+    "role": "baseline_candidate_pool_provider",
+    "strategy_code": "regime_sector_industry_selection_v1",
+    "strategy_version_code": "v1_regime_state_machine",
+    "source_stage": "M4_strategy_signal",
+    "candidate_pool_top_n_policy": {
+      "mode": "inherit_from_versioned_candidate_pool_or_research_request",
+      "hardcoded_in_execution_policy_v1": false,
+      "stage2_requirement": "The adaptive dry-run must persist the actual candidate_top_n used for request-level attribution.",
+      "experiment_values_reserved_for_stage5": [
+        50,
+        100,
+        150
+      ]
+    },
+    "boundaries": [
+      "V1 answers what to buy; V2 execution policy answers when to buy, when to sell, and how much.",
+      "Do not tune v1_regime_state_machine inside V2 Stage 1.",
+      "Do not bypass M4 strategy_signal handoff."
+    ]
+  },
+  "risk_budget_policy": {
+    "RISK_ON": {
+      "total_position_cap": "0.85",
+      "max_new_positions_per_day": 5
+    },
+    "RANGE": {
+      "total_position_cap": "0.25",
+      "max_new_positions_per_day": 1
+    },
+    "RISK_OFF": {
+      "total_position_cap": "0.30",
+      "max_new_positions_per_day": 1
+    }
+  },
+  "execution_policy": {
+    "portfolio_constraints": {
+      "max_total_positions": 15,
+      "single_position_weight": "0.05",
+      "max_industry_weight": "0.18",
+      "min_cash_reserve": "0.10",
+      "order_round_lot": 100
+    },
+    "entry_policy_v1": {
+      "entry_allowed_all_required": [
+        "candidate_pool_match",
+        "route_match",
+        "liquidity_ok",
+        "not_limit_up",
+        "risk_budget_available",
+        "board_lot_ok"
+      ],
+      "complex_entry_patterns_deferred": [
+        "breakout_entry",
+        "pullback_entry",
+        "oversold_reversal_entry"
+      ],
+      "defer_reason": "Stage 1/2 must first validate position lifecycle and risk-budget ordering."
+    },
+    "exit_policy_v1": {
+      "hard_stop_loss": "-0.09",
+      "max_holding_days": 20,
+      "trailing_profit_start": "0.05",
+      "trailing_profit_drawdown": "0.035",
+      "signal_exit_confirm_days": 2,
+      "exit_rules": [
+        "hard_stop_loss",
+        "max_holding_days_exit",
+        "trailing_profit_drawdown_exit",
+        "signal_exit",
+        "market_regime_exit",
+        "industry_strength_exit",
+        "liquidity_exit"
+      ]
+    },
+    "daily_execution_order": [
+      "read_confirmed_market_regime",
+      "generate_daily_risk_budget",
+      "read_candidate_pool_signal",
+      "check_existing_position_exits_first",
+      "execute_sells",
+      "update_cash_after_sells",
+      "check_new_candidate_entries",
+      "execute_buys",
+      "update_portfolio_nav",
+      "write_attribution_log"
+    ],
+    "candidate_strategy_policies": {
+      "trend_growth": {
+        "description": "顺势趋势成长，保留主要正贡献，但必须通过 top-down gate。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "allow_entry": true,
+            "position_weight_multiplier": "1.20",
+            "min_signal_confidence": "0.50",
+            "entry_reason": "v2_top_down_gate+trend_growth+risk_on"
+          },
+          "RANGE": {
+            "allow_entry": true,
+            "position_weight_multiplier": "0.55",
+            "min_signal_confidence": "0.58",
+            "min_market_breadth_score": "0.48",
+            "entry_reason": "v2_top_down_gate+trend_growth+range_reduced"
+          },
+          "RISK_OFF": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          }
+        }
+      },
+      "range_pullback_quality": {
+        "description": "当前主要亏损来源，只在 RANGE 且宽度/置信度通过时小预算试运行。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RANGE": {
+            "allow_entry": true,
+            "position_weight_multiplier": "0.30",
+            "min_signal_confidence": "0.62",
+            "min_market_breadth_score": "0.52",
+            "block_transition_new_entries": true,
+            "entry_reason": "v2_top_down_gate+range_pullback_quality+tight"
+          },
+          "RISK_OFF": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          }
+        }
+      },
+      "risk_off_defensive": {
+        "description": "RISK_OFF 防守策略，保留正贡献，避免在 RANGE 被误用。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RANGE": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RISK_OFF": {
+            "allow_entry": true,
+            "position_weight_multiplier": "1.15",
+            "min_signal_confidence": "0.42",
+            "entry_reason": "v2_top_down_gate+risk_off_defensive"
+          }
+        }
+      },
+      "oversold_reversal": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "L3候选池占位：未完成验证前只观察不买入。"
+      },
+      "concept_strength": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "L7概念/主题先 observation-only，不直接改变买卖。"
+      },
+      "capital_flow": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "资金活跃度先 observation-only，不直接改变买卖。"
+      },
+      "trend_growth_strategy": {
+        "description": "顺势趋势成长，保留主要正贡献，但必须通过 top-down gate。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "allow_entry": true,
+            "position_weight_multiplier": "1.20",
+            "min_signal_confidence": "0.50",
+            "entry_reason": "v2_top_down_gate+trend_growth+risk_on"
+          },
+          "RANGE": {
+            "allow_entry": true,
+            "position_weight_multiplier": "0.55",
+            "min_signal_confidence": "0.58",
+            "min_market_breadth_score": "0.48",
+            "entry_reason": "v2_top_down_gate+trend_growth+range_reduced"
+          },
+          "RISK_OFF": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          }
+        },
+        "alias_of": "trend_growth",
+        "allocator_alias_key": "trend_growth_strategy"
+      },
+      "range_pullback_quality_strategy": {
+        "description": "当前主要亏损来源，只在 RANGE 且宽度/置信度通过时小预算试运行。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RANGE": {
+            "allow_entry": true,
+            "position_weight_multiplier": "0.30",
+            "min_signal_confidence": "0.62",
+            "min_market_breadth_score": "0.52",
+            "block_transition_new_entries": true,
+            "entry_reason": "v2_top_down_gate+range_pullback_quality+tight"
+          },
+          "RISK_OFF": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          }
+        },
+        "alias_of": "range_pullback_quality",
+        "allocator_alias_key": "range_pullback_quality_strategy"
+      },
+      "risk_off_defensive_strategy": {
+        "description": "RISK_OFF 防守策略，保留正贡献，避免在 RANGE 被误用。",
+        "policy_by_regime": {
+          "RISK_ON": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RANGE": {
+            "entry_mode": "OBSERVATION_ONLY",
+            "position_weight_multiplier": "0"
+          },
+          "RISK_OFF": {
+            "allow_entry": true,
+            "position_weight_multiplier": "1.15",
+            "min_signal_confidence": "0.42",
+            "entry_reason": "v2_top_down_gate+risk_off_defensive"
+          }
+        },
+        "alias_of": "risk_off_defensive",
+        "allocator_alias_key": "risk_off_defensive_strategy"
+      },
+      "oversold_reversal_strategy": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "L3候选池占位：未完成验证前只观察不买入。",
+        "alias_of": "oversold_reversal",
+        "allocator_alias_key": "oversold_reversal_strategy"
+      },
+      "concept_strength_strategy": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "L7概念/主题先 observation-only，不直接改变买卖。",
+        "alias_of": "concept_strength",
+        "allocator_alias_key": "concept_strength_strategy"
+      },
+      "capital_flow_strategy": {
+        "entry_mode": "OBSERVATION_ONLY",
+        "description": "资金活跃度先 observation-only，不直接改变买卖。",
+        "alias_of": "capital_flow",
+        "allocator_alias_key": "capital_flow_strategy"
+      }
+    }
+  },
+  "parameter_rows": [
+    {
+      "section": "candidate_pool",
+      "parameter_name": "candidate_pool_provider_strategy_code",
+      "parameter_value": "regime_sector_industry_selection_v1",
+      "unit": "code",
+      "source": "V1 frozen baseline",
+      "stage_usage": "Stage 2 input",
+      "status": "PASS",
+      "detail": "Baseline candidate provider is frozen for V2 Stage 1."
+    },
+    {
+      "section": "candidate_pool",
+      "parameter_name": "candidate_pool_provider_strategy_version_code",
+      "parameter_value": "v1_regime_state_machine",
+      "unit": "code",
+      "source": "V1 frozen baseline",
+      "stage_usage": "Stage 2 input",
+      "status": "PASS",
+      "detail": "Do not retune V1 in this stage."
+    },
+    {
+      "section": "candidate_pool",
+      "parameter_name": "candidate_top_n_policy",
+      "parameter_value": "inherit_from_versioned_candidate_pool_or_research_request",
+      "unit": "policy",
+      "source": "Stage 1 boundary",
+      "stage_usage": "Stage 2 input contract",
+      "status": "PASS",
+      "detail": "Execution policy does not hardcode candidate_top_n; Stage 2 must record actual versioned value."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RISK_ON.total_position_cap",
+      "parameter_value": "0.80",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls total portfolio exposure by confirmed market regime."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RISK_ON.max_new_positions_per_day",
+      "parameter_value": "5",
+      "unit": "count",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls daily opening capacity by confirmed market regime."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RANGE.total_position_cap",
+      "parameter_value": "0.25",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls total portfolio exposure by confirmed market regime."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RANGE.max_new_positions_per_day",
+      "parameter_value": "1",
+      "unit": "count",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls daily opening capacity by confirmed market regime."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RISK_OFF.total_position_cap",
+      "parameter_value": "0.30",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls total portfolio exposure by confirmed market regime."
+    },
+    {
+      "section": "risk_budget",
+      "parameter_name": "RISK_OFF.max_new_positions_per_day",
+      "parameter_value": "1",
+      "unit": "count",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "daily risk budget",
+      "status": "PASS",
+      "detail": "Controls daily opening capacity by confirmed market regime."
+    },
+    {
+      "section": "portfolio",
+      "parameter_name": "max_total_positions",
+      "parameter_value": "15",
+      "unit": "count",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "position cap",
+      "status": "PASS",
+      "detail": "Maximum active positions."
+    },
+    {
+      "section": "portfolio",
+      "parameter_name": "single_position_weight",
+      "parameter_value": "0.05",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "position sizing",
+      "status": "PASS",
+      "detail": "Per-position target weight."
+    },
+    {
+      "section": "portfolio",
+      "parameter_name": "max_industry_weight",
+      "parameter_value": "0.18",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "industry concentration",
+      "status": "PASS",
+      "detail": "Maximum industry exposure."
+    },
+    {
+      "section": "portfolio",
+      "parameter_name": "min_cash_reserve",
+      "parameter_value": "0.10",
+      "unit": "ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "cash risk control",
+      "status": "PASS",
+      "detail": "Minimum cash reserve after orders."
+    },
+    {
+      "section": "portfolio",
+      "parameter_name": "order_round_lot",
+      "parameter_value": "100",
+      "unit": "shares",
+      "source": "A-share board lot",
+      "stage_usage": "order sizing",
+      "status": "PASS",
+      "detail": "Round order quantity to board lot."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "candidate_pool_match",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "route_match",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "liquidity_ok",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "not_limit_up",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "risk_budget_available",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "entry",
+      "parameter_name": "board_lot_ok",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "entry gate",
+      "status": "PASS",
+      "detail": "Required entry gate for Stage 2 minimal buy-point."
+    },
+    {
+      "section": "exit",
+      "parameter_name": "hard_stop_loss",
+      "parameter_value": "-0.09",
+      "unit": "return_ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "exit gate",
+      "status": "PASS",
+      "detail": "Hard loss stop."
+    },
+    {
+      "section": "exit",
+      "parameter_name": "max_holding_days",
+      "parameter_value": "20",
+      "unit": "trading_days",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "exit gate",
+      "status": "PASS",
+      "detail": "Time-based exit."
+    },
+    {
+      "section": "exit",
+      "parameter_name": "trailing_profit_start",
+      "parameter_value": "0.05",
+      "unit": "return_ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "exit gate",
+      "status": "PASS",
+      "detail": "Profit protection starts after this return."
+    },
+    {
+      "section": "exit",
+      "parameter_name": "trailing_profit_drawdown",
+      "parameter_value": "0.035",
+      "unit": "drawdown_ratio",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "exit gate",
+      "status": "PASS",
+      "detail": "Exit after profit drawdown threshold."
+    },
+    {
+      "section": "exit",
+      "parameter_name": "signal_exit_confirm_days",
+      "parameter_value": "2",
+      "unit": "trading_days",
+      "source": "施工总纲 Stage 1",
+      "stage_usage": "exit gate",
+      "status": "PASS",
+      "detail": "Signal exit confirmation window."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "hard_stop_loss",
+      "parameter_value": "-0.09",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "max_holding_days_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "trailing_profit_drawdown_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "signal_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "market_regime_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "industry_strength_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    },
+    {
+      "section": "exit_rule",
+      "parameter_name": "liquidity_exit",
+      "parameter_value": "True",
+      "unit": "boolean",
+      "source": "施工总纲 Stage 1/2",
+      "stage_usage": "exit reason",
+      "status": "PASS",
+      "detail": "Required exit reason category for Stage 2 lifecycle logs."
+    }
+  ],
+  "contract_checks": [
+    {
+      "check_name": "risk_budget_regime_coverage",
+      "status": "PASS",
+      "row_count": 3,
+      "detail": "required=['RANGE', 'RISK_OFF', 'RISK_ON'] present=['RANGE', 'RISK_OFF', 'RISK_ON']"
+    },
+    {
+      "check_name": "entry_gate_coverage",
+      "status": "PASS",
+      "row_count": 6,
+      "detail": "required=['board_lot_ok', 'candidate_pool_match', 'liquidity_ok', 'not_limit_up', 'risk_budget_available', 'route_match'] present=['board_lot_ok', 'candidate_pool_match', 'liquidity_ok', 'not_limit_up', 'risk_budget_available', 'route_match']"
+    },
+    {
+      "check_name": "exit_reason_coverage",
+      "status": "PASS",
+      "row_count": 7,
+      "detail": "required=['hard_stop_loss', 'industry_strength_exit', 'liquidity_exit', 'market_regime_exit', 'max_holding_days_exit', 'signal_exit', 'trailing_profit_drawdown_exit'] present=['hard_stop_loss', 'industry_strength_exit', 'liquidity_exit', 'market_regime_exit', 'max_holding_days_exit', 'signal_exit', 'trailing_profit_drawdown_exit']"
+    },
+    {
+      "check_name": "candidate_pool_provider_frozen",
+      "status": "PASS",
+      "row_count": 1,
+      "detail": "strategy_version_code=v1_regime_state_machine"
+    },
+    {
+      "check_name": "candidate_top_n_boundary",
+      "status": "PASS",
+      "row_count": 1,
+      "detail": "candidate_top_n is not guessed or hardcoded in execution_policy_v1; Stage 2 must record the actual versioned candidate-pool/request value."
+    },
+    {
+      "check_name": "parameter_rows_written",
+      "status": "PASS",
+      "row_count": 32,
+      "detail": "parameter_row_count=32"
+    },
+    {
+      "check_name": "artifact_only_guardrail",
+      "status": "PASS",
+      "row_count": 0,
+      "detail": "No DB engine is required in this mode; no strategy_signal or research_backtest_result writes are performed."
+    },
+    {
+      "check_name": "m6_guardrail",
+      "status": "PASS",
+      "row_count": 0,
+      "detail": "can_route_to_m6 is forced false for Stage 1 policy design."
+    },
+    {
+      "check_name": "future_data_guardrail",
+      "status": "PASS",
+      "row_count": 0,
+      "detail": "Policy uses only confirmed_market_regime and candidate-pool inputs; Stage 2 must preserve no-lookahead ordering."
+    }
+  ],
+  "validation_decision": {
+    "can_start_adaptive_execution_dry_run": true,
+    "can_write_strategy_signal": false,
+    "can_write_research_backtest_result": false,
+    "can_route_to_m6": false,
+    "can_claim_strategy_effective": false,
+    "interpretation_scope": "v2_stage1_adaptive_execution_policy_design_only",
+    "next_research_step": "Proceed to V2 Stage 2 adaptive execution dry-run skeleton only after manual review.",
+    "blocker_count": 0,
+    "warn_count": 0
+  },
+  "guardrails": [
+    "artifact_only_policy_design",
+    "does_not_read_database",
+    "does_not_write_strategy_signal",
+    "does_not_write_research_backtest_result",
+    "does_not_execute_backtest",
+    "does_not_route_to_m6",
+    "does_not_change_production_runtime",
+    "does_not_claim_performance"
+  ],
+  "next_stage_contract": {
+    "stage": "M5_ADAPTIVE_EXECUTION_DRY_RUN",
+    "must_sell_before_buy": true,
+    "must_keep_cash_non_negative": true,
+    "must_enforce_position_and_industry_caps": true,
+    "must_record_entry_reason": true,
+    "must_record_exit_reason": true,
+    "must_record_holding_days": true,
+    "must_record_max_floating_profit_and_loss": true,
+    "must_remain_artifact_only": true
+  },
+  "artifacts": {
+    "json_path": "artifacts\\m5\\adaptive_execution_design\\adaptive_execution_policy_v1.json",
+    "markdown_path": "artifacts\\m5\\adaptive_execution_design\\adaptive_execution_policy_v1.md",
+    "parameters_path": "artifacts\\m5\\adaptive_execution_design\\adaptive_execution_policy_v1_parameters.csv",
+    "contract_checks_path": "artifacts\\m5\\adaptive_execution_design\\adaptive_execution_contract_checks.csv"
+  },
+  "r62p6_tuning_note": {
+    "stage": "stage6_23r62p6_research_policy_v2_tight_range_patch",
+    "created_at": "2026-05-26T15:17:54.152810+08:00",
+    "profile": "policy_v2_tight_range_plus_tail_control",
+    "basis": {
+      "r62p5_current_realized_pnl": -274937.83100000164,
+      "r62p5_current_win_rate": 0.3858267716535433,
+      "r62p5_current_profit_factor": 0.954543045323181,
+      "remaining_drag": [
+        "range_pullback_quality",
+        "hard_stop_loss"
+      ]
+    },
+    "boundary": "research policy artifact only; no source code; no production; no DB"
+  },
+  "v2_market_layer_contract": {
+    "stage": "stage6_23r62p9b_existing_file_v2_structural_supplement_e_path",
+    "parameter_version_id": "R62P9_V2_STRUCTURAL_GATE_P1",
+    "layers": {
+      "L0_data_quality": [
+        "execution_price",
+        "limit_status",
+        "tradability",
+        "feature_coverage",
+        "future_data_guard"
+      ],
+      "L1_market_regime": [
+        "RISK_ON",
+        "RANGE",
+        "RISK_OFF",
+        "regime_confidence",
+        "transition_flag"
+      ],
+      "L2_risk_budget": [
+        "total_position_cap",
+        "max_new_positions_per_day",
+        "industry_weight",
+        "cash_reserve"
+      ],
+      "L3_strategy_allocator": [
+        "enabled",
+        "down_weight",
+        "observation_only",
+        "regime_adaptive"
+      ],
+      "L4_market_breadth": [
+        "market_breadth_score",
+        "earning_effect_score",
+        "limit_up_down_structure"
+      ],
+      "L5_vol_liquidity": [
+        "volatility",
+        "turnover",
+        "tradability"
+      ],
+      "L6_industry_structure": [
+        "industry_strength",
+        "industry_concentration",
+        "industry_rotation"
+      ],
+      "L7_concept_theme": [
+        "concept_strength",
+        "theme_persistence",
+        "observation_only_first"
+      ],
+      "L8_style_environment": [
+        "size",
+        "growth_value",
+        "low_vol_high_momentum"
+      ],
+      "L9_portfolio_exposure": [
+        "industry_concentration",
+        "single_name",
+        "cash_utilization"
+      ]
+    },
+    "principle": "top_down_attribution_before_entry_filter_or_parameter_tuning"
+  },
+  "market_structure_gate_policy": {
+    "enabled": true,
+    "stage": "stage6_23r62p11_existing_file_allocator_key_fix",
+    "scope": "M5 dry-run entry gate; R63 production fast-deploy must preserve the same policy hash before release.",
+    "missing_evidence_action": "ALLOW_WITH_WARN",
+    "regime_confidence_sources": [
+      "regime_confidence",
+      "market_regime_confidence",
+      "confidence_score"
+    ],
+    "transition_flag_sources": [
+      "transition_flag",
+      "market_transition_flag",
+      "regime_transition_flag"
+    ],
+    "market_breadth_sources": [
+      "market_breadth_score",
+      "breadth_score",
+      "earning_effect_score",
+      "赚钱效应",
+      "reason_payload_json.market_inputs.market_breadth_score",
+      "reason_payload_json.market_inputs.breadth_score",
+      "reason_payload_json.market_context.market_breadth_score"
+    ],
+    "by_regime": {
+      "RISK_ON": {
+        "min_signal_confidence": "0.50",
+        "min_market_breadth_score": "0.50",
+        "block_transition_new_entries": false
+      },
+      "RANGE": {
+        "min_signal_confidence": "0.58",
+        "min_market_breadth_score": "0.48",
+        "block_transition_new_entries": true
+      },
+      "RISK_OFF": {
+        "min_signal_confidence": "0.42",
+        "min_market_breadth_score": null,
+        "block_transition_new_entries": false
+      }
+    },
+    "r62p11_note": "Allocator now resolves candidate_strategy_code/bucket aliases; fail-closed support exists in code but missing evidence remains warn until M4 field coverage is verified."
+  },
+  "attribution_contract_v2": {
+    "enabled": true,
+    "parameter_version_id": "R62P9_V2_STRUCTURAL_GATE_P1",
+    "required_dimensions": [
+      "by_regime",
+      "by_strategy",
+      "by_entry_type",
+      "by_exit_reason",
+      "by_industry",
+      "by_holding_days",
+      "by_drawdown_period",
+      "by_parameter_version",
+      "by_market_structure_gate"
+    ],
+    "notes": "M9/report must show which strategy bucket, gate and parameter version generated the trade before R63 release."
+  },
+  "parameter_version_control": {
+    "enabled": true,
+    "parameter_version_id": "R62P13_V2_ALLOCATOR_RESOLVER_CALLSITE_FIX_P5",
+    "base_policy_chain": [
+      "R62P4_POLICY_V1",
+      "R62P6_POLICY_V2",
+      "R62P9_V2_STRUCTURAL_GATE_P1",
+      "R62P11_V2_ALLOCATOR_KEY_FIX_P2"
+    ],
+    "champion_candidate_status": "candidate_pending_walk_forward_validation_after_allocator_key_fix",
+    "r63_trigger_rule": {
+      "profit_factor_min": "1.00",
+      "win_rate_min": "0.40",
+      "realized_pnl_rule": "positive_or_near_flat_with_material_drawdown_reduction",
+      "window_pass_rule": "20_of_20_windows_must_pass_contract_checks"
+    },
+    "allocator_alias_fix": {
+      "enabled": true,
+      "aliases": {
+        "range_pullback_quality_strategy": "range_pullback_quality",
+        "trend_growth_strategy": "trend_growth",
+        "risk_off_defensive_strategy": "risk_off_defensive"
+      },
+      "fail_closed_on_missing_policy": true,
+      "fail_closed_on_missing_regime_override": true
+    },
+    "source_stage": "stage6_23r62p13_existing_file_allocator_resolver_callsite_fix",
+    "r63_fast_deploy_required": true,
+    "r63_fast_deploy_note": "research improvement must be released through R63 fast deploy, not manual production patching",
+    "r62p12_failure_reason": "allocator_resolver_keyword_only_callsite_typeerror",
+    "policy_effective_hash": "98100ff1940b2703"
+  },
+  "r63_fast_deploy_contract": {
+    "enabled": true,
+    "status": "DRAFT_RESEARCH_SIDE_CONTRACT_NOT_RELEASED",
+    "strategy_code": "regime_sector_industry_selection_v1",
+    "strategy_version_code": "v1_regime_state_machine",
+    "source_parameter_version_id": "R62P11_V2_ALLOCATOR_KEY_FIX_P2",
+    "research_to_production_principle": "validated research policy -> existing release/sync/daily entry -> Orange Pi pull only; no production source edit or commit",
+    "required_before_release": [
+      "walk_forward_20_window_pass",
+      "performance_report_material_improvement",
+      "policy_effective_hash_recorded",
+      "strategy_release_payload_contains_strategy_version_and_policy_hash",
+      "production_daily_m4_route_uses_released_target_strategy_not_alpha_selection",
+      "m6_5_and_m7_consume_exact_released_signal_run",
+      "candidate_strategy_code_bucket_alias_resolution_verified"
+    ],
+    "production_boundaries": {
+      "broker_order_enabled": false,
+      "allow_main_portfolio": false,
+      "production_source_edit": false,
+      "production_commit": false
+    },
+    "requires_allocator_alias_fix": true,
+    "required_parameter_version_id": "R62P11D_V2_ALLOCATOR_ALIAS_COMPLETE_FIX_P3",
+    "research_to_production_policy_hash_required": true,
+    "required_for_production_release": true,
+    "parameter_version_id": "R62P13_V2_ALLOCATOR_RESOLVER_CALLSITE_FIX_P5",
+    "requires_policy_hash": true,
+    "requires_research_walk_forward_report": true,
+    "requires_strategy_release_sync": true,
+    "production_must_pull_research_commit": true,
+    "production_source_edit_allowed": false,
+    "last_research_fix": "R62P13 resolver callsite keyword-only fix before R62P14 validation",
+    "required_fields": [
+      "strategy_code",
+      "strategy_version_code",
+      "parameter_version_id",
+      "policy_effective_hash",
+      "source_commit",
+      "release_profile",
+      "rollback_target",
+      "no_trade_reason"
+    ],
+    "production_route_requirement": "daily_m4_must_route_by_release_selected_strategy_not_hardcoded_alpha_selection",
+    "m7_signal_resolution_requirement": "campaign_strategy_version_policy_hash_specific_signal"
+  },
+  "r62p9_structural_supplement_note": {
+    "stage": "stage6_23r62p9b_existing_file_v2_structural_supplement_e_path",
+    "created_at": "2026-05-26T09:43:33+00:00",
+    "boundary": "existing files only; no new source files; production untouched",
+    "purpose": "补齐 V2 top-down gate / allocator / attribution / R63 contract, then continue parameter tuning."
+  },
+  "policy_effective_hash": "5b9cee95018fa81e",
+  "parameter_version_id": "R62P16_NO_TRADE_SEMANTICS_PRODUCTIZATION_P6",
+  "validation_semantics": {
+    "zero_candidate_window_status": "PASS_NO_TRADE_BY_DESIGN",
+    "zero_candidate_window_reason": "zero_candidate_rows_after_top_down_or_window_filter",
+    "m9_empty_trade_log_allowed_when_no_trade_by_design": true,
+    "research_window_filter_zero_candidate_soft_fail": true,
+    "r63_fast_deploy_requires_no_trade_reason_in_report": true
+  }
+}

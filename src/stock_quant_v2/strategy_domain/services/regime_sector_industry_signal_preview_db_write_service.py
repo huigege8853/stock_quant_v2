@@ -29,6 +29,15 @@ STAGE = "M4_SIGNAL_PREVIEW_DB_WRITE_CONTRACT"
 SOURCE_STAGE = "M4_S3_SIGNAL_PREVIEW"
 DEFAULT_PREVIEW_ARTIFACT_DIR = Path("artifacts") / "m4" / "strategy_signal_preview_v1_1"
 DEFAULT_OUTPUT_DIR = Path("artifacts") / "m4" / "strategy_signal_db_write_contract"
+SCORE_POLICY_V1_1 = "v1_1_preview_score"
+SCORE_POLICY_CLEANED_V1_1 = "cleaned_v1_1_preview_score"
+DEFAULT_SCORE_POLICY = SCORE_POLICY_V1_1
+SUPPORTED_SCORE_POLICIES = (SCORE_POLICY_V1_1, SCORE_POLICY_CLEANED_V1_1)
+EXECUTION_HANDOFF_BOUNDARY_DETAIL = (
+    "strategy_signal DB write certifies selection/ranking only; executable entry still requires "
+    "M5 candidate enrichment/dry-run evidence such as execution_price and not_limit_up. "
+    "Rows not explicitly proven not limit-up must remain blocked from entry handoff."
+)
 WRITE_MODE_DRY_RUN = "CONTRACT_DRY_RUN_ONLY"
 WRITE_MODE_DB = "PREVIEW_SCOPE_DB_WRITE"
 REQUIRED_WRITE_CONFIRMATION = "PREVIEW_SCOPE_ONLY"
@@ -74,6 +83,15 @@ DB_RESULT_ROW_COLUMNS = (
     "source_normalized_score",
     "source_confidence_score",
     "source_v1_1_preview_score",
+    "source_cleaned_v1_1_preview_score",
+    "source_cleaned_v1_1_score_delta",
+    "source_cleaned_concept_score",
+    "source_true_theme_score",
+    "source_true_theme_names",
+    "source_filtered_generic_concept_count",
+    "source_filtered_generic_concept_names",
+    "source_concept_cleaning_status",
+    "source_tag_classification_status",
     "source_v1_1_scoring_mode",
     "write_mode",
 )
@@ -169,11 +187,13 @@ class SignalPreviewDbWriteContractConfig:
     output_dir: Path = DEFAULT_OUTPUT_DIR
     strategy_code: str = STRATEGY_CODE
     strategy_version_code: str = DEFAULT_STRATEGY_VERSION_CODE
+    score_policy: str = DEFAULT_SCORE_POLICY
     effective_date: date | None = None
     write_db: bool = False
     write_confirmation: str = ""
     allow_existing_same_version_date: bool = False
     max_rows: int | None = None
+    allow_latest_preview_artifact_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -251,11 +271,13 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             config.preview_artifact_dir,
             exact_name=f"regime_sector_industry_signal_preview_{config.report_date}.json",
             pattern="regime_sector_industry_signal_preview_*.json",
+            allow_latest_fallback=config.allow_latest_preview_artifact_fallback,
         )
         preview_rows_path = self._resolve_artifact_path(
             config.preview_artifact_dir,
             exact_name=f"signal_preview_rows_{config.report_date}.csv",
             pattern="signal_preview_rows_*.csv",
+            allow_latest_fallback=config.allow_latest_preview_artifact_fallback,
         )
         if progress_callback:
             progress_callback(f"PREVIEW_ARTIFACTS_RESOLVED json={preview_json_path} rows={preview_rows_path}")
@@ -274,6 +296,20 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         source_blocker_count = int(preview_decision.get("blocker_count") or 0)
         source_can_start_write = bool(preview_decision.get("can_start_m4_signal_db_write_design"))
         source_row_count = int(preview_summary.get("signal_preview_row_count") or len(preview_rows) or 0)
+        score_policy = self._normalize_score_policy(config.score_policy)
+        if score_policy is None:
+            contract_check.append(self._check("score_policy_supported", "FAIL", f"score_policy={config.score_policy}; supported={SUPPORTED_SCORE_POLICIES}", rows=0))
+            action_items.append(
+                self._action(
+                    "BLOCKER",
+                    "score_policy",
+                    f"Unsupported score_policy={config.score_policy}.",
+                    f"Use one of: {', '.join(SUPPORTED_SCORE_POLICIES)}.",
+                )
+            )
+            score_policy = DEFAULT_SCORE_POLICY
+        else:
+            contract_check.append(self._check("score_policy_supported", "PASS", f"score_policy={score_policy}", rows=source_row_count))
 
         contract_check.append(self._check("source_preview_status", "PASS" if source_status in {"PASS", "PASS_WITH_WARN"} else "FAIL", f"status={source_status}", rows=source_row_count))
         contract_check.append(self._check("source_preview_blockers", "PASS" if source_blocker_count == 0 else "FAIL", f"blocker_count={source_blocker_count}", rows=source_row_count))
@@ -335,6 +371,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             preview_payload=preview_payload,
             strategy_version_id=strategy_version_id,
             effective_date_override=config.effective_date,
+            score_policy=score_policy,
         )
         contract_check.extend(candidate_checks)
 
@@ -346,6 +383,14 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             contract_check.append(self._check("as_of_date_singleton", "FAIL", f"as_of_dates={as_of_dates}", rows=len(candidate_rows)))
         if len(effective_dates) != 1:
             contract_check.append(self._check("effective_date_singleton", "FAIL", f"effective_dates={effective_dates}", rows=len(candidate_rows)))
+        contract_check.append(
+            self._check(
+                "execution_handoff_boundary",
+                "PASS",
+                EXECUTION_HANDOFF_BOUNDARY_DETAIL,
+                rows=len(candidate_rows),
+            )
+        )
 
         with self.engine.connect() as conn:
             existing_instruments = self._load_existing_instrument_ids(conn, [row["instrument_id"] for row in candidate_rows if row.get("instrument_id") is not None])
@@ -386,6 +431,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                 strategy_code=config.strategy_code,
                 strategy_version_code=config.strategy_version_code,
                 preview_payload=preview_payload,
+                score_policy=score_policy,
                 progress_callback=progress_callback,
             )
             contract_check.append(self._check("ops_run_created", "PASS", f"run_id={run_id} run_uid={run_uid_value}", rows=1))
@@ -408,6 +454,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             run_uid=run_uid_value,
             existing_signal_rows_before_write=existing_count,
             write_mode=write_mode,
+            score_policy=score_policy,
         )
         status = "FAIL" if final_blocker_count > 0 else "PASS_WITH_WARN"
         validation_decision = {
@@ -437,17 +484,31 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             validation_decision=validation_decision,
             contract_check=contract_check,
             action_items=action_items,
-            guardrails=self._guardrails(write_db=config.write_db),
+            guardrails=self._guardrails(write_db=config.write_db, score_policy=score_policy),
             candidate_rows=candidate_rows,
             result_rows=result_rows,
         )
         return self._write_artifacts(config=config, result=result)
 
-    def _resolve_artifact_path(self, directory: Path, *, exact_name: str, pattern: str) -> Path:
+    def _resolve_artifact_path(
+        self,
+        directory: Path,
+        *,
+        exact_name: str,
+        pattern: str,
+        allow_latest_fallback: bool = False,
+    ) -> Path:
         directory = Path(directory)
         exact_path = directory / exact_name
         if exact_path.exists():
             return exact_path
+        if not allow_latest_fallback:
+            raise FileNotFoundError(
+                f"Exact preview artifact missing in {directory}: {exact_name}. "
+                "Latest-file fallback is disabled for DB-write contract builds because it can mix "
+                "report_date/effective_date semantics. Regenerate or materialize the exact cleaned "
+                "preview artifact before running this contract."
+            )
         candidates = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
         if candidates:
             return candidates[0]
@@ -467,12 +528,32 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         preview_payload: Mapping[str, Any],
         strategy_version_id: int | None,
         effective_date_override: date | None,
+        score_policy: str,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         checks: list[dict[str, Any]] = []
         prepared: list[dict[str, Any]] = []
         missing_columns = self._missing_columns(preview_rows, PREVIEW_REQUIRED_COLUMNS)
         checks.append(self._check("preview_required_columns", "PASS" if not missing_columns else "FAIL", f"missing_columns={missing_columns}", rows=len(preview_rows)))
-        if missing_columns:
+        score_policy_required_columns = [score_policy]
+        if score_policy == SCORE_POLICY_CLEANED_V1_1:
+            score_policy_required_columns.extend(
+                [
+                    "cleaned_concept_score",
+                    "true_theme_score",
+                    "concept_cleaning_status",
+                    "tag_classification_status",
+                ]
+            )
+        score_policy_missing_columns = [column for column in score_policy_required_columns if preview_rows and column not in set(preview_rows[0].keys())]
+        checks.append(
+            self._check(
+                "score_policy_required_columns",
+                "PASS" if not score_policy_missing_columns else "FAIL",
+                f"score_policy={score_policy}; missing_columns={score_policy_missing_columns}",
+                rows=len(preview_rows),
+            )
+        )
+        if missing_columns or score_policy_missing_columns:
             return [], checks
 
         empty_counts: dict[str, int] = {column: 0 for column in PREVIEW_REQUIRED_COLUMNS}
@@ -511,7 +592,13 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             source_normalized_score = quantize_8(row.get("normalized_score"))
             source_confidence_score = quantize_8(row.get("confidence_score"))
             v1_1_score = quantize_8(row.get("v1_1_preview_score"))
-            db_score = v1_1_score if v1_1_score is not None else source_normalized_score
+            cleaned_v1_1_score = quantize_8(row.get("cleaned_v1_1_preview_score"))
+            if score_policy == SCORE_POLICY_CLEANED_V1_1:
+                db_score = cleaned_v1_1_score
+                score_written_to_db = SCORE_POLICY_CLEANED_V1_1
+            else:
+                db_score = v1_1_score if v1_1_score is not None else source_normalized_score
+                score_written_to_db = SCORE_POLICY_V1_1 if v1_1_score is not None else "normalized_score"
             if db_score is None:
                 score_missing += 1
             elif db_score < Decimal("0") or db_score > Decimal("1"):
@@ -531,11 +618,21 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                     "preview_scope_db_write": True,
                     "source_preview_signal_id": row.get("preview_signal_id"),
                     "source_preview_rank": row.get("rank_in_batch"),
-                    "score_written_to_db": "v1_1_preview_score" if v1_1_score is not None else "normalized_score",
+                    "score_written_to_db": score_written_to_db,
                     "source_raw_score": json_default(source_raw_score),
                     "source_normalized_score": json_default(source_normalized_score),
                     "source_confidence_score": json_default(source_confidence_score),
                     "source_v1_1_preview_score": json_default(v1_1_score),
+                    "source_cleaned_v1_1_preview_score": json_default(cleaned_v1_1_score),
+                    "source_cleaned_v1_1_score_delta": row.get("cleaned_v1_1_score_delta"),
+                    "source_cleaned_concept_score": row.get("cleaned_concept_score"),
+                    "source_true_theme_score": row.get("true_theme_score"),
+                    "source_true_theme_names": row.get("true_theme_names"),
+                    "source_filtered_generic_concept_count": row.get("filtered_generic_concept_count"),
+                    "source_filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
+                    "source_concept_cleaning_status": row.get("concept_cleaning_status"),
+                    "source_tag_classification_status": row.get("tag_classification_status"),
+                    "execution_handoff_boundary": EXECUTION_HANDOFF_BOUNDARY_DETAIL,
                     "m5_submission_allowed": False,
                     "paper_trading_allowed": False,
                 }
@@ -544,7 +641,9 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                 {
                     "write_mode": WRITE_MODE_DB,
                     "preview_scope_db_write": True,
-                    "score_written_to_db": "v1_1_preview_score" if v1_1_score is not None else "normalized_score",
+                    "score_policy": score_policy,
+                    "score_written_to_db": score_written_to_db,
+                    "execution_handoff_boundary": EXECUTION_HANDOFF_BOUNDARY_DETAIL,
                     "m5_submission_allowed": False,
                     "paper_trading_allowed": False,
                 }
@@ -576,12 +675,21 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                     "source_normalized_score": source_normalized_score,
                     "source_confidence_score": source_confidence_score,
                     "source_v1_1_preview_score": v1_1_score,
+                    "source_cleaned_v1_1_preview_score": cleaned_v1_1_score,
+                    "source_cleaned_v1_1_score_delta": row.get("cleaned_v1_1_score_delta"),
+                    "source_cleaned_concept_score": row.get("cleaned_concept_score"),
+                    "source_true_theme_score": row.get("true_theme_score"),
+                    "source_true_theme_names": row.get("true_theme_names"),
+                    "source_filtered_generic_concept_count": row.get("filtered_generic_concept_count"),
+                    "source_filtered_generic_concept_names": row.get("filtered_generic_concept_names"),
+                    "source_concept_cleaning_status": row.get("concept_cleaning_status"),
+                    "source_tag_classification_status": row.get("tag_classification_status"),
                     "source_v1_1_scoring_mode": row.get("v1_1_scoring_mode"),
                     "write_mode": WRITE_MODE_DB,
                 }
             )
 
-        rank_changed_count = self._sort_and_recompute_candidate_ranks(prepared)
+        rank_changed_count = self._sort_and_recompute_candidate_ranks(prepared, score_policy=score_policy)
 
         empty_failures = {column: count for column, count in empty_counts.items() if count > 0}
         required_value_failures = dict(empty_failures)
@@ -598,17 +706,17 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             self._check(
                 "candidate_rank_recomputed",
                 "PASS",
-                f"rank_basis=v1_1_preview_score_desc_then_confidence_desc; rank_changed_count={rank_changed_count}",
+                f"rank_basis={score_policy}_desc_then_confidence_desc; rank_changed_count={rank_changed_count}",
                 rows=len(prepared),
             )
         )
         return prepared, checks
 
-    def _sort_and_recompute_candidate_ranks(self, rows: list[dict[str, Any]]) -> int:
+    def _sort_and_recompute_candidate_ranks(self, rows: list[dict[str, Any]], *, score_policy: str) -> int:
         """Sort final DB-write candidates by the score that will actually be written.
 
         S3 preview rank is produced before v1.1 concept/capital score enrichment.
-        The DB contract writes v1.1_preview_score into strategy_signal.raw_score and
+        The DB contract writes the selected score policy into strategy_signal.raw_score and
         normalized_score, so rank_in_batch must be recomputed from that final DB
         score rather than copied from the source preview artifact. The original
         preview rank is retained in source_preview_rank for traceability.
@@ -629,7 +737,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         rows.sort(key=sort_key)
 
         rank_changed_count = 0
-        rank_basis = "v1_1_preview_score_desc_then_confidence_desc"
+        rank_basis = f"{score_policy}_desc_then_confidence_desc"
         for write_rank, row in enumerate(rows, start=1):
             source_rank = safe_int(row.get("source_preview_rank"))
             if source_rank != write_rank:
@@ -657,6 +765,10 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             row["parameter_payload_json"] = json.dumps(parameter_payload, ensure_ascii=False, sort_keys=True, default=json_default)
 
         return rank_changed_count
+
+    def _normalize_score_policy(self, score_policy: str | None) -> str | None:
+        normalized = str(score_policy or DEFAULT_SCORE_POLICY).strip()
+        return normalized if normalized in SUPPORTED_SCORE_POLICIES else None
 
     def _resolve_effective_date(
         self,
@@ -774,6 +886,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         strategy_code: str,
         strategy_version_code: str,
         preview_payload: Mapping[str, Any],
+        score_policy: str,
         progress_callback: Callable[[str], None] | None,
     ) -> tuple[int, str, list[dict[str, Any]]]:
         now = utc_now()
@@ -788,7 +901,9 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             "report_date": report_date,
             "source_preview_status": preview_payload.get("status"),
             "candidate_row_count": len(rows),
-            "score_written_to_db": "v1_1_preview_score",
+            "score_policy": score_policy,
+            "score_written_to_db": score_policy,
+            "execution_handoff_boundary": EXECUTION_HANDOFF_BOUNDARY_DETAIL,
             "m5_submission_allowed": False,
             "paper_trading_allowed": False,
         }
@@ -926,6 +1041,15 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                     "source_normalized_score": row.get("source_normalized_score"),
                     "source_confidence_score": row.get("source_confidence_score"),
                     "source_v1_1_preview_score": row.get("source_v1_1_preview_score"),
+                    "source_cleaned_v1_1_preview_score": row.get("source_cleaned_v1_1_preview_score"),
+                    "source_cleaned_v1_1_score_delta": row.get("source_cleaned_v1_1_score_delta"),
+                    "source_cleaned_concept_score": row.get("source_cleaned_concept_score"),
+                    "source_true_theme_score": row.get("source_true_theme_score"),
+                    "source_true_theme_names": row.get("source_true_theme_names"),
+                    "source_filtered_generic_concept_count": row.get("source_filtered_generic_concept_count"),
+                    "source_filtered_generic_concept_names": row.get("source_filtered_generic_concept_names"),
+                    "source_concept_cleaning_status": row.get("source_concept_cleaning_status"),
+                    "source_tag_classification_status": row.get("source_tag_classification_status"),
                     "source_v1_1_scoring_mode": row.get("source_v1_1_scoring_mode"),
                     "write_mode": row.get("write_mode") or WRITE_MODE_DRY_RUN,
                 }
@@ -942,6 +1066,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
         run_uid: str | None,
         existing_signal_rows_before_write: int,
         write_mode: str,
+        score_policy: str,
     ) -> dict[str, Any]:
         reason_counts: dict[str, int] = {}
         for row in candidate_rows:
@@ -959,8 +1084,10 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             "existing_signal_rows_before_write": existing_signal_rows_before_write,
             "reason_code_counts": reason_counts,
             "write_mode": write_mode,
-            "score_written_to_db": "v1_1_preview_score",
-            "rank_written_to_db": "recomputed_by_v1_1_preview_score_desc_then_confidence_desc",
+            "score_policy": score_policy,
+            "score_written_to_db": score_policy,
+            "rank_written_to_db": f"recomputed_by_{score_policy}_desc_then_confidence_desc",
+            "execution_handoff_boundary": EXECUTION_HANDOFF_BOUNDARY_DETAIL,
         }
 
     def _decision_reason(self, *, final_blocker_count: int, write_db: bool, run_id: int | None) -> str:
@@ -1020,7 +1147,7 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             ),
         ]
 
-    def _guardrails(self, *, write_db: bool) -> list[str]:
+    def _guardrails(self, *, write_db: bool, score_policy: str) -> list[str]:
         return [
             "consumes_existing_s3_preview_artifact_only",
             "does_not_create_strategy_metadata",
@@ -1029,8 +1156,10 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             "does_not_change_risk_rules",
             "writes_strategy_signal_only_when_write_db_and_confirmation_are_supplied" if write_db else "dry_run_only_no_db_write",
             "blocks_append_when_existing_same_version_date_unless_explicitly_allowed",
-            "score_written_to_db_is_v1_1_preview_score",
+            f"score_written_to_db_is_{score_policy}",
             "rank_in_batch_recomputed_from_written_score_before_insert",
+            "strategy_signal_write_does_not_certify_not_limit_up",
+            "m5_candidate_input_and_dry_run_remain_executable_entry_gate",
         ]
 
     def _write_artifacts(self, *, config: SignalPreviewDbWriteContractConfig, result: SignalPreviewDbWriteContractResult) -> SignalPreviewDbWriteContractResult:
@@ -1077,6 +1206,8 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
             f"- run_id: `{result.run_id}`",
             f"- candidate_row_count: `{summary.get('candidate_row_count')}`",
             f"- inserted_row_count: `{summary.get('inserted_row_count')}`",
+            f"- score_policy: `{summary.get('score_policy')}`",
+            f"- score_written_to_db: `{summary.get('score_written_to_db')}`",
             f"- can_write_strategy_signal_now: `{decision.get('can_write_strategy_signal_now')}`",
             f"- can_start_m5_backtest_design: `{decision.get('can_start_m5_backtest_design')}`",
             f"- can_submit_m5_backtest_now: `{decision.get('can_submit_m5_backtest_now')}`",
@@ -1098,6 +1229,8 @@ class RegimeSectorIndustrySignalPreviewDbWriteService:
                 "## Boundary note",
                 "",
                 "This task is a preview-scope adapter. It does not submit M5 backtests, does not route to paper trading, and does not approve production trading.",
+                "",
+                f"Execution handoff boundary: {summary.get('execution_handoff_boundary')}",
             ]
         )
         return "\n".join(lines) + "\n"

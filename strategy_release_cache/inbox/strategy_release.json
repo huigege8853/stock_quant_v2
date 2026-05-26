@@ -1,13 +1,51 @@
 {
-  "strategy_code": "alpha_selection",
-  "version_code": "v3",
-  "release_date": "2026-04-24",
-  "effective_from": "2026-04-25",
-  "feature_set": "fs_daily_alpha_v2",
+  "strategy_code": "regime_sector_industry_selection_v1",
+  "version_code": "v1_regime_state_machine",
+  "strategy_version_code": "v1_regime_state_machine",
+  "release_date": "2026-05-26",
+  "effective_from": "2026-05-26",
+  "feature_set": "regime_sector_industry_v1",
+  "release_profile": "r63_research_validated_fast_deploy",
   "params": {
-    "top_n": 30,
-    "min_score": 0.65
+    "release_profile": "r63_research_validated_fast_deploy",
+    "parameter_version_id": "R62P16_NO_TRADE_SEMANTICS_PRODUCTIZATION_P6",
+    "policy_effective_hash": "5b9cee95018fa81e",
+    "source_validation_stage": "R62P17",
+    "source_validation_status": "PASS_R62P17_R63_TRIGGER_READY_WITH_NO_TRADE_SEMANTICS",
+    "source_realized_pnl": 996050.81,
+    "source_profit_factor": 1.6134,
+    "source_win_rate": 0.4046,
+    "source_equal_window_compound_return": 0.0839,
+    "no_trade_semantics": "PASS_NO_TRADE_BY_DESIGN",
+    "run_full_target_preview_chain": true,
+    "write_db": true,
+    "m4_target_signal_write_confirmation": "PREVIEW_SCOPE_ONLY",
+    "allow_existing_same_version_date": true
   },
-  "notes": "Desktop approved release for Orange Pi runtime.",
-  "checksum": ""
+  "r63_fast_deploy_contract": {
+    "enabled": true,
+    "status": "RESEARCH_VALIDATED_PENDING_PRODUCTION_PULL",
+    "strategy_code": "regime_sector_industry_selection_v1",
+    "strategy_version_code": "v1_regime_state_machine",
+    "parameter_version_id": "R62P16_NO_TRADE_SEMANTICS_PRODUCTIZATION_P6",
+    "policy_effective_hash": "5b9cee95018fa81e",
+    "required_fields": [
+      "strategy_code",
+      "version_code",
+      "parameter_version_id",
+      "policy_effective_hash",
+      "source_commit",
+      "release_profile",
+      "no_trade_reason"
+    ],
+    "production_route_requirement": "daily_m4_must_route_by_release_selected_strategy_not_hardcoded_alpha_selection",
+    "production_boundaries": {
+      "broker_order_enabled": false,
+      "allow_main_portfolio": false,
+      "production_source_edit": false,
+      "production_commit": false
+    }
+  },
+  "notes": "R63 research-validated fast deploy release candidate. Production side must git pull only.",
+  "checksum": "9d51d1c3da6a532a"
 }

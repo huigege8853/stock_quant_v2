@@ -27,10 +27,17 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 PROFILE_CHOICES = ("runtime", "research", "full")
 PAPER_MODE_CHOICES = ("auto", "m6", "m7", "skip", "off")
+RESEARCH_STEP_SCOPE_CHOICES = ("all", "regime_state_machine", "none")
 _TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
 DEFAULT_RESEARCH_STRATEGY_CODE = "regime_sector_industry_selection_v1"
 DEFAULT_RESEARCH_STRATEGY_VERSION_CODE = "v1_regime_state_machine"
+DEFAULT_RESEARCH_REQUEST_ID = 47
+DEFAULT_RESEARCH_INITIAL_CASH = "1000000"
+DEFAULT_RESEARCH_TRANSACTION_COST_BPS = "0"
+DEFAULT_RESEARCH_PRICE_SOURCE = "close"
+DEFAULT_RESEARCH_M9_TOP_N = 10
+DEFAULT_RESEARCH_WINDOW_TRADING_DAYS = 60
 
 
 @dataclass(frozen=True)
@@ -365,10 +372,71 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         ("SQV2_RESEARCH_MAX_SIGNAL_BATCHES",),
         120,
     )
+    default_research_min_preview_rows = min(50, int(args.research_target_top_n or 100))
+    args.research_min_preview_rows_per_batch = _resolve_int_option(
+        getattr(args, "research_min_preview_rows_per_batch", None),
+        ("SQV2_RESEARCH_MIN_PREVIEW_ROWS_PER_BATCH",),
+        default_research_min_preview_rows,
+    )
     args.research_min_candidate_rows = _resolve_int_option(
         args.research_min_candidate_rows,
         ("SQV2_RESEARCH_MIN_CANDIDATE_ROWS",),
         1000,
+    )
+    args.enable_adaptive_m5_m9_research = _resolve_bool_option(
+        getattr(args, "enable_adaptive_m5_m9_research", None),
+        ("SQV2_RESEARCH_ENABLE_ADAPTIVE_M5_M9",),
+        False,
+    )
+    args.research_request_id = _resolve_int_option(
+        getattr(args, "research_request_id", None),
+        ("SQV2_RESEARCH_REQUEST_ID",),
+        DEFAULT_RESEARCH_REQUEST_ID,
+    )
+    args.research_initial_cash = _resolve_string_option(
+        getattr(args, "research_initial_cash", None),
+        ("SQV2_RESEARCH_INITIAL_CASH",),
+        DEFAULT_RESEARCH_INITIAL_CASH,
+    )
+    args.research_transaction_cost_bps = _resolve_string_option(
+        getattr(args, "research_transaction_cost_bps", None),
+        ("SQV2_RESEARCH_TRANSACTION_COST_BPS",),
+        DEFAULT_RESEARCH_TRANSACTION_COST_BPS,
+    )
+    args.research_price_source = _resolve_string_option(
+        getattr(args, "research_price_source", None),
+        ("SQV2_RESEARCH_PRICE_SOURCE",),
+        DEFAULT_RESEARCH_PRICE_SOURCE,
+    )
+    args.research_max_candidate_dates = _resolve_int_option(
+        getattr(args, "research_max_candidate_dates", None),
+        ("SQV2_RESEARCH_MAX_CANDIDATE_DATES",),
+        None,
+    )
+    args.research_window_start = _resolve_string_option(
+        getattr(args, "research_window_start", None),
+        ("SQV2_RESEARCH_WINDOW_START",),
+        "",
+    )
+    args.research_window_end = _resolve_string_option(
+        getattr(args, "research_window_end", None),
+        ("SQV2_RESEARCH_WINDOW_END",),
+        "",
+    )
+    default_window_trading_days = (
+        int(args.research_max_candidate_dates) + 1
+        if args.research_max_candidate_dates is not None
+        else DEFAULT_RESEARCH_WINDOW_TRADING_DAYS
+    )
+    args.research_window_trading_days = _resolve_int_option(
+        getattr(args, "research_window_trading_days", None),
+        ("SQV2_RESEARCH_WINDOW_TRADING_DAYS",),
+        default_window_trading_days,
+    )
+    args.research_m9_top_n = _resolve_int_option(
+        getattr(args, "research_m9_top_n", None),
+        ("SQV2_RESEARCH_M9_TOP_N",),
+        DEFAULT_RESEARCH_M9_TOP_N,
     )
     args.enable_m6_5_campaign = _resolve_bool_option(
         args.enable_m6_5_campaign,
@@ -424,6 +492,31 @@ def _resolve_options_from_env(args: argparse.Namespace) -> argparse.Namespace:
         ("SQV2_PRODUCTION_DAILY_OBSERVATION_EXECUTION_CONTEXT",),
         "production_paper_campaign",
     )
+    args.research_step_scope = _resolve_choice_option(
+        getattr(args, "research_step_scope", None),
+        ("SQV2_RESEARCH_STEP_SCOPE",),
+        RESEARCH_STEP_SCOPE_CHOICES,
+        "all",
+    )
+    args.skip_research_backfill = _resolve_bool_option(
+        getattr(args, "skip_research_backfill", None),
+        ("SQV2_RESEARCH_SKIP_BACKFILL",),
+        False,
+    )
+    args.research_artifact_only = _resolve_bool_option(
+        getattr(args, "research_artifact_only", None),
+        ("SQV2_RESEARCH_ARTIFACT_ONLY",),
+        False,
+    )
+    if args.research_artifact_only:
+        args.paper_mode = "skip"
+        args.skip_m8_daily_ops = True
+        args.enable_m8_ops_master = False
+        args.enable_m6_5_campaign = False
+        args.enable_m6_5_campaign_summary = False
+        args.enable_next_trade_plan = False
+        args.enable_production_daily_observation_report = False
+
     return args
 
 
@@ -985,6 +1078,24 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
     design_dir = f"{base_dir}/historical_signal_generation_design"
     preview_dir = f"{base_dir}/historical_signal_generation_preview"
     db_write_preview_dir = f"{base_dir}/historical_signal_db_write_preview"
+    historical_request_dir = f"artifacts/m5/research_chain_{label}/historical_backtest_request_design"
+    window_filter_dir = f"{base_dir}/window_filtered_candidate_signal_rows"
+    input_enrichment_dir = f"artifacts/m5/research_chain_{label}/adaptive_execution_input_enrichment"
+    dry_run_dir = f"artifacts/m5/research_chain_{label}/adaptive_execution_dry_run"
+    attribution_dir = f"artifacts/m9/research_chain_{label}/adaptive_execution_attribution"
+    request_id = int(getattr(args, "research_request_id", DEFAULT_RESEARCH_REQUEST_ID) or DEFAULT_RESEARCH_REQUEST_ID)
+    input_enrichment_request_dir = f"{input_enrichment_dir}/request_{request_id}"
+    dry_run_request_dir = f"{dry_run_dir}/request_{request_id}"
+    enriched_candidate_csv = f"{input_enrichment_request_dir}/enriched_candidate_signal_rows.csv"
+    window_start = getattr(args, "research_window_start", None)
+    window_end = getattr(args, "research_window_end", None)
+    has_research_window_filter = bool(window_start and window_end)
+    window_report_date = args.report_date or window_end or "latest"
+    window_token = f"{str(window_start).replace('-', '')}_{str(window_end).replace('-', '')}"
+    window_filtered_candidate_csv = (
+        f"{window_filter_dir}/request_{request_id}/"
+        f"window_filtered_candidate_signal_rows_{window_report_date}_{window_token}.csv"
+    )
     report_date_args = _report_date_args(args.report_date)
 
     common_strategy_args = (
@@ -997,7 +1108,36 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
         strategy_version_code,
     )
 
-    return [
+    steps: list[ChainStep] = []
+
+    if has_research_window_filter:
+        steps.append(
+            ChainStep(
+                "m5_window_bound_historical_request_design",
+                "stock_quant_v2.scripts.bootstrap_m5_backtest_historical_request_design",
+                extra_args=(
+                    *common_strategy_args,
+                    "--mode",
+                    "design",
+                    "--output-dir",
+                    historical_request_dir,
+                    "--target-trading-days",
+                    str(getattr(args, "research_window_trading_days", DEFAULT_RESEARCH_WINDOW_TRADING_DAYS)),
+                    "--max-signal-plan-rows",
+                    str(args.research_max_signal_batches),
+                    "--historical-anchor-date",
+                    str(window_end or args.report_date),
+                    "--research-backtest-request-id",
+                    str(request_id),
+                ),
+            )
+        )
+
+    m4_historical_request_artifact_dir = (
+        historical_request_dir if has_research_window_filter else "artifacts/m5/historical_backtest_request_design"
+    )
+
+    steps.extend([
         ChainStep(
             "m4_regime_sm_historical_design",
             "stock_quant_v2.scripts.bootstrap_m4_historical_signal_generation_design",
@@ -1005,6 +1145,10 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
                 *common_strategy_args,
                 "--mode",
                 "design",
+                "--historical-request-artifact-dir",
+                m4_historical_request_artifact_dir,
+                "--research-backtest-request-id",
+                str(request_id),
                 "--output-dir",
                 design_dir,
             ),
@@ -1016,6 +1160,8 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
                 *common_strategy_args,
                 "--mode",
                 "preview_dry_run",
+                "--research-backtest-request-id",
+                str(request_id),
                 "--design-artifact-dir",
                 design_dir,
                 "--output-dir",
@@ -1024,6 +1170,8 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
                 str(args.research_target_top_n),
                 "--max-signal-batches",
                 str(args.research_max_signal_batches),
+                "--min-preview-rows-per-batch",
+                str(args.research_min_preview_rows_per_batch),
             ),
         ),
         ChainStep(
@@ -1033,6 +1181,8 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
                 *common_strategy_args,
                 "--mode",
                 "db_write_preview",
+                "--research-backtest-request-id",
+                str(request_id),
                 "--preview-artifact-dir",
                 preview_dir,
                 "--output-dir",
@@ -1056,8 +1206,128 @@ def _build_regime_state_machine_research_steps(args: argparse.Namespace) -> list
             "stock_quant_v2.platform_overview_domain.tasks.build_platform_overview_report",
             extra_args=report_date_args,
         ),
-    ]
+    ])
 
+    if has_research_window_filter:
+        steps.append(
+            ChainStep(
+                "m4_regime_sm_candidate_window_filter",
+                "stock_quant_v2.scripts.bootstrap_research_candidate_window_filter",
+                extra_args=(
+                    "--project-root",
+                    ".",
+                    *report_date_args,
+                    "--candidate-signal-artifact-dir",
+                    preview_dir,
+                    "--output-dir",
+                    window_filter_dir,
+                    "--request-id",
+                    str(request_id),
+                    "--window-start",
+                    str(window_start),
+                    "--window-end",
+                    str(window_end),
+                    "--min-candidate-rows",
+                    str(args.research_min_candidate_rows),
+                ),
+                soft_fail=bool(
+                    getattr(args, "enable_adaptive_m5_m9_research", False)
+                    and getattr(args, "research_artifact_only", False)
+                ),
+            )
+        )
+
+    if getattr(args, "enable_adaptive_m5_m9_research", False):
+        input_enrichment_args: list[str] = [
+            "--project-root",
+            ".",
+            *report_date_args,
+            "--request-id",
+            str(request_id),
+            "--candidate-signal-artifact-dir",
+            preview_dir,
+            "--output-dir",
+            input_enrichment_dir,
+            "--price-source",
+            str(getattr(args, "research_price_source", DEFAULT_RESEARCH_PRICE_SOURCE)),
+        ]
+        if has_research_window_filter:
+            input_enrichment_args.extend(["--candidate-signal-csv", window_filtered_candidate_csv])
+
+        dry_run_args: list[str] = [
+            "--project-root",
+            ".",
+            *report_date_args,
+            "--request-id",
+            str(request_id),
+            "--candidate-signal-artifact-dir",
+            preview_dir,
+            "--candidate-signal-csv",
+            enriched_candidate_csv,
+            "--output-dir",
+            dry_run_dir,
+            "--initial-cash",
+            str(getattr(args, "research_initial_cash", DEFAULT_RESEARCH_INITIAL_CASH)),
+            "--transaction-cost-bps",
+            str(getattr(args, "research_transaction_cost_bps", DEFAULT_RESEARCH_TRANSACTION_COST_BPS)),
+            "--execution-price-column",
+            "execution_price",
+        ]
+        max_candidate_dates = getattr(args, "research_max_candidate_dates", None)
+        if max_candidate_dates is not None:
+            input_enrichment_args.extend(["--max-candidate-dates", str(max_candidate_dates)])
+            dry_run_args.extend(["--max-candidate-dates", str(max_candidate_dates)])
+        m9_attribution_args: list[str] = [
+            "--project-root",
+            ".",
+            *report_date_args,
+            "--request-id",
+            str(request_id),
+            "--dry-run-artifact-dir",
+            dry_run_request_dir,
+            "--input-enrichment-artifact-dir",
+            input_enrichment_request_dir,
+            "--output-dir",
+            attribution_dir,
+            "--top-n",
+            str(getattr(args, "research_m9_top_n", DEFAULT_RESEARCH_M9_TOP_N)),
+        ]
+        steps.extend(
+            [
+                ChainStep(
+                    "m5_adaptive_execution_input_enrichment",
+                    "stock_quant_v2.scripts.bootstrap_m5_adaptive_execution_input_enrichment",
+                    extra_args=tuple(input_enrichment_args),
+                ),
+                ChainStep(
+                    "m5_adaptive_execution_dry_run",
+                    "stock_quant_v2.scripts.bootstrap_m5_adaptive_execution_dry_run",
+                    extra_args=tuple(dry_run_args),
+                ),
+                ChainStep(
+                    "m9_adaptive_execution_attribution_report",
+                    "stock_quant_v2.scripts.bootstrap_m9_adaptive_execution_attribution_report",
+                    extra_args=tuple(m9_attribution_args),
+                ),
+            ]
+        )
+
+    return steps
+
+
+
+# STAGE6_23R17_RESEARCH_BACKFILL_DATE_ARGS_BEGIN
+def _build_research_backfill_date_args(args: argparse.Namespace) -> list[str]:
+    """Pass research window dates to child historical backfill modules."""
+    extra_args: list[str] = []
+    window_start = str(getattr(args, "research_window_start", "") or "").strip()
+    window_end = str(getattr(args, "research_window_end", "") or "").strip()
+    if window_start:
+        extra_args.extend(["--start-date", window_start])
+    if window_end:
+        extra_args.extend(["--end-date", window_end])
+    return extra_args
+# STAGE6_23R17_RESEARCH_BACKFILL_DATE_ARGS_END
 
 def _build_research_steps(
     args: argparse.Namespace,
@@ -1065,34 +1335,41 @@ def _build_research_steps(
     include_m5_refresh: bool,
 ) -> list[ChainStep]:
     steps: list[ChainStep] = []
+    research_step_scope = getattr(args, "research_step_scope", "all")
+
+    if research_step_scope == "none":
+        return steps
 
     # Optional heavy/research modules are skipped when the current branch does
     # not contain them yet. This lets the production runtime profile stay stable
     # while research capabilities are introduced incrementally.
-    steps.extend(
-        [
-            ChainStep(
-                "m3_historical_feature_backfill_p1",
-                "stock_quant_v2.scripts.bootstrap_m3_historical_feature_backfill_p1",
-                optional=True,
-            ),
-            ChainStep(
-                "m5_historical_signal_backfill_p1",
-                "stock_quant_v2.scripts.bootstrap_m5_historical_signal_backfill_p1",
-                optional=True,
-            ),
-        ]
-    )
+    if research_step_scope == "all" and not getattr(args, "skip_research_backfill", False):
+        steps.extend(
+            [
+                ChainStep(
+                    "m3_historical_feature_backfill_p1",
+                    "stock_quant_v2.scripts.bootstrap_m3_historical_feature_backfill_p1",
+                    extra_args=tuple(_build_research_backfill_date_args(args)),  # m3_historical_feature_backfill_p1_STAGE6_23R17
+                    optional=True,
+                ),
+                ChainStep(
+                    "m5_historical_signal_backfill_p1",
+                    "stock_quant_v2.scripts.bootstrap_m5_historical_signal_backfill_p1",
+                    extra_args=tuple(_build_research_backfill_date_args(args)),  # m5_historical_signal_backfill_p1_STAGE6_23R17
+                    optional=True,
+                ),
+            ]
+        )
 
-    if include_m5_refresh and not args.skip_m5:
+    if research_step_scope == "all" and include_m5_refresh and not args.skip_m5:
         steps.append(
             ChainStep("m5_research_refresh", "stock_quant_v2.scripts.bootstrap_m5_research_refresh_chain")
         )
 
-    if args.enable_regime_state_machine_research:
+    if research_step_scope in {"all", "regime_state_machine"} and args.enable_regime_state_machine_research:
         steps.extend(_build_regime_state_machine_research_steps(args))
 
-    if args.enable_m8_ops_master:
+    if research_step_scope == "all" and args.enable_m8_ops_master:
         steps.append(
             ChainStep(
                 "m8_ops_master_chain",
@@ -1234,6 +1511,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target top-N for optional research historical preview. Env: SQV2_RESEARCH_TARGET_TOP_N.",
     )
     parser.add_argument(
+        "--research-min-preview-rows-per-batch",
+        type=int,
+        default=None,
+        help=(
+            "Minimum preview rows per M4 historical signal batch in research quick-scope. "
+            "Default is min(50, --research-target-top-n), so top30 research smoke does not fail a top50 floor. "
+            "Env: SQV2_RESEARCH_MIN_PREVIEW_ROWS_PER_BATCH."
+        ),
+    )
+    parser.add_argument(
         "--research-max-signal-batches",
         type=int,
         default=None,
@@ -1249,6 +1536,104 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Minimum candidate rows for optional research DB-write preview. "
             "Env: SQV2_RESEARCH_MIN_CANDIDATE_ROWS."
+        ),
+    )
+    parser.add_argument(
+        "--enable-adaptive-m5-m9-research",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable optional artifact-only M5 input enrichment, M5 adaptive dry-run, "
+            "and M9 adaptive attribution after the regime state-machine M4 preview chain. "
+            "Env: SQV2_RESEARCH_ENABLE_ADAPTIVE_M5_M9."
+        ),
+    )
+    parser.add_argument(
+        "--research-request-id",
+        type=int,
+        default=None,
+        help="Request id for optional adaptive M5/M9 research artifacts. Env: SQV2_RESEARCH_REQUEST_ID.",
+    )
+    parser.add_argument(
+        "--research-initial-cash",
+        default=None,
+        help="Initial cash for optional M5 adaptive dry-run. Env: SQV2_RESEARCH_INITIAL_CASH.",
+    )
+    parser.add_argument(
+        "--research-transaction-cost-bps",
+        default=None,
+        help="Transaction cost bps for optional M5 adaptive dry-run. Env: SQV2_RESEARCH_TRANSACTION_COST_BPS.",
+    )
+    parser.add_argument(
+        "--research-price-source",
+        default=None,
+        help="Execution price source for optional M5 input enrichment. Env: SQV2_RESEARCH_PRICE_SOURCE.",
+    )
+    parser.add_argument(
+        "--research-max-candidate-dates",
+        type=int,
+        default=None,
+        help="Optional cap on candidate dates for optional M5 adaptive research smoke. Env: SQV2_RESEARCH_MAX_CANDIDATE_DATES.",
+    )
+    parser.add_argument(
+        "--research-window-start",
+        default=None,
+        help=(
+            "Inclusive start date for strict research walk-forward window filtering, format YYYY-MM-DD. "
+            "When paired with --research-window-end, daily runtime writes a window-filtered M4 candidate CSV "
+            "and feeds it to M5 adaptive research. Env: SQV2_RESEARCH_WINDOW_START."
+        ),
+    )
+    parser.add_argument(
+        "--research-window-end",
+        default=None,
+        help=(
+            "Inclusive end date for strict research walk-forward window filtering, format YYYY-MM-DD. "
+            "When paired with --research-window-start, daily runtime writes a window-filtered M4 candidate CSV "
+            "and feeds it to M5 adaptive research. Env: SQV2_RESEARCH_WINDOW_END."
+        ),
+    )
+    parser.add_argument(
+        "--research-window-trading-days",
+        type=int,
+        default=None,
+        help=(
+            "Trading-day span used by the window-bound M5 historical request design. "
+            "Default is --research-max-candidate-dates + 1, or 60. Env: SQV2_RESEARCH_WINDOW_TRADING_DAYS."
+        ),
+    )
+    parser.add_argument(
+        "--research-m9-top-n",
+        type=int,
+        default=None,
+        help="Top/bottom rows for optional M9 adaptive attribution. Env: SQV2_RESEARCH_M9_TOP_N.",
+    )
+    parser.add_argument(
+        "--research-step-scope",
+        choices=RESEARCH_STEP_SCOPE_CHOICES,
+        default=None,
+        help=(
+            "Limit research profile steps. all = existing behavior; "
+            "regime_state_machine = run only optional regime-state-machine research chain; "
+            "none = skip research-only steps. Env: SQV2_RESEARCH_STEP_SCOPE."
+        ),
+    )
+    parser.add_argument(
+        "--skip-research-backfill",
+        action="store_true",
+        default=None,
+        help=(
+            "Skip optional research historical backfill steps in research/full profiles. "
+            "Env: SQV2_RESEARCH_SKIP_BACKFILL."
+        ),
+    )
+    parser.add_argument(
+        "--research-artifact-only",
+        action="store_true",
+        default=None,
+        help=(
+            "Research safety guard: force paper_mode=skip, skip M8 ops, disable production daily observation, "
+            "and keep execution artifact-only. Env: SQV2_RESEARCH_ARTIFACT_ONLY."
         ),
     )
     parser.add_argument(
@@ -1375,6 +1760,9 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
         print("[DAILY] skip_m8_daily_ops = True", flush=True)
     if args.profile in {"research", "full"}:
         print(f"[DAILY] enable_m8_ops_master = {args.enable_m8_ops_master}", flush=True)
+        print(f"[DAILY] research_step_scope = {getattr(args, 'research_step_scope', 'all')}", flush=True)
+        print(f"[DAILY] skip_research_backfill = {getattr(args, 'skip_research_backfill', False)}", flush=True)
+        print(f"[DAILY] research_artifact_only = {getattr(args, 'research_artifact_only', False)}", flush=True)
         print(
             f"[DAILY] enable_regime_state_machine_research = {args.enable_regime_state_machine_research}",
             flush=True,
@@ -1388,6 +1776,10 @@ def run_daily_project_runtime_chain(args: argparse.Namespace) -> int:
             print(f"[DAILY] research_target_top_n = {args.research_target_top_n}", flush=True)
             print(
                 f"[DAILY] research_max_signal_batches = {args.research_max_signal_batches}",
+                flush=True,
+            )
+            print(
+                f"[DAILY] research_min_preview_rows_per_batch = {args.research_min_preview_rows_per_batch}",
                 flush=True,
             )
             print(

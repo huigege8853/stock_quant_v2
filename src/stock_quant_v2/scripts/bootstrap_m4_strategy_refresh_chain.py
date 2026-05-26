@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -26,16 +27,32 @@ M4_MAIN_CHAIN = M4Chain(
 )
 
 
+M4_TARGET_CHAIN = M4Chain(
+    name="regime_sector_industry_target_signal_light",
+    module_name="stock_quant_v2.scripts.bootstrap_m4_regime_sector_industry_target_signal_light",
+)
+
+TARGET_STRATEGY_CODE = "regime_sector_industry_selection_v1"
+TARGET_VERSION_CODE = "v1_regime_state_machine"
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _run_module(module_name: str, extra_env: dict[str, str] | None = None) -> int:
+def _run_module(
+    module_name: str,
+    extra_env: dict[str, str] | None = None,
+    args: list[str] | None = None,
+) -> int:
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
 
     cmd = [sys.executable, "-m", module_name]
+    if args:
+        cmd.extend(args)
+    print(f"[M4] executing: {' '.join(cmd)}")
     completed = subprocess.run(cmd, cwd=_project_root(), env=env)
     return int(completed.returncode)
 
@@ -69,6 +86,27 @@ class DatabaseInspector:
 
         fallback = self._safe_scalar("SELECT MAX(trade_date) FROM core_daily_bar")
         return self._coerce_to_date(fallback)
+
+    def next_trading_day(self, as_of_date: date) -> date | None:
+        candidates = [
+            ("meta_trading_calendar", "trade_date", "is_open"),
+            ("meta_trading_calendar", "calendar_date", "is_open"),
+            ("meta_trading_calendar", "trade_date", "is_trading_day"),
+            ("meta_trading_calendar", "calendar_date", "is_trading_day"),
+        ]
+
+        for table_name, date_col, open_col in candidates:
+            sql = (
+                f"SELECT MIN({date_col}) "
+                f"FROM {table_name} "
+                f"WHERE {open_col} = TRUE AND {date_col} > :as_of_date"
+            )
+            value = self._safe_scalar(sql, {"as_of_date": as_of_date})
+            coerced = self._coerce_to_date(value)
+            if coerced is not None:
+                return coerced
+
+        return None
 
     def signal_total_rows(self) -> int | None:
         value = self._safe_scalar("SELECT COUNT(*) FROM strategy_signal")
@@ -113,10 +151,10 @@ class DatabaseInspector:
         except Exception:
             return []
 
-    def _safe_scalar(self, sql: str) -> Any | None:
+    def _safe_scalar(self, sql: str, params: dict[str, Any] | None = None) -> Any | None:
         try:
             with self.engine.connect() as conn:
-                return conn.execute(text(sql)).scalar()
+                return conn.execute(text(sql), params or {}).scalar()
         except Exception:
             return None
 
@@ -146,6 +184,149 @@ def _build_m4_env(target_date: date) -> dict[str, str]:
     }
 
 
+
+def _load_strategy_release_payload(project_root: Path) -> tuple[dict[str, Any], Path | None]:
+    candidates: list[Path] = []
+    env_path = os.getenv("STRATEGY_RELEASE_LOCAL_FILE", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend([
+        project_root / "strategy_release_cache" / "active" / "strategy_release.json",
+        project_root / "strategy_release_cache" / "inbox" / "strategy_release.json",
+        Path("/app/strategy_release_cache/active/strategy_release.json"),
+        Path("/app/strategy_release_cache/inbox/strategy_release.json"),
+    ])
+
+    for path in candidates:
+        try:
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                return payload, path
+        except Exception as exc:
+            print(f"[M4][release] failed to load {path}: {type(exc).__name__}: {exc}")
+
+    return {}, None
+
+
+def _release_version_code(payload: dict[str, Any]) -> str:
+    return str(payload.get("strategy_version_code") or payload.get("version_code") or "").strip()
+
+
+def _release_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = payload.get("params")
+    return params if isinstance(params, dict) else {}
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _release_value(payload: dict[str, Any], key: str, default: Any = None) -> Any:
+    params = _release_params(payload)
+    if key in payload:
+        return payload.get(key)
+    if key in params:
+        return params.get(key)
+    contract = payload.get("r63_fast_deploy_contract")
+    if isinstance(contract, dict) and key in contract:
+        return contract.get(key)
+    return default
+
+
+def _build_target_chain_args(
+    *,
+    project_root: Path,
+    release_payload: dict[str, Any],
+    report_date: date,
+    effective_date: date,
+) -> list[str]:
+    strategy_code = str(_release_value(release_payload, "strategy_code", TARGET_STRATEGY_CODE)).strip() or TARGET_STRATEGY_CODE
+    strategy_version_code = _release_version_code(release_payload) or TARGET_VERSION_CODE
+    params = _release_params(release_payload)
+    output_dir = project_root / "artifacts" / "m4" / "strategy_signal_db_write_contract" / "r63_release_route"
+    output_json = output_dir / f"target_m4_signal_light_release_route_{report_date.isoformat()}_{effective_date.isoformat()}.json"
+
+    args = [
+        "--project-root",
+        str(project_root),
+        "--report-date",
+        report_date.isoformat(),
+        "--effective-date",
+        effective_date.isoformat(),
+        "--strategy-code",
+        strategy_code,
+        "--strategy-version-code",
+        strategy_version_code,
+        "--output-dir",
+        str(output_dir),
+        "--output-json",
+        str(output_json),
+    ]
+
+    if _truthy(params.get("run_full_target_preview_chain"), True):
+        args.append("--run-full-target-preview-chain")
+    elif _truthy(params.get("build_preview"), True):
+        args.append("--build-preview")
+
+    if _truthy(params.get("write_db"), True):
+        args.append("--write-db")
+        write_confirmation = str(
+            params.get("m4_target_signal_write_confirmation")
+            or params.get("write_confirmation")
+            or os.getenv("M4_TARGET_SIGNAL_WRITE_CONFIRMATION", "")
+            or "PREVIEW_SCOPE_ONLY"
+        )
+        args.extend(["--write-confirmation", write_confirmation])
+
+    if _truthy(params.get("allow_existing_same_version_date"), True):
+        args.append("--allow-existing-same-version-date")
+
+    max_rows = params.get("max_rows")
+    if max_rows not in (None, ""):
+        args.extend(["--max-rows", str(max_rows)])
+
+    return args
+
+
+def _resolve_release_selected_chain(
+    *,
+    project_root: Path,
+    release_payload: dict[str, Any],
+    release_path: Path | None,
+    report_date: date,
+    effective_date: date,
+) -> tuple[M4Chain, list[str] | None, dict[str, Any]]:
+    strategy_code = str(release_payload.get("strategy_code") or "").strip()
+    version_code = _release_version_code(release_payload)
+    summary = {
+        "release_path": str(release_path) if release_path else None,
+        "strategy_code": strategy_code or None,
+        "version_code": version_code or None,
+        "report_date": report_date.isoformat(),
+        "effective_date": effective_date.isoformat(),
+        "route": "rule_strategy_chain",
+    }
+
+    if strategy_code == TARGET_STRATEGY_CODE and version_code == TARGET_VERSION_CODE:
+        summary["route"] = "regime_sector_industry_target_signal_light"
+        return (
+            M4_TARGET_CHAIN,
+            _build_target_chain_args(
+                project_root=project_root,
+                release_payload=release_payload,
+                report_date=report_date,
+                effective_date=effective_date,
+            ),
+            summary,
+        )
+
+    return M4_MAIN_CHAIN, None, summary
+
+
 def run_m4_strategy_refresh_chain(target_date: date | None = None) -> int:
     inspector = DatabaseInspector(str(settings.postgres_v2_url))
     try:
@@ -159,18 +340,33 @@ def run_m4_strategy_refresh_chain(target_date: date | None = None) -> int:
 
         print(f"[M4] latest_trading_day = {latest_trading_day.isoformat()}")
 
+        effective_trading_day = inspector.next_trading_day(latest_trading_day) or latest_trading_day
+
         env_overrides = _build_m4_env(latest_trading_day)
+        env_overrides["M4_EFFECTIVE_DATE"] = effective_trading_day.isoformat()
         print("[M4] Effective env overrides:")
         for k, v in env_overrides.items():
             print(f"  - {k}={v}")
 
-        print(f"\n[M4][{M4_MAIN_CHAIN.name}] starting: {M4_MAIN_CHAIN.module_name}")
-        rc = _run_module(M4_MAIN_CHAIN.module_name, extra_env=env_overrides)
+        project_root = _project_root()
+        release_payload, release_path = _load_strategy_release_payload(project_root)
+        selected_chain, selected_args, release_route_summary = _resolve_release_selected_chain(
+            project_root=project_root,
+            release_payload=release_payload,
+            release_path=release_path,
+            report_date=latest_trading_day,
+            effective_date=effective_trading_day,
+        )
+        print("[M4] Release route summary:")
+        print(json.dumps(release_route_summary, ensure_ascii=False, indent=2))
+
+        print(f"\n[M4][{selected_chain.name}] starting: {selected_chain.module_name}")
+        rc = _run_module(selected_chain.module_name, extra_env=env_overrides, args=selected_args)
         if rc != 0:
-            print(f"[M4][{M4_MAIN_CHAIN.name}] failed (exit_code={rc})")
+            print(f"[M4][{selected_chain.name}] failed (exit_code={rc})")
             print("[M4] Chain stopped. Fix M4 before moving to M5.")
             return rc
-        print(f"[M4][{M4_MAIN_CHAIN.name}] succeeded.")
+        print(f"[M4][{selected_chain.name}] succeeded.")
 
         strategy_definition_count = inspector.strategy_definition_count()
         strategy_version_count = inspector.strategy_version_count()
