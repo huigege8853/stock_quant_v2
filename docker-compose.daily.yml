@@ -20,6 +20,8 @@ services:
       - ./logs:/app/logs
       - ./strategy_release_cache:/app/strategy_release_cache
       - ./configs/paper_campaigns:/app/configs/paper_campaigns:ro
+      - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
     command: ["/bin/bash", "-lc", "sleep infinity"]
     networks:
       - stock_quant_net
@@ -44,6 +46,8 @@ services:
       - ./strategy_release_cache:/app/strategy_release_cache
       - ./deploy/supercronic/supercronic.crontab:/app/deploy/supercronic/supercronic.crontab:ro
       - ./configs/paper_campaigns:/app/configs/paper_campaigns:ro
+      - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
     command:
       [
         "/usr/local/bin/supercronic",
