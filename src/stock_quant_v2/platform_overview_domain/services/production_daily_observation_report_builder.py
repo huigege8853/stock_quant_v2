@@ -2384,17 +2384,6 @@ class ProductionDailyObservationReportBuilder:
         fills = trade.get("fills") or {}
         snapshot = first_campaign.get("snapshot") or {}
         risk = first_campaign.get("risk_metrics") or {}
-        # R63X7C_LATEST_EXPLAINABILITY_ACCEPTANCE_FIX_V1: make explainability CSV artifacts discoverable from latest markdown.
-        lines.extend([
-            "",
-            "## 0.1a 可解释报告产物",
-            "",
-            "| artifact | purpose |",
-            "|---|---|",
-            "| `production_daily_observation_latest_signal_explain.csv` | 股票入库/候选/next-trade 信号原因、source_signal_run_id、reason_payload_json |",
-            "| `production_daily_observation_latest_trade_explain.csv` | 买入/卖出/调仓/风控拒绝原因、source_signal_run_id、exit_reason |",
-        ])
-
         used_guard = payload.get("used_date_guard") or {}
         market_alignment = market_context.get("strategy_alignment") or []
         first_alignment = market_alignment[0] if market_alignment else {}
@@ -5491,6 +5480,17 @@ class ProductionDailyObservationReportBuilder:
             lines.append(
                 f"| {self._md_cell(row.get('item'))} | {self._md_cell(row.get('status'))} | {self._md_cell(row.get('summary'))} |"
             )
+
+        # R63X7E_MD_BLOCK_NAMEERROR_FIX_V1: explainability artifact links belong in markdown rendering, where `lines` exists.
+        lines.extend([
+            "",
+            "## 0.1a 可解释报告产物",
+            "",
+            "| artifact | purpose |",
+            "|---|---|",
+            "| `production_daily_observation_latest_signal_explain.csv` | 股票入库/候选/next-trade 信号原因、source_signal_run_id、reason_payload_json |",
+            "| `production_daily_observation_latest_trade_explain.csv` | 买入/卖出/调仓/风控拒绝原因、source_signal_run_id、exit_reason |",
+        ])
 
         used_guard = payload.get("used_date_guard") or {}
         lines.extend([
