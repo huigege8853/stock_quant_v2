@@ -147,6 +147,14 @@ class ProductionDailyObservationReportBuilder:
             waterline=waterline,
             campaign_reports=campaign_reports,
         )
+        signal_explain_rows = self._build_signal_explain_rows(
+            campaign_reports=campaign_reports,
+            next_trade_plan=next_trade_plan,
+        )
+        trade_explain_rows = self._build_trade_explain_rows(
+            campaign_reports=campaign_reports,
+            next_trade_plan=next_trade_plan,
+        )
         market_context = self._build_market_context(
             report_date=resolved_report_date,
             campaign_reports=campaign_reports,
@@ -197,6 +205,8 @@ class ProductionDailyObservationReportBuilder:
             "signal_as_of_date": signal_as_of_date,
             "next_trade_date": next_trade_date,
             "next_trade_plan": next_trade_plan,
+            "signal_explain_rows": signal_explain_rows,
+            "trade_explain_rows": trade_explain_rows,
             "used_date_guard": used_date_guard,
             "waterline": waterline,
             "data_refresh_summary": data_refresh_summary,
@@ -248,6 +258,8 @@ class ProductionDailyObservationReportBuilder:
         sources_path = output_dir / f"{stem}_sources.csv"
         artifacts_path = output_dir / f"{stem}_artifacts.csv"
         next_trade_plan_path = output_dir / f"{stem}_next_trade_plan.csv"
+        signal_explain_path = output_dir / f"{stem}_signal_explain.csv"
+        trade_explain_path = output_dir / f"{stem}_trade_explain.csv"
 
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
@@ -257,17 +269,23 @@ class ProductionDailyObservationReportBuilder:
         self._write_csv(sources_path, self._source_rows(payload))
         self._write_csv(artifacts_path, artifact_index)
         self._write_csv(next_trade_plan_path, self._next_trade_plan_csv_rows(payload))
+        self._write_csv(signal_explain_path, signal_explain_rows)
+        self._write_csv(trade_explain_path, trade_explain_rows)
 
         latest_json = latest_dir / "production_daily_observation_latest.json"
         latest_md = latest_dir / "production_daily_observation_latest.md"
         latest_sources = latest_dir / "production_daily_observation_latest_sources.csv"
         latest_artifacts = latest_dir / "production_daily_observation_latest_artifacts.csv"
         latest_next_trade_plan = latest_dir / "production_daily_observation_latest_next_trade_plan.csv"
+        latest_signal_explain = latest_dir / "production_daily_observation_latest_signal_explain.csv"
+        latest_trade_explain = latest_dir / "production_daily_observation_latest_trade_explain.csv"
         shutil.copyfile(json_path, latest_json)
         shutil.copyfile(md_path, latest_md)
         shutil.copyfile(sources_path, latest_sources)
         shutil.copyfile(artifacts_path, latest_artifacts)
         shutil.copyfile(next_trade_plan_path, latest_next_trade_plan)
+        shutil.copyfile(signal_explain_path, latest_signal_explain)
+        shutil.copyfile(trade_explain_path, latest_trade_explain)
 
         payload["files"] = {
             "json": str(json_path),
@@ -275,11 +293,15 @@ class ProductionDailyObservationReportBuilder:
             "sources_csv": str(sources_path),
             "artifacts_csv": str(artifacts_path),
             "next_trade_plan_csv": str(next_trade_plan_path),
+            "signal_explain_csv": str(signal_explain_path),
+            "trade_explain_csv": str(trade_explain_path),
             "latest_json": str(latest_json),
             "latest_markdown": str(latest_md),
             "latest_sources_csv": str(latest_sources),
             "latest_artifacts_csv": str(latest_artifacts),
             "latest_next_trade_plan_csv": str(latest_next_trade_plan),
+            "latest_signal_explain_csv": str(latest_signal_explain),
+            "latest_trade_explain_csv": str(latest_trade_explain),
         }
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, default=self._json_default),
@@ -861,12 +883,24 @@ class ProductionDailyObservationReportBuilder:
             max(t.rank_no) as max_target_rank,
             min(t.score) as min_target_score,
             max(t.score) as max_target_score,
-            min(ss.rank_in_batch) as min_source_rank,
-            max(ss.rank_in_batch) as max_source_rank,
-            count(*) filter (where ss.rank_in_batch <= :target_count) as rank_in_scope_rows,
-            count(*) filter (where ss.rank_in_batch > :target_count) as rank_out_of_scope_rows
+            -- R63X5G_SELECTION_SUMMARY_ALIAS_FIX_V1: use the post-R63X5E aliases, with target rank fallback.
+            min(coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no)) as min_source_rank,
+            max(coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no)) as max_source_rank,
+            count(*) filter (where coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) <= :target_count) as rank_in_scope_rows,
+            count(*) filter (where coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) > :target_count) as rank_out_of_scope_rows
         from public.trading_paper_target_position t
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         where t.portfolio_id = :portfolio_id
           and t.effective_date <= :report_date
           and t.run_id = (
@@ -903,11 +937,33 @@ class ProductionDailyObservationReportBuilder:
             t.target_weight,
             t.target_quantity,
             t.reason_code as target_reason_code,
-            ss.rank_in_batch as source_rank,
-            ss.raw_score as source_raw_score,
-            ss.reason_code as signal_reason_code
+            -- R63X5E_EXPLAINABILITY_SIGNAL_LINEAGE_REASON_FIX_V1:
+            -- Prefer exact strategy_signal_id, but fall back to target.source_signal_run_id
+            -- so old target rows without strategy_signal_id still expose source_signal_run_id
+            -- and target-level reason_code/status_reason in explainability CSVs.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.raw_score, ss_by_run.raw_score, t.score) as source_raw_score,
+            coalesce(ss_by_id.normalized_score, ss_by_run.normalized_score, t.score) as source_normalized_score,
+            coalesce(ss_by_id.confidence_score, ss_by_run.confidence_score) as source_confidence_score,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json
         from public.trading_paper_target_position t
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = t.instrument_id
         where t.portfolio_id = :portfolio_id
           and t.run_id = :target_run_id
@@ -1063,14 +1119,37 @@ class ProductionDailyObservationReportBuilder:
             t.target_weight,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
-            ss.rank_in_batch as source_rank,
-            ss.reason_code as signal_reason_code
+            -- R63X5E_EXPLAINABILITY_SIGNAL_LINEAGE_REASON_FIX_V1:
+            -- Prefer exact strategy_signal_id, but fall back to target.source_signal_run_id
+            -- so old target rows without strategy_signal_id still expose source_signal_run_id
+            -- and target-level reason_code/status_reason in explainability CSVs.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.raw_score, ss_by_run.raw_score, t.score) as source_raw_score,
+            coalesce(ss_by_id.normalized_score, ss_by_run.normalized_score, t.score) as source_normalized_score,
+            coalesce(ss_by_id.confidence_score, ss_by_run.confidence_score) as source_confidence_score,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json
         from public.trading_paper_order o
         left join public.trading_paper_fill f
           on f.order_id = o.id
          and (:fill_run_id is null or f.run_id = :fill_run_id)
         left join public.trading_paper_target_position t on t.id = o.target_position_id
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = o.instrument_id
         where o.portfolio_id = :portfolio_id
           and o.run_id = :order_run_id
@@ -1946,11 +2025,14 @@ class ProductionDailyObservationReportBuilder:
             t.target_quantity,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
-            ss.run_id as source_signal_run_id,
-            ss.as_of_date as source_signal_as_of_date,
-            ss.effective_date as source_signal_effective_date,
-            ss.rank_in_batch as source_rank,
-            ss.reason_code as signal_reason_code,
+            -- R63X5H_NEXT_TRADE_ALIAS_LINEAGE_FIX_V1: use post-R63X5E aliases, with target-row fallback.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json,
             cp.current_quantity,
             cp.current_market_value,
             cp.current_total_pnl,
@@ -1965,7 +2047,18 @@ class ProductionDailyObservationReportBuilder:
         from public.trading_paper_target_position t
         join target_run tr on tr.target_run_id = t.run_id
         left join current_pos cp on cp.instrument_id = t.instrument_id
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = t.instrument_id
         where t.portfolio_id = :portfolio_id
           and t.effective_date = :next_trade_date
@@ -2032,11 +2125,14 @@ class ProductionDailyObservationReportBuilder:
             t.target_weight,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
-            ss.run_id as source_signal_run_id,
-            ss.as_of_date as source_signal_as_of_date,
-            ss.effective_date as source_signal_effective_date,
-            ss.rank_in_batch as source_rank,
-            ss.reason_code as signal_reason_code,
+            -- R63X5H_NEXT_TRADE_ALIAS_LINEAGE_FIX_V1: use post-R63X5E aliases, with target-row fallback.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json,
             cp.current_quantity,
             cp.current_market_value,
             cp.current_total_pnl,
@@ -2068,7 +2164,18 @@ class ProductionDailyObservationReportBuilder:
         join order_run r on r.order_run_id = o.run_id
         left join public.trading_paper_target_position t on t.id = o.target_position_id
         left join current_pos cp on cp.instrument_id = o.instrument_id
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = o.instrument_id
         where o.portfolio_id = :portfolio_id
           and o.effective_date = :next_trade_date
@@ -5842,14 +5949,20 @@ class ProductionDailyObservationReportBuilder:
             t.target_weight,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
-            ss.run_id as source_signal_run_id,
-            ss.as_of_date as source_signal_as_of_date,
-            ss.effective_date as source_signal_effective_date,
-            ss.rank_in_batch as source_rank,
-            ss.raw_score as source_raw_score,
-            ss.normalized_score as source_normalized_score,
-            ss.confidence_score as source_confidence_score,
-            ss.reason_code as signal_reason_code,
+            -- R63X5E_EXPLAINABILITY_SIGNAL_LINEAGE_REASON_FIX_V1:
+            -- Prefer exact strategy_signal_id, but fall back to target.source_signal_run_id
+            -- so old target rows without strategy_signal_id still expose source_signal_run_id
+            -- and target-level reason_code/status_reason in explainability CSVs.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.raw_score, ss_by_run.raw_score, t.score) as source_raw_score,
+            coalesce(ss_by_id.normalized_score, ss_by_run.normalized_score, t.score) as source_normalized_score,
+            coalesce(ss_by_id.confidence_score, ss_by_run.confidence_score) as source_confidence_score,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json,
             cp.current_quantity,
             cp.current_market_value,
             cp.current_total_pnl,
@@ -5879,7 +5992,18 @@ class ProductionDailyObservationReportBuilder:
         from public.trading_paper_order o
         left join public.trading_paper_target_position t on t.id = o.target_position_id
         left join current_pos cp on cp.instrument_id = o.instrument_id
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = o.instrument_id
         where o.run_id = :order_run_id
         order by case when upper(o.order_side) = 'BUY' then 0 when upper(o.order_side) = 'SELL' then 1 else 2 end,
@@ -5914,16 +6038,33 @@ class ProductionDailyObservationReportBuilder:
             t.target_quantity,
             t.reason_code as target_reason_code,
             t.status_reason as target_status_reason,
-            ss.run_id as source_signal_run_id,
-            ss.as_of_date as source_signal_as_of_date,
-            ss.effective_date as source_signal_effective_date,
-            ss.rank_in_batch as source_rank,
-            ss.raw_score as source_raw_score,
-            ss.normalized_score as source_normalized_score,
-            ss.confidence_score as source_confidence_score,
-            ss.reason_code as signal_reason_code
+            -- R63X5E_EXPLAINABILITY_SIGNAL_LINEAGE_REASON_FIX_V1:
+            -- Prefer exact strategy_signal_id, but fall back to target.source_signal_run_id
+            -- so old target rows without strategy_signal_id still expose source_signal_run_id
+            -- and target-level reason_code/status_reason in explainability CSVs.
+            coalesce(ss_by_id.run_id, ss_by_run.run_id, t.source_signal_run_id) as source_signal_run_id,
+            coalesce(ss_by_id.as_of_date, ss_by_run.as_of_date, t.as_of_date) as source_signal_as_of_date,
+            coalesce(ss_by_id.effective_date, ss_by_run.effective_date, t.effective_date) as source_signal_effective_date,
+            coalesce(ss_by_id.rank_in_batch, ss_by_run.rank_in_batch, t.rank_no) as source_rank,
+            coalesce(ss_by_id.raw_score, ss_by_run.raw_score, t.score) as source_raw_score,
+            coalesce(ss_by_id.normalized_score, ss_by_run.normalized_score, t.score) as source_normalized_score,
+            coalesce(ss_by_id.confidence_score, ss_by_run.confidence_score) as source_confidence_score,
+            coalesce(ss_by_id.reason_code, ss_by_run.reason_code, t.reason_code) as signal_reason_code,
+            cast(coalesce(ss_by_id.reason_payload_json, ss_by_run.reason_payload_json, '{}'::jsonb) as text) as signal_reason_payload_json,
+            cast(coalesce(ss_by_id.parameter_payload_json, ss_by_run.parameter_payload_json, '{}'::jsonb) as text) as signal_parameter_payload_json
         from public.trading_paper_target_position t
-        left join public.strategy_signal ss on ss.id = t.strategy_signal_id
+        left join public.strategy_signal ss_by_id on ss_by_id.id = t.strategy_signal_id
+        left join lateral (
+            select ss2.*
+            from public.strategy_signal ss2
+            where ss2.run_id = t.source_signal_run_id
+              and (
+                  ss2.instrument_id = t.instrument_id
+                  or ss2.subject_key = cast(t.instrument_id as text)
+              )
+            order by ss2.rank_in_batch nulls last, ss2.id
+            limit 1
+        ) ss_by_run on true
         left join public.meta_instrument mi on mi.id = t.instrument_id
         where t.run_id = :target_run_id
         order by t.rank_no nulls last, t.score desc nulls last, t.instrument_id
@@ -5950,6 +6091,318 @@ class ProductionDailyObservationReportBuilder:
                 **row,
             })
         return out
+
+
+    # R63X4_EXPLAINABILITY_REPORT_PATCH_V1 begin
+    @staticmethod
+    def _explainability_json_dict(raw: Any) -> dict[str, Any]:
+        # Parse JSON/JSONB payloads safely for report-only explainability exports.
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                return {}
+        if not isinstance(raw, str):
+            return {}
+        value = raw.strip()
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _explainability_get(payload: dict[str, Any], *paths: str) -> Any:
+        # Return the first non-empty value from dotted payload paths.
+        for path in paths:
+            current: Any = payload
+            ok = True
+            for part in path.split("."):
+                if isinstance(current, dict) and part in current:
+                    current = current.get(part)
+                else:
+                    ok = False
+                    break
+            if ok and current not in (None, "", [], {}):
+                return current
+        return None
+
+    @staticmethod
+    def _explainability_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                return str(value)
+        text_value = str(value)
+        return text_value if text_value else None
+
+    def _signal_explain_row(self, base: dict[str, Any], row: dict[str, Any], *, row_source: str) -> dict[str, Any]:
+        payload = self._explainability_json_dict(row.get("signal_reason_payload_json"))
+        parameter_payload = self._explainability_json_dict(row.get("signal_parameter_payload_json"))
+        score_components = self._explainability_get(payload, "score_components") or {}
+        concept_domain = self._explainability_get(payload, "concept_domain") or {}
+        industry_payload = self._explainability_get(payload, "industry") or {}
+        market_inputs = self._explainability_get(payload, "market_inputs") or {}
+        route_config = self._explainability_get(payload, "route_config") or {}
+
+        candidate_strategy_reason = self._explainability_get(
+            payload,
+            "candidate_strategy_reason",
+            "candidate_strategy.reason",
+            "strategy_reason",
+        )
+        entry_pool_reason = self._explainability_get(
+            payload,
+            "reason_summary",
+            "entry_pool_reason",
+            "entry_reason",
+        )
+
+        return {
+            **base,
+            "row_source": row_source,
+            "instrument_id": row.get("instrument_id"),
+            "instrument_code": row.get("instrument_code"),
+            "symbol": row.get("symbol"),
+            "display_name": row.get("display_name"),
+            # R63X5D_EXPLAINABILITY_COLUMN_FIX_CRLF_V1: stable alias required by signal/trade explain CSV smoke.
+            "instrument_name": (
+                row.get("instrument_name")
+                or row.get("display_name")
+                or row.get("security_name")
+                or row.get("name")
+                or row.get("symbol")
+                or row.get("instrument_code")
+            ),
+            "rank_no": row.get("rank_no"),
+            "target_weight": row.get("target_weight"),
+            "target_quantity": row.get("target_quantity"),
+            "target_reason_code": row.get("target_reason_code"),
+            "target_status_reason": row.get("target_status_reason"),
+            "source_signal_run_id": (
+                row.get("source_signal_run_id")
+                or row.get("next_plan_signal_run_id")
+                or base.get("source_signal_run_id")
+            ),
+            "source_signal_as_of_date": row.get("source_signal_as_of_date") or base.get("source_signal_as_of_date"),
+            "source_signal_effective_date": row.get("source_signal_effective_date") or base.get("source_signal_effective_date"),
+            "source_rank": row.get("source_rank"),
+            "source_raw_score": row.get("source_raw_score"),
+            "source_normalized_score": row.get("source_normalized_score"),
+            "source_confidence_score": row.get("source_confidence_score"),
+            "signal_reason_code": row.get("signal_reason_code"),
+            "entry_pool_reason": self._explainability_text(
+                entry_pool_reason
+                or self._dedupe_join([
+                    row.get("signal_reason_code"),
+                    row.get("target_reason_code"),
+                    row.get("target_status_reason"),
+                ])
+            ),
+            "candidate_strategy_code": self._explainability_text(self._explainability_get(payload, "candidate_strategy_code", "candidate_strategy.code")),
+            "candidate_strategy_name": self._explainability_text(self._explainability_get(payload, "candidate_strategy_name", "candidate_strategy.name")),
+            "candidate_strategy_bucket": self._explainability_text(self._explainability_get(payload, "candidate_strategy_bucket", "candidate_strategy.bucket")),
+            "candidate_strategy_reason": self._explainability_text(
+                candidate_strategy_reason
+                or row.get("signal_reason_code")
+                or row.get("target_reason_code")
+                or row.get("target_status_reason")
+            ),
+            "confirmed_market_regime": self._explainability_text(self._explainability_get(payload, "confirmed_market_regime", "market_regime", "market_regime_display")),
+            "raw_market_regime": self._explainability_text(self._explainability_get(payload, "raw_market_regime", "market_regime")),
+            "regime_confidence": self._explainability_text(self._explainability_get(payload, "regime_confidence", "market_inputs.regime_confidence")),
+            "regime_reason_code": self._explainability_text(self._explainability_get(payload, "regime_reason_code", "market_inputs.regime_reason_code")),
+            "regime_reason_summary": self._explainability_text(self._explainability_get(payload, "regime_reason_summary", "market_inputs.regime_reason_summary")),
+            "route_name": self._explainability_text(self._explainability_get(payload, "route_name")),
+            "industry_tag_code": self._explainability_text(self._explainability_get(payload, "industry_tag_code", "industry.tag_code")),
+            "industry_tag_name": self._explainability_text(self._explainability_get(payload, "industry_tag_name", "industry.tag_name", "industry.name")),
+            "industry_strength_score": self._explainability_text(self._explainability_get(payload, "feat_industry_strength_20", "industry.strength_20", "industry.industry_strength_20", "score_components.industry_strength_20")),
+            "concept_names": self._explainability_text(self._explainability_get(payload, "concept_names", "concept_domain.concept_names", "concept_domain.cleaned_concept_names", "concept_domain.true_theme_names")),
+            "concept_score": self._explainability_text(self._explainability_get(payload, "concept_score", "concept_domain.concept_score", "concept_domain.cleaned_concept_score", "concept_domain.true_theme_score")),
+            "capital_activity_score": self._explainability_text(self._explainability_get(payload, "capital_activity_score", "concept_domain.capital_activity_score")),
+            "stock_alpha_score": self._explainability_text(self._explainability_get(payload, "stock_alpha_score", "score_components.stock_alpha_score")),
+            "risk_penalty_score": self._explainability_text(self._explainability_get(payload, "risk_penalty_score", "score_components.risk_penalty_score")),
+            "final_preview_score": self._explainability_text(self._explainability_get(payload, "final_preview_score", "score_components.final_preview_score")),
+            "v1_1_preview_score": self._explainability_text(self._explainability_get(payload, "v1_1_preview_score", "score_components.v1_1_preview_score")),
+            "cleaned_v1_1_preview_score": self._explainability_text(self._explainability_get(payload, "cleaned_v1_1_preview_score", "score_components.cleaned_v1_1_preview_score")),
+            "score_components_json": self._explainability_text(score_components),
+            "concept_domain_json": self._explainability_text(concept_domain),
+            "industry_json": self._explainability_text(industry_payload),
+            "market_inputs_json": self._explainability_text(market_inputs),
+            "route_config_json": self._explainability_text(route_config),
+            "parameter_payload_json": self._explainability_text(parameter_payload),
+            "reason_payload_json": self._explainability_text(payload),
+        }
+
+    def _build_signal_explain_rows(
+        self,
+        *,
+        campaign_reports: list[dict[str, Any]],
+        next_trade_plan: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any, str]] = set()
+
+        def append_row(base: dict[str, Any], row: dict[str, Any], row_source: str) -> None:
+            explain = self._signal_explain_row(base, row, row_source=row_source)
+            key = (
+                explain.get("campaign_code"),
+                explain.get("source_signal_run_id"),
+                explain.get("instrument_id") or explain.get("instrument_code"),
+                row_source,
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            rows.append(explain)
+
+        for campaign in campaign_reports or []:
+            base = {
+                "report_section": "campaign_selected_instruments",
+                "campaign_code": campaign.get("campaign_code"),
+                "strategy_code": campaign.get("strategy_code"),
+                "strategy_version_code": campaign.get("strategy_version_code"),
+                "portfolio_id": campaign.get("portfolio_id"),
+                "source_signal_run_id": ((campaign.get("selection_summary") or {}).get("source_signal_run_id")),
+            }
+            for row in campaign.get("selected_instruments") or []:
+                append_row(base, row, "selected_instruments")
+
+        next_base_by_campaign: dict[Any, dict[str, Any]] = {}
+        for plan in (next_trade_plan or {}).get("campaigns") or []:
+            next_base_by_campaign[plan.get("campaign_code")] = {
+                "report_section": "next_trade_plan",
+                "campaign_code": plan.get("campaign_code"),
+                "strategy_code": plan.get("strategy_code"),
+                "strategy_version_code": plan.get("strategy_version_code"),
+                "portfolio_id": plan.get("portfolio_id"),
+                "next_trade_date": plan.get("next_trade_date"),
+                "source_signal_run_id": plan.get("next_plan_signal_run_id"),
+                "target_run_id": plan.get("target_run_id"),
+                "order_run_id": plan.get("order_run_id"),
+            }
+
+        for row in self._next_trade_plan_csv_rows({"next_trade_plan": next_trade_plan}):
+            campaign_code = row.get("campaign_code")
+            base = next_base_by_campaign.get(campaign_code, {"report_section": "next_trade_plan", "campaign_code": campaign_code})
+            append_row(base, row, row.get("row_source") or "next_trade_plan")
+        return rows
+
+    def _build_trade_explain_rows(
+        self,
+        *,
+        campaign_reports: list[dict[str, Any]],
+        next_trade_plan: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        for campaign in campaign_reports or []:
+            base = {
+                "report_section": "executed_or_materialized_trade",
+                "campaign_code": campaign.get("campaign_code"),
+                "strategy_code": campaign.get("strategy_code"),
+                "strategy_version_code": campaign.get("strategy_version_code"),
+                "portfolio_id": campaign.get("portfolio_id"),
+                "source_signal_run_id": ((campaign.get("selection_summary") or {}).get("source_signal_run_id")),
+            }
+            for row in campaign.get("trade_details") or []:
+                signal_row = self._signal_explain_row(base, row, row_source="trade_details")
+                side = str(row.get("order_side") or "").upper()
+                rows.append({
+                    **signal_row,
+                    "order_id": row.get("order_id"),
+                    "order_run_id": row.get("order_run_id"),
+                    "fill_id": row.get("fill_id"),
+                    "fill_run_id": row.get("fill_run_id"),
+                    "action": side or "ORDER",
+                    "order_side": row.get("order_side"),
+                    "side": side or row.get("order_side") or row.get("plan_action"),
+                    "order_type": row.get("order_type"),
+                    "order_quantity": row.get("order_quantity"),
+                    "estimated_price": row.get("estimated_price"),
+                    "order_status": row.get("order_status"),
+                    "reject_reason": row.get("reject_reason"),
+                    "fill_status": row.get("fill_status"),
+                    "fill_price": row.get("fill_price"),
+                    "fill_quantity": row.get("fill_quantity"),
+                    "trade_reason": row.get("trade_reason"),
+                    "trade_reason_summary": row.get("trade_reason_summary"),
+                    "buy_reason": row.get("trade_reason_summary") if side == "BUY" else None,
+                    "sell_reason": row.get("trade_reason_summary") if side == "SELL" else None,
+                    "exit_reason": (
+                        row.get("exit_reason")
+                        or (row.get("trade_reason_summary") if side == "SELL" else None)
+                        or (row.get("target_reason_code") if side == "SELL" else None)
+                        or row.get("reject_reason")
+                    ),
+                    "entry_policy": row.get("entry_policy"),
+                    "exit_policy": row.get("exit_policy"),
+                })
+
+        for row in self._next_trade_plan_csv_rows({"next_trade_plan": next_trade_plan}):
+            side = str(row.get("order_side") or row.get("plan_action") or "").upper()
+            base = {
+                "report_section": "next_trade_plan",
+                "campaign_code": row.get("campaign_code"),
+                "strategy_code": row.get("strategy_code"),
+                "strategy_version_code": row.get("strategy_version_code"),
+                "portfolio_id": row.get("portfolio_id"),
+                "source_signal_run_id": row.get("source_signal_run_id") or row.get("next_plan_signal_run_id"),
+                "next_trade_date": row.get("next_trade_date"),
+            }
+            signal_row = self._signal_explain_row(base, row, row_source=row.get("row_source") or "next_trade_plan")
+            derived_reason = (
+                row.get("plan_reason")
+                or row.get("derived_plan_reason")
+                or row.get("target_reason_code")
+                or row.get("target_status_reason")
+                or row.get("signal_reason_code")
+                or row.get("campaign_reason")
+            )
+            rows.append({
+                **signal_row,
+                "order_id": row.get("order_id"),
+                "order_run_id": row.get("order_run_id"),
+                "target_run_id": row.get("target_run_id"),
+                "action": side or row.get("plan_action") or "PLAN",
+                "order_side": row.get("order_side"),
+                "side": side or row.get("order_side") or row.get("plan_action"),
+                "order_type": row.get("order_type"),
+                "order_quantity": row.get("order_quantity"),
+                "estimated_price": row.get("estimated_price"),
+                "order_status": row.get("order_status"),
+                "reject_reason": row.get("reject_reason"),
+                "current_quantity": row.get("current_quantity"),
+                "target_quantity": row.get("target_quantity"),
+                "current_position_status": row.get("current_position_status"),
+                "trade_reason": derived_reason,
+                "trade_reason_summary": derived_reason,
+                "buy_reason": derived_reason if side == "BUY" else None,
+                "sell_reason": derived_reason if side == "SELL" else None,
+                "exit_reason": (
+                    row.get("exit_reason")
+                    or (derived_reason if side == "SELL" else None)
+                    or (row.get("target_reason_code") if side == "SELL" else None)
+                    or row.get("reject_reason")
+                ),
+                "entry_policy": row.get("price_fill_rule") if side == "BUY" else None,
+                "exit_policy": row.get("price_fill_rule") if side == "SELL" else None,
+            })
+
+        return rows
+    # R63X4_EXPLAINABILITY_REPORT_PATCH_V1 end
+
 
     def _source_rows(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
