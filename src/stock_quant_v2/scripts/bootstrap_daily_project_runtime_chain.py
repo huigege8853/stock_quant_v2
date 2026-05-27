@@ -758,6 +758,75 @@ class DatabaseInspector:
             )
             return value is not None
 
+    def resolve_strategy_signal_source(
+        self,
+        *,
+        strategy_code: str,
+        strategy_version_code: str,
+        effective_date: date,
+    ) -> dict[str, object] | None:
+        """Resolve the exact signal run for a campaign strategy/version/date.
+
+        The next-trade plan runner must not fall back to a global latest
+        strategy_signal run.  It should carry the campaign's own strategy_code
+        and strategy_version_code into M7 as an explicit source_signal_run_id.
+        """
+        from stock_quant_v2.db.session import SessionLocal
+
+        sql = """
+        select
+            ss.run_id as source_signal_run_id,
+            max(ss.as_of_date) as as_of_date,
+            max(ss.effective_date) as effective_date,
+            max(ss.strategy_version_id) as strategy_version_id
+        from strategy_signal ss
+        join strategy_version sv on sv.id = ss.strategy_version_id
+        join strategy_definition sd on sd.id = sv.strategy_definition_id
+        where sd.strategy_code = :strategy_code
+          and sv.version_code = :strategy_version_code
+          and ss.effective_date = :effective_date
+        group by ss.run_id
+        order by ss.run_id desc
+        limit 1
+        """
+        params = {
+            "strategy_code": strategy_code,
+            "strategy_version_code": strategy_version_code,
+            "effective_date": effective_date,
+        }
+        with SessionLocal() as session:
+            try:
+                row = session.execute(text(sql), params).mappings().one_or_none()
+            except Exception:
+                return None
+            if row is None:
+                return None
+
+            source_signal_run_id = int(row["source_signal_run_id"])
+            screen_request_id = self._safe_scalar(
+                session,
+                """
+                select screen_request_id
+                from research_screen_result
+                where signal_run_id = :source_signal_run_id
+                  and result_status = 'SUCCESS'
+                  and effective_date <= :effective_date
+                order by effective_date desc, id desc
+                limit 1
+                """,
+                {
+                    "source_signal_run_id": source_signal_run_id,
+                    "effective_date": effective_date,
+                },
+            )
+            return {
+                "source_signal_run_id": source_signal_run_id,
+                "source_screen_request_id": int(screen_request_id) if screen_request_id is not None else None,
+                "as_of_date": self._coerce_to_date(row["as_of_date"]),
+                "effective_date": self._coerce_to_date(row["effective_date"]),
+                "strategy_version_id": int(row["strategy_version_id"]),
+            }
+
     @staticmethod
     def _safe_scalar(session, sql: str, params: dict | None = None):
         try:
@@ -906,10 +975,38 @@ def _build_next_trade_plan_steps(project_root: Path, args: argparse.Namespace) -
         execution_context=str(args.next_trade_plan_execution_context),
     )
     steps: list[ChainStep] = []
+    inspector = DatabaseInspector()
 
     for campaign in campaigns:
         portfolio_id = int(campaign["portfolio_id"])
         campaign_code = str(campaign.get("campaign_code") or f"portfolio_{portfolio_id}")
+        strategy_code = str(campaign.get("strategy_code") or "").strip()
+        strategy_version_code = str(campaign.get("strategy_version_code") or "").strip()
+        if not strategy_code or not strategy_version_code:
+            print(
+                "[DAILY][next_trade_plan] skip campaign because strategy_code/version is missing: "
+                f"campaign_code={campaign_code}",
+                flush=True,
+            )
+            continue
+
+        signal_source = inspector.resolve_strategy_signal_source(
+            strategy_code=strategy_code,
+            strategy_version_code=strategy_version_code,
+            effective_date=effective_date,
+        )
+        if signal_source is None:
+            print(
+                "[DAILY][next_trade_plan] skip campaign because exact strategy signal is missing: "
+                f"campaign_code={campaign_code}, strategy_code={strategy_code}, "
+                f"strategy_version_code={strategy_version_code}, effective_date={effective_date.isoformat()}",
+                flush=True,
+            )
+            continue
+
+        source_signal_run_id = int(signal_source["source_signal_run_id"])
+        source_as_of_date = signal_source.get("as_of_date")
+        source_screen_request_id = signal_source.get("source_screen_request_id")
         step_name = f"m7_next_trade_plan_only_p{portfolio_id}"
         extra_args = [
             "--portfolio-id",
@@ -917,10 +1014,27 @@ def _build_next_trade_plan_steps(project_root: Path, args: argparse.Namespace) -
             "--effective-date",
             effective_date.isoformat(),
             "--plan-only",
+            "--source-signal-run-id",
+            str(source_signal_run_id),
+            "--strategy-code",
+            strategy_code,
+            "--strategy-version-code",
+            strategy_version_code,
         ]
+        if source_as_of_date is not None:
+            extra_args.extend(["--as-of-date", source_as_of_date.isoformat()])
+        if source_screen_request_id is not None:
+            extra_args.extend(["--source-screen-request-id", str(source_screen_request_id)])
         if getattr(args, "next_trade_plan_replace_existing", True):
             extra_args.append("--replace-existing")
 
+        print(
+            "[DAILY][next_trade_plan] resolved exact campaign signal: "
+            f"campaign_code={campaign_code}, portfolio_id={portfolio_id}, "
+            f"strategy_code={strategy_code}, strategy_version_code={strategy_version_code}, "
+            f"source_signal_run_id={source_signal_run_id}, effective_date={effective_date.isoformat()}",
+            flush=True,
+        )
         steps.append(
             ChainStep(
                 step_name,
@@ -931,6 +1045,9 @@ def _build_next_trade_plan_steps(project_root: Path, args: argparse.Namespace) -
                 extra_env={
                     "SQV2_NEXT_TRADE_PLAN_CAMPAIGN_CODE": campaign_code,
                     "SQV2_NEXT_TRADE_PLAN_EFFECTIVE_DATE": effective_date.isoformat(),
+                    "SQV2_NEXT_TRADE_PLAN_STRATEGY_CODE": strategy_code,
+                    "SQV2_NEXT_TRADE_PLAN_STRATEGY_VERSION_CODE": strategy_version_code,
+                    "SQV2_NEXT_TRADE_PLAN_SOURCE_SIGNAL_RUN_ID": str(source_signal_run_id),
                 },
             )
         )

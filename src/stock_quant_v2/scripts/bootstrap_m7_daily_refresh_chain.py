@@ -302,11 +302,35 @@ def _resolve_latest_signal_run(
     effective_date: date,
     explicit_signal_run_id: int | None,
     explicit_as_of_date: date | None,
+    strategy_code: str | None = None,
+    strategy_version_code: str | None = None,
 ) -> tuple[int, date, date]:
+    strategy_code = (strategy_code or "").strip() or None
+    strategy_version_code = (strategy_version_code or "").strip() or None
+    has_strategy_filter = bool(strategy_code and strategy_version_code)
+
     if explicit_signal_run_id is not None:
-        row = session.execute(
-            text(
+        if has_strategy_filter:
+            sql = """
+                select
+                    ss.run_id,
+                    max(ss.as_of_date) as as_of_date,
+                    max(ss.effective_date) as effective_date
+                from strategy_signal ss
+                join strategy_version sv on sv.id = ss.strategy_version_id
+                join strategy_definition sd on sd.id = sv.strategy_definition_id
+                where ss.run_id = :run_id
+                  and sd.strategy_code = :strategy_code
+                  and sv.version_code = :strategy_version_code
+                group by ss.run_id
                 """
+            params = {
+                "run_id": explicit_signal_run_id,
+                "strategy_code": strategy_code,
+                "strategy_version_code": strategy_version_code,
+            }
+        else:
+            sql = """
                 select
                     run_id,
                     max(as_of_date) as as_of_date,
@@ -315,11 +339,17 @@ def _resolve_latest_signal_run(
                 where run_id = :run_id
                 group by run_id
                 """
-            ),
-            {"run_id": explicit_signal_run_id},
-        ).mappings().one_or_none()
+            params = {"run_id": explicit_signal_run_id}
+
+        row = session.execute(text(sql), params).mappings().one_or_none()
 
         if row is None:
+            if has_strategy_filter:
+                raise RuntimeError(
+                    "source_signal_run_id does not match requested strategy/version: "
+                    f"source_signal_run_id={explicit_signal_run_id}, "
+                    f"strategy_code={strategy_code}, strategy_version_code={strategy_version_code}"
+                )
             raise RuntimeError(f"source_signal_run_id not found: {explicit_signal_run_id}")
 
         resolved_as_of = explicit_as_of_date or row["as_of_date"]
@@ -335,9 +365,32 @@ def _resolve_latest_signal_run(
             )
         return int(row["run_id"]), resolved_as_of, resolved_effective
 
-    row = session.execute(
-        text(
+    if has_strategy_filter:
+        sql = """
+            select
+                ss.run_id,
+                max(ss.as_of_date) as as_of_date,
+                max(ss.effective_date) as effective_date
+            from strategy_signal ss
+            join strategy_version sv on sv.id = ss.strategy_version_id
+            join strategy_definition sd on sd.id = sv.strategy_definition_id
+            where ss.effective_date <= :effective_date
+              and sd.strategy_code = :strategy_code
+              and sv.version_code = :strategy_version_code
+            group by ss.run_id
+            order by max(ss.effective_date) desc, ss.run_id desc
+            limit 1
             """
+        params = {
+            "effective_date": effective_date,
+            "strategy_code": strategy_code,
+            "strategy_version_code": strategy_version_code,
+        }
+    else:
+        # Legacy standalone path.  Production campaign and next-trade-plan
+        # callers should pass either an explicit source_signal_run_id or a
+        # strategy_code/strategy_version_code pair to avoid global latest picks.
+        sql = """
             select
                 run_id,
                 max(as_of_date) as as_of_date,
@@ -348,11 +401,17 @@ def _resolve_latest_signal_run(
             order by max(effective_date) desc, run_id desc
             limit 1
             """
-        ),
-        {"effective_date": effective_date},
-    ).mappings().one_or_none()
+        params = {"effective_date": effective_date}
+
+    row = session.execute(text(sql), params).mappings().one_or_none()
 
     if row is None:
+        if has_strategy_filter:
+            raise RuntimeError(
+                "cannot resolve strategy_signal run for M7 daily refresh: "
+                f"strategy_code={strategy_code}, strategy_version_code={strategy_version_code}, "
+                f"effective_date<={effective_date}"
+            )
         raise RuntimeError("cannot resolve latest strategy_signal run for M7 daily refresh")
 
     return int(row["run_id"]), row["as_of_date"], row["effective_date"]
@@ -525,6 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--as-of-date", default=None, help="YYYY-MM-DD; default: resolved from latest signal run")
     parser.add_argument("--source-signal-run-id", type=int, default=None)
     parser.add_argument("--source-screen-request-id", type=int, default=None)
+    parser.add_argument("--strategy-code", default=None)
+    parser.add_argument("--strategy-version-code", default=None)
     parser.add_argument("--replace-existing", action="store_true")
     parser.add_argument(
         "--plan-only",
@@ -580,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
             effective_date=effective_date,
             explicit_signal_run_id=args.source_signal_run_id,
             explicit_as_of_date=explicit_as_of_date,
+            strategy_code=args.strategy_code,
+            strategy_version_code=args.strategy_version_code,
         )
         source_screen_request_id = _resolve_latest_screen_request_id(
             session,
@@ -619,7 +682,17 @@ def main(argv: list[str] | None = None) -> int:
                     "source_signal_as_of_date": as_of_date.isoformat(),
                     "source_signal_effective_date": signal_effective_date.isoformat(),
                     "source_screen_request_id": source_screen_request_id,
-                    "signal_resolution_policy": "latest strategy_signal effective_date <= paper_execution_date",
+                    "strategy_code": args.strategy_code,
+                    "strategy_version_code": args.strategy_version_code,
+                    "signal_resolution_policy": (
+                        "explicit source_signal_run_id with strategy/version validation"
+                        if args.source_signal_run_id is not None and args.strategy_code and args.strategy_version_code
+                        else (
+                            "strategy/version filtered latest strategy_signal effective_date <= paper_execution_date"
+                            if args.strategy_code and args.strategy_version_code
+                            else "latest strategy_signal effective_date <= paper_execution_date"
+                        )
+                    ),
                     "signal_usage_mode": signal_usage_mode,
                     "signal_carry_days": signal_carry_days,
                     "screen_resolution_policy": "prefer same source_signal_run_id when research_screen_result supports it",
@@ -656,6 +729,8 @@ def main(argv: list[str] | None = None) -> int:
                 "plan_only": bool(args.plan_only),
                 "source_signal_run_id": source_signal_run_id,
                 "source_screen_request_id": source_screen_request_id,
+                "strategy_code": args.strategy_code,
+                "strategy_version_code": args.strategy_version_code,
                 "previous_snapshot_run_id": int(previous_snapshot["run_id"]),
                 "source_position_run_id": int(previous_position["run_id"]),
                 "replace_existing": bool(args.replace_existing),

@@ -88,6 +88,7 @@ class DatabaseInspector:
     def latest_executable_screen_source(
         self,
         effective_date_cap: date | None = None,
+        strategy_version_id: int | None = None,
     ) -> tuple[int | None, int | None, date | None, date | None, date | None]:
         latest_bar_date = self.latest_available_bar_date()
         if latest_bar_date is None:
@@ -99,21 +100,42 @@ class DatabaseInspector:
             else latest_bar_date
         )
 
-        sql = """
-        SELECT signal_run_id, screen_request_id, as_of_date, effective_date
-        FROM research_screen_result
-        WHERE result_status = 'SUCCESS'
-          AND effective_date <= :effective_upper_bound
-        ORDER BY id DESC
-        LIMIT 1
-        """
+        if strategy_version_id is not None:
+            sql = """
+            SELECT
+                rsr.signal_run_id,
+                rsr.screen_request_id,
+                rsr.as_of_date,
+                rsr.effective_date
+            FROM research_screen_result rsr
+            JOIN strategy_signal ss ON ss.run_id = rsr.signal_run_id
+            WHERE rsr.result_status = 'SUCCESS'
+              AND rsr.effective_date <= :effective_upper_bound
+              AND ss.strategy_version_id = :strategy_version_id
+            GROUP BY rsr.id, rsr.signal_run_id, rsr.screen_request_id, rsr.as_of_date, rsr.effective_date
+            ORDER BY rsr.effective_date DESC, rsr.id DESC
+            LIMIT 1
+            """
+            params = {
+                "effective_upper_bound": effective_upper_bound,
+                "strategy_version_id": strategy_version_id,
+            }
+        else:
+            # Legacy standalone route.  Campaign runners should provide
+            # M6_STRATEGY_VERSION_ID to avoid global latest screen selection.
+            sql = """
+            SELECT signal_run_id, screen_request_id, as_of_date, effective_date
+            FROM research_screen_result rsr
+            WHERE result_status = 'SUCCESS'
+              AND effective_date <= :effective_upper_bound
+            ORDER BY rsr.effective_date DESC, rsr.id DESC
+            LIMIT 1
+            """
+            params = {"effective_upper_bound": effective_upper_bound}
 
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(
-                    text(sql),
-                    {"effective_upper_bound": effective_upper_bound},
-                ).first()
+                row = conn.execute(text(sql), params).first()
         except Exception:
             return None, None, None, None, latest_bar_date
 
@@ -146,9 +168,17 @@ class DatabaseInspector:
         return None
 
 
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    return int(str(raw).strip())
+
+
 def _resolve_m6_source(
     inspector: DatabaseInspector,
     manual_target: date | None,
+    strategy_version_id: int | None = None,
 ) -> tuple[int, int, date, date, date, str]:
     (
         latest_signal_run_id,
@@ -156,7 +186,10 @@ def _resolve_m6_source(
         latest_as_of_date,
         latest_effective_date,
         latest_bar_date,
-    ) = inspector.latest_executable_screen_source(effective_date_cap=manual_target)
+    ) = inspector.latest_executable_screen_source(
+        effective_date_cap=manual_target,
+        strategy_version_id=strategy_version_id,
+    )
 
     if latest_bar_date is None:
         raise RuntimeError("Failed to resolve latest available daily_bar date.")
@@ -225,7 +258,11 @@ def run_m6_paper_trading_refresh_chain(
                 effective_date,
                 latest_bar_date,
                 target_source,
-            ) = _resolve_m6_source(inspector, target_date)
+            ) = _resolve_m6_source(
+                inspector,
+                target_date,
+                strategy_version_id=_env_int("M6_STRATEGY_VERSION_ID"),
+            )
         except Exception as exc:
             print(f"[M6] Failed to resolve executable source: {exc}")
             print("[M6] Please make sure M4 / M5 outputs are ready.")
@@ -235,6 +272,7 @@ def run_m6_paper_trading_refresh_chain(
         print(f"[M6] target_source = {target_source}")
         print(f"[M6] latest_screen_request_id = {source_screen_request_id}")
         print(f"[M6] latest_signal_run_id = {source_signal_run_id}")
+        print(f"[M6] strategy_version_id_filter = {_env_int('M6_STRATEGY_VERSION_ID')}")
         print(f"[M6] as_of_date = {as_of_date.isoformat()}")
         print(f"[M6] effective_date = {effective_date.isoformat()}")
 
