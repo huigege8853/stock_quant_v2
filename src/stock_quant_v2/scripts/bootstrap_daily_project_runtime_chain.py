@@ -1056,11 +1056,16 @@ def _build_next_trade_plan_steps(project_root: Path, args: argparse.Namespace) -
 
 
 def _build_taxonomy_daily_refresh_args(report_date: str | None) -> tuple[str, ...]:
+    cache_ttl_hours = _env_first("SQV2_TAXONOMY_CACHE_TTL_HOURS", "M4_TAXONOMY_CACHE_TTL_HOURS") or "36"
+    cache_manifest = _env_first("SQV2_TAXONOMY_CACHE_MANIFEST", "M4_TAXONOMY_CACHE_MANIFEST")
+    force_refresh_raw = _env_first("SQV2_TAXONOMY_FORCE_REFRESH", "M4_TAXONOMY_FORCE_REFRESH")
     args: list[str] = [
         "--daily-refresh",
         "--fail-safe",
         "--fetch-sw-industry-akshare",
         "--fetch-em-concepts",
+        "--cache-ttl-hours",
+        str(cache_ttl_hours),
         "--output-dir",
         "artifacts/m4/taxonomy_daily_refresh",
         "--progress-every",
@@ -1080,6 +1085,10 @@ def _build_taxonomy_daily_refresh_args(report_date: str | None) -> tuple[str, ..
         "--concept-import-commit-every",
         "5000",
     ]
+    if cache_manifest:
+        args.extend(["--cache-manifest", cache_manifest])
+    if force_refresh_raw is not None and _parse_bool(force_refresh_raw, option_name="SQV2_TAXONOMY_FORCE_REFRESH/M4_TAXONOMY_FORCE_REFRESH"):
+        args.append("--force-refresh")
     if report_date:
         args.extend(["--report-date", report_date])
     return tuple(args)

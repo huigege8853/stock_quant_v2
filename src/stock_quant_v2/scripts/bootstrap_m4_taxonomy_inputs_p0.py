@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -52,6 +53,224 @@ def _split_csv(value: str | None) -> list[str] | None:
 
 
 
+
+
+# R63Z3_TAXONOMY_DAILY_CACHE_BEGIN
+def _parse_utc_datetime(value: object | None) -> datetime | None:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    if text_value.endswith("Z"):
+        text_value = text_value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _resolve_taxonomy_cache_manifest_path(output_dir: Path, cache_manifest: str | None) -> Path:
+    if cache_manifest:
+        path = Path(cache_manifest)
+        return path if path.is_absolute() else output_dir / path
+    return output_dir / "taxonomy_daily_refresh_manifest.json"
+
+
+def _read_json_payload(path: Path) -> dict | None:
+    try:
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _taxonomy_status_is_reusable(status: object | None) -> bool:
+    return str(status or "").strip().upper() in {"SUCCESS", "PARTIAL"}
+
+
+def _taxonomy_artifact_json_path(output_dir: Path, report_date: str) -> Path:
+    return output_dir / f"m4_taxonomy_import_p0_{report_date}.json"
+
+
+def _taxonomy_artifact_md_path(output_dir: Path, report_date: str) -> Path:
+    return output_dir / f"m4_taxonomy_import_p0_{report_date}_skip.md"
+
+
+def _taxonomy_artifact_skip_json_path(output_dir: Path, report_date: str) -> Path:
+    return output_dir / f"m4_taxonomy_import_p0_{report_date}_skip.json"
+
+
+def _is_fresh_timestamp(timestamp: datetime | None, *, ttl_hours: float) -> bool:
+    if timestamp is None:
+        return False
+    if ttl_hours <= 0:
+        return True
+    age_seconds = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    return age_seconds <= ttl_hours * 3600
+
+
+def _file_mtime_utc(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _taxonomy_last_good_artifact(output_dir: Path) -> dict | None:
+    candidates: list[tuple[float, Path, dict]] = []
+    for path in output_dir.glob("m4_taxonomy_import_p0_*.json"):
+        if path.name.endswith("_skip.json"):
+            continue
+        payload = _read_json_payload(path)
+        if payload is None or not _taxonomy_status_is_reusable(payload.get("status")):
+            continue
+        try:
+            candidates.append((path.stat().st_mtime, path, payload))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    _, path, payload = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+    return {
+        "artifact_json": str(path),
+        "status": payload.get("status"),
+        "run_id": payload.get("run_id"),
+        "finished_at": payload.get("finished_at"),
+    }
+
+
+def _build_taxonomy_daily_skip_payload(
+    *,
+    output_dir: Path,
+    report_date: str,
+    cache_manifest: str | None,
+    cache_ttl_hours: float,
+) -> dict | None:
+    manifest_path = _resolve_taxonomy_cache_manifest_path(output_dir, cache_manifest)
+    manifest_payload = _read_json_payload(manifest_path)
+    canonical_json = _taxonomy_artifact_json_path(output_dir, report_date)
+    source_payload: dict | None = None
+    source_reason = ""
+    source_timestamp: datetime | None = None
+
+    if manifest_payload is not None:
+        manifest_report_date = str(manifest_payload.get("report_date") or "")
+        manifest_status = manifest_payload.get("status")
+        manifest_artifact = Path(str(manifest_payload.get("artifact_json") or canonical_json))
+        if (
+            manifest_report_date == report_date
+            and _taxonomy_status_is_reusable(manifest_status)
+            and manifest_artifact.exists()
+        ):
+            source_timestamp = _parse_utc_datetime(
+                manifest_payload.get("generated_at") or manifest_payload.get("finished_at")
+            ) or _file_mtime_utc(manifest_artifact)
+            if _is_fresh_timestamp(source_timestamp, ttl_hours=cache_ttl_hours):
+                source_payload = manifest_payload
+                source_reason = "fresh_manifest"
+                canonical_json = manifest_artifact
+
+    if source_payload is None and canonical_json.exists():
+        artifact_payload = _read_json_payload(canonical_json)
+        if artifact_payload is not None and _taxonomy_status_is_reusable(artifact_payload.get("status")):
+            source_timestamp = _parse_utc_datetime(artifact_payload.get("finished_at")) or _file_mtime_utc(canonical_json)
+            if _is_fresh_timestamp(source_timestamp, ttl_hours=cache_ttl_hours):
+                source_payload = artifact_payload
+                source_reason = "fresh_same_report_artifact"
+
+    if source_payload is None:
+        return None
+
+    last_good = _taxonomy_last_good_artifact(output_dir)
+    skip_payload = {
+        "status": "SKIPPED_FRESH_CACHE",
+        "report_date": report_date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cache_ttl_hours": cache_ttl_hours,
+        "skip_reason": source_reason,
+        "reused_artifact_json": str(canonical_json),
+        "reused_status": source_payload.get("status"),
+        "reused_run_id": source_payload.get("run_id"),
+        "reused_finished_at": source_payload.get("finished_at"),
+        "manifest_path": str(manifest_path),
+        "last_good": last_good,
+        "guardrails": ["no_provider_fetch", "no_db_write", "no_strategy_signal", "no_paper_trading"],
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    skip_json = _taxonomy_artifact_skip_json_path(output_dir, report_date)
+    skip_md = _taxonomy_artifact_md_path(output_dir, report_date)
+    skip_payload["artifact_paths"] = {"skip_json": str(skip_json), "skip_markdown": str(skip_md)}
+    skip_json.write_text(json.dumps(skip_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    skip_md.write_text(
+        "\n".join([
+            "# M4 Taxonomy Daily Refresh Cache Skip",
+            "",
+            f"- report_date: {report_date}",
+            "- status: SKIPPED_FRESH_CACHE",
+            f"- skip_reason: {source_reason}",
+            f"- reused_artifact_json: {canonical_json}",
+            f"- reused_status: {source_payload.get('status')}",
+            f"- reused_run_id: {source_payload.get('run_id')}",
+            f"- cache_ttl_hours: {cache_ttl_hours}",
+            "- guardrail: skipped provider fetch and DB write; last-good taxonomy data remains in DB.",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    return skip_payload
+
+
+def _write_taxonomy_daily_refresh_manifest(
+    *,
+    output_dir: Path,
+    report_date: str,
+    cache_manifest: str | None,
+    result,
+) -> dict:
+    manifest_path = _resolve_taxonomy_cache_manifest_path(output_dir, cache_manifest)
+    artifact_json = None
+    try:
+        artifact_json = result.artifact_paths.get("json")
+    except Exception:
+        artifact_json = None
+    stats_summary = []
+    try:
+        for item in result.stats:
+            stats_summary.append({
+                "import_name": item.import_name,
+                "input_rows": item.input_rows,
+                "instrument_tag_upsert_rows": item.instrument_tag_upsert_rows,
+                "missing_instruments": item.missing_instruments,
+                "error_rows": item.error_rows,
+                "skipped_rows": item.skipped_rows,
+            })
+    except Exception:
+        stats_summary = []
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "report_date": report_date,
+        "status": getattr(result, "status", None),
+        "run_id": getattr(result, "run_id", None),
+        "started_at": getattr(result, "started_at", None),
+        "finished_at": getattr(result, "finished_at", None),
+        "artifact_json": artifact_json,
+        "artifact_paths": getattr(result, "artifact_paths", {}),
+        "stats_summary": stats_summary,
+        "guardrails": ["last_good_taxonomy_cache", "daily_skip_if_fresh", "force_refresh_supported"],
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return {**payload, "manifest_path": str(manifest_path)}
+# R63Z3_TAXONOMY_DAILY_CACHE_END
+
+
 def _resolve_report_date(session, explicit_report_date: str | None) -> str:
     if explicit_report_date:
         return explicit_report_date
@@ -94,6 +313,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--concept-import-commit-every", type=int, default=5000, help="Commit every N concept mapping rows. Use 0 to keep one transaction.")
     parser.add_argument("--daily-refresh", action="store_true", help="Daily taxonomy refresh mode. If no taxonomy input is provided, attempt SW industry and Eastmoney concept providers.")
     parser.add_argument("--fail-safe", action="store_true", help="Do not fail the caller when a taxonomy provider is unavailable; write WARN/PARTIAL artifacts and keep last-good DB data.")
+    parser.add_argument("--cache-manifest", default=None, help="Optional daily taxonomy cache manifest path. Relative paths are resolved from --output-dir. Default: taxonomy_daily_refresh_manifest.json under output-dir.")
+    parser.add_argument("--cache-ttl-hours", type=float, default=36.0, help="When --daily-refresh is used, skip provider fetch/DB writes if same report-date taxonomy artifact is fresh within this TTL. Use 0 to accept same-report-date artifact regardless of mtime.")
+    parser.add_argument("--skip-if-fresh", action=argparse.BooleanOptionalAction, default=True, help="Daily refresh cache guard. Default true; use --no-skip-if-fresh to force normal refresh unless --force-refresh is set.")
+    parser.add_argument("--force-refresh", action="store_true", help="Bypass daily taxonomy cache/manifest and fetch providers even when same report-date artifact is fresh.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress logs.")
     return parser
 
@@ -147,8 +370,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             "RESOLVED "
             f"report_date={resolved_report_date} "
             f"daily_refresh={args.daily_refresh} "
-            f"fail_safe={args.fail_safe}"
+            f"fail_safe={args.fail_safe} "
+            f"skip_if_fresh={args.skip_if_fresh} "
+            f"force_refresh={args.force_refresh} "
+            f"cache_ttl_hours={args.cache_ttl_hours}"
         )
+
+        if args.daily_refresh and args.skip_if_fresh and not args.force_refresh:
+            skip_payload = _build_taxonomy_daily_skip_payload(
+                output_dir=output_dir,
+                report_date=resolved_report_date,
+                cache_manifest=args.cache_manifest,
+                cache_ttl_hours=args.cache_ttl_hours,
+            )
+            if skip_payload is not None:
+                progress(
+                    "CACHE_SKIP "
+                    f"reason={skip_payload.get('skip_reason')} "
+                    f"reused_artifact_json={skip_payload.get('reused_artifact_json')}"
+                )
+                print(skip_payload)
+                return
 
         run = run_repo.create_run(
             session=session,
@@ -175,6 +417,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "concept_import_commit_every": args.concept_import_commit_every,
                 "daily_refresh": args.daily_refresh,
                 "fail_safe": args.fail_safe,
+                "cache_manifest": args.cache_manifest,
+                "cache_ttl_hours": args.cache_ttl_hours,
+                "skip_if_fresh": args.skip_if_fresh,
+                "force_refresh": args.force_refresh,
                 "report_date": resolved_report_date,
                 "guardrails": ["no_strategy_signal", "no_backtest", "no_paper_trading", "no_risk_change"],
             },
@@ -208,6 +454,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             concept_import_commit_every=args.concept_import_commit_every,
             fail_safe=args.fail_safe,
         )
+        if args.daily_refresh:
+            manifest_payload = _write_taxonomy_daily_refresh_manifest(
+                output_dir=output_dir,
+                report_date=resolved_report_date,
+                cache_manifest=args.cache_manifest,
+                result=result,
+            )
+            progress(f"CACHE_MANIFEST_WRITTEN path={manifest_payload.get('manifest_path')}")
         session.commit()
         final_status = "SUCCESS" if result.status == "SUCCESS" else "PARTIAL"
         run_repo.mark_run_finished(session, run, final_status)
