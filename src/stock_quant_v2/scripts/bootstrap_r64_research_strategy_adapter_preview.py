@@ -42,6 +42,11 @@ def main() -> int:
         action="store_true",
         help="Emit only the R64 strategy compare input dry-run candidate artifact.",
     )
+    parser.add_argument(
+        "--emit-report-generation-dryrun-candidate",
+        action="store_true",
+        help="Emit only the R64 report generation dry-run candidate artifact.",
+    )
     args = parser.parse_args()
 
     adapter = MultiLayerRegimeRotationV2ResearchAdapter(
@@ -56,7 +61,9 @@ def main() -> int:
             top_n=args.top_n,
         )
     )
-    if args.emit_strategy_compare_input_dryrun_candidate:
+    if args.emit_report_generation_dryrun_candidate:
+        payload = adapter.build_report_generation_dryrun_candidate(shadow_signal_row_count=0)
+    elif args.emit_strategy_compare_input_dryrun_candidate:
         payload = adapter.build_strategy_compare_input_dryrun_candidate(shadow_signal_row_count=0)
     elif args.emit_backtest_request_dryrun_candidate:
         payload = adapter.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0)
