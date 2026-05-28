@@ -24,6 +24,7 @@ R64_REASON_TEXT = (
 R64_SCORE = 0.0
 R64_WEIGHT_ADJUSTMENT = 0.0
 R64_SHADOW_ARTIFACT_VERSION = "r64_shadow_signal_artifact_v1"
+R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION = "r64_m5_backtest_request_dryrun_candidate_v1"
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
     - research_strategy_candidate_plan_snapshot
     - research_strategy_backtest_result_snapshot
 
-    R64E1 still emits shadow-only artifacts. It does not write formal signals,
+    R64E2 still emits dry-run shadow/backtest artifacts. It does not write formal signals,
     create M5 backtest requests, trigger M7, or trade.
     """
 
@@ -199,29 +200,73 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             )
         return shadow_signals
 
-    def build_backtest_request_candidate(self, *, shadow_signal_row_count: int = 0) -> Dict[str, Any]:
-        """Return a dry-run M5 backtest request candidate, not a DB write."""
+    def build_backtest_request_dryrun_candidate(self, *, shadow_signal_row_count: int = 0) -> Dict[str, Any]:
+        """Return an M5-compatible dry-run backtest request candidate.
+
+        This is an artifact payload only. It must not write DB rows, create a
+        formal backtest request, generate formal signals, trigger M7, or trade.
+        """
         self.guardrails.assert_safe()
-        return {
-            "request_status": "DRY_RUN_NOT_CREATED",
+        shadow_count = int(shadow_signal_row_count)
+        evidence = {
+            "source": "backtest_request_dryrun_candidate",
+            "schema_name": self.config.schema_name,
+            "strategy_code": self.config.strategy_code,
+            "strategy_version_code": self.config.strategy_version_code,
+            "backtest_version": self.config.backtest_version,
+            "shadow_artifact_version": self.config.shadow_artifact_version,
+            "shadow_signal_row_count": shadow_count,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
             "db_write_allowed": False,
             "backtest_request_created": False,
+            "create_mode": "DRY_RUN_ONLY",
+        }
+        return {
+            "artifact_type": "backtest_request_dryrun_candidate",
+            "artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
+            "request_status": "DRY_RUN_NOT_CREATED",
+            "create_mode": "DRY_RUN_ONLY",
+            "db_write_allowed": False,
+            "backtest_request_created": False,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+            "gate_status": R64_GATE_STATUS,
+            "score": R64_SCORE,
+            "weight_adjustment": R64_WEIGHT_ADJUSTMENT,
+            "reason_code": R64_REASON_CODE,
+            "reason_text": R64_REASON_TEXT,
             "strategy_code": self.config.strategy_code,
+            "strategy_version_code": self.config.strategy_version_code,
             "version_code": self.config.strategy_version_code,
             "backtest_version": self.config.backtest_version,
             "source": self.config.shadow_artifact_version,
+            "source_artifact_type": "shadow_signal_artifact",
             "source_signal_run_id": None,
             "screen_request_id": None,
             "engine_code": "backtrader",
             "engine_payload": {
                 "r64_shadow_only": True,
                 "shadow_artifact_version": self.config.shadow_artifact_version,
-                "shadow_signal_row_count": int(shadow_signal_row_count),
+                "shadow_signal_row_count": shadow_count,
                 "formal_signal_allowed": False,
                 "trading_allowed": False,
                 "db_write_allowed": False,
+                "backtest_request_created": False,
+                "create_mode": "DRY_RUN_ONLY",
             },
+            "evidence_json": evidence,
         }
+
+    def build_backtest_request_candidate(self, *, shadow_signal_row_count: int = 0) -> Dict[str, Any]:
+        """Backward-compatible alias for R64E1 payload readers."""
+        return self.build_backtest_request_dryrun_candidate(
+            shadow_signal_row_count=shadow_signal_row_count
+        )
 
     def build_candidate_preview(
         self,
@@ -254,7 +299,10 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "shadow_candidate_rows": shadow_candidate_rows,
             "shadow_signal_rows": shadow_signal_rows,
             "signal_rows": [],
-            "backtest_request_candidate": self.build_backtest_request_candidate(
+            "backtest_request_dryrun_candidate": self.build_backtest_request_dryrun_candidate(
+                shadow_signal_row_count=len(shadow_signal_rows)
+            ),
+            "backtest_request_candidate": self.build_backtest_request_dryrun_candidate(
                 shadow_signal_row_count=len(shadow_signal_rows)
             ),
         }
@@ -287,7 +335,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "signal_rows": [],
             "shadow_candidate_rows": [],
             "shadow_signal_rows": [],
-            "backtest_request_candidate": self.build_backtest_request_candidate(shadow_signal_row_count=0),
+            "backtest_request_dryrun_candidate": self.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0),
+            "backtest_request_candidate": self.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0),
         }
         payload.update(
             self.build_reason_schema_payload(

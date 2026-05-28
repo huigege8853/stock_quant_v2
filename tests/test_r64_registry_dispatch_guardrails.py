@@ -18,6 +18,7 @@ def test_r64_registry_entry_is_research_only():
     assert entry["reason_code"] == "R64_REGISTRY_DISPATCH_RESEARCH_ONLY"
     assert entry["reason_text"]
     assert entry["shadow_artifact_version"] == "r64_shadow_signal_artifact_v1"
+    assert entry["backtest_request_dryrun_artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
     assert entry["evidence_json"]["source"] == "registry_entry"
     assert entry["evidence_json"]["db_write_allowed"] is False
 
@@ -31,7 +32,10 @@ def test_r64_dispatch_preview_blocks_signal_and_trade():
     assert payload["signal_rows"] == []
     assert payload["shadow_candidate_rows"] == []
     assert payload["shadow_signal_rows"] == []
-    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_dryrun_candidate"]["artifact_type"] == "backtest_request_dryrun_candidate"
+    assert payload["backtest_request_dryrun_candidate"]["artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
+    assert payload["backtest_request_dryrun_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
     assert payload["gate_status"] == "OBSERVE_ONLY"
     assert payload["score"] == 0.0
     assert payload["weight_adjustment"] == 0.0
@@ -51,6 +55,10 @@ def test_r64_dispatch_preview_can_emit_shadow_artifact_only():
     assert len(payload["shadow_candidate_rows"]) == 1
     assert len(payload["shadow_signal_rows"]) == 1
     assert payload["shadow_signal_rows"][0]["signal_status"] == "BLOCKED_RESEARCH_ONLY"
-    assert payload["backtest_request_candidate"]["request_status"] == "DRY_RUN_NOT_CREATED"
-    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_dryrun_candidate"]["request_status"] == "DRY_RUN_NOT_CREATED"
+    assert payload["backtest_request_dryrun_candidate"]["create_mode"] == "DRY_RUN_ONLY"
+    assert payload["backtest_request_dryrun_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_dryrun_candidate"]["backtest_request_created"] is False
+    assert payload["backtest_request_dryrun_candidate"]["engine_payload"]["shadow_signal_row_count"] == 1
+    assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
     assert payload["registry_entry"]["formal_signal_allowed"] is False

@@ -13,8 +13,12 @@ def test_r64_adapter_blocks_signal_and_trading():
     assert payload["signal_rows"] == []
     assert payload["shadow_candidate_rows"] == []
     assert payload["shadow_signal_rows"] == []
-    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
-    assert payload["backtest_request_candidate"]["backtest_request_created"] is False
+    assert payload["backtest_request_dryrun_candidate"]["artifact_type"] == "backtest_request_dryrun_candidate"
+    assert payload["backtest_request_dryrun_candidate"]["artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
+    assert payload["backtest_request_dryrun_candidate"]["create_mode"] == "DRY_RUN_ONLY"
+    assert payload["backtest_request_dryrun_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_dryrun_candidate"]["backtest_request_created"] is False
+    assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
     assert payload["gate_status"] == "OBSERVE_ONLY"
     assert payload["score"] == 0.0
     assert payload["weight_adjustment"] == 0.0
@@ -41,9 +45,34 @@ def test_r64_adapter_builds_shadow_artifact_without_formal_signal():
     assert payload["shadow_candidate_rows"][0]["ts_code"] == "000001.SZ"
     assert payload["shadow_signal_rows"][0]["signal_status"] == "BLOCKED_RESEARCH_ONLY"
     assert payload["shadow_signal_rows"][0]["target_weight"] == 0.0
-    assert payload["backtest_request_candidate"]["request_status"] == "DRY_RUN_NOT_CREATED"
-    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
-    assert payload["backtest_request_candidate"]["backtest_request_created"] is False
-    assert payload["backtest_request_candidate"]["engine_payload"]["r64_shadow_only"] is True
+    assert payload["backtest_request_dryrun_candidate"]["request_status"] == "DRY_RUN_NOT_CREATED"
+    assert payload["backtest_request_dryrun_candidate"]["artifact_type"] == "backtest_request_dryrun_candidate"
+    assert payload["backtest_request_dryrun_candidate"]["artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
+    assert payload["backtest_request_dryrun_candidate"]["create_mode"] == "DRY_RUN_ONLY"
+    assert payload["backtest_request_dryrun_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_dryrun_candidate"]["backtest_request_created"] is False
+    assert payload["backtest_request_dryrun_candidate"]["engine_payload"]["r64_shadow_only"] is True
+    assert payload["backtest_request_dryrun_candidate"]["engine_payload"]["shadow_signal_row_count"] == 1
+    assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
     assert payload["evidence_json"]["source"] == "candidate_preview"
     assert payload["evidence_json"]["shadow_signal_row_count"] == 1
+
+
+def test_r64_adapter_builds_m5_compatible_backtest_request_dryrun_candidate():
+    adapter = MultiLayerRegimeRotationV2ResearchAdapter()
+    candidate = adapter.build_backtest_request_dryrun_candidate(shadow_signal_row_count=2)
+
+    assert candidate["artifact_type"] == "backtest_request_dryrun_candidate"
+    assert candidate["artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
+    assert candidate["request_status"] == "DRY_RUN_NOT_CREATED"
+    assert candidate["create_mode"] == "DRY_RUN_ONLY"
+    assert candidate["db_write_allowed"] is False
+    assert candidate["backtest_request_created"] is False
+    assert candidate["formal_signal_allowed"] is False
+    assert candidate["trading_allowed"] is False
+    assert candidate["block_signal_generation"] is True
+    assert candidate["block_trading"] is True
+    assert candidate["engine_code"] == "backtrader"
+    assert candidate["engine_payload"]["shadow_signal_row_count"] == 2
+    assert candidate["engine_payload"]["db_write_allowed"] is False
+    assert candidate["evidence_json"]["source"] == "backtest_request_dryrun_candidate"

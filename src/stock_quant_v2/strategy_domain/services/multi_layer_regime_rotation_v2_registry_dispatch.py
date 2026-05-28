@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_research_adapter import (
     MultiLayerRegimeRotationV2ResearchAdapter,
     R64AdapterConfig,
+    R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
     R64_GATE_STATUS,
     R64_REASON_CODE,
     R64_REASON_TEXT,
@@ -38,6 +39,7 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
         "adapter_class": "MultiLayerRegimeRotationV2ResearchAdapter",
         "dispatch_function": "dispatch_r64_research_preview",
         "shadow_artifact_version": R64_SHADOW_ARTIFACT_VERSION,
+        "backtest_request_dryrun_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
         "formal_signal_allowed": False,
         "trading_allowed": False,
         "block_signal_generation": True,
@@ -124,9 +126,10 @@ def dispatch_r64_research_preview(
     payload.setdefault("shadow_candidate_rows", [])
     payload.setdefault("shadow_signal_rows", [])
     payload.setdefault(
-        "backtest_request_candidate",
-        adapter.build_backtest_request_candidate(shadow_signal_row_count=0),
+        "backtest_request_dryrun_candidate",
+        adapter.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0),
     )
+    payload.setdefault("backtest_request_candidate", payload["backtest_request_dryrun_candidate"])
     payload.setdefault(
         "evidence_json",
         {
@@ -134,6 +137,7 @@ def dispatch_r64_research_preview(
             "strategy_code": R64_STRATEGY_CODE,
             "strategy_version_code": R64_STRATEGY_VERSION_CODE,
             "shadow_artifact_version": shadow_artifact_version,
+            "backtest_request_dryrun_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,
