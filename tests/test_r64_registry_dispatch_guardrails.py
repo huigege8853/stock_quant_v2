@@ -12,6 +12,12 @@ def test_r64_registry_entry_is_research_only():
     assert entry["trading_allowed"] is False
     assert entry["block_signal_generation"] is True
     assert entry["block_trading"] is True
+    assert entry["gate_status"] == "OBSERVE_ONLY"
+    assert entry["score"] == 0.0
+    assert entry["weight_adjustment"] == 0.0
+    assert entry["reason_code"] == "R64_REGISTRY_DISPATCH_RESEARCH_ONLY"
+    assert entry["reason_text"]
+    assert entry["evidence_json"]["source"] == "registry_entry"
 
 
 def test_r64_dispatch_preview_blocks_signal_and_trade():
@@ -21,3 +27,9 @@ def test_r64_dispatch_preview_blocks_signal_and_trade():
     assert payload["block_signal_generation"] is True
     assert payload["block_trading"] is True
     assert payload["signal_rows"] == []
+    assert payload["gate_status"] == "OBSERVE_ONLY"
+    assert payload["score"] == 0.0
+    assert payload["weight_adjustment"] == 0.0
+    assert payload["reason_code"] == "R64_SIGNAL_BLOCKED_RESEARCH_ONLY"
+    assert payload["reason_text"]
+    assert payload["evidence_json"]["source"] == "signal_preview"

@@ -14,6 +14,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 STRATEGY_CODE = "multi_layer_regime_rotation_v2"
 STRATEGY_VERSION_CODE = "v1_l0_l12_state_budget_theme_style"
+R64_GATE_STATUS = "OBSERVE_ONLY"
+R64_REASON_CODE = "R64_SIGNAL_BLOCKED_RESEARCH_ONLY"
+R64_REASON_TEXT = (
+    "R64 multi-layer regime rotation v2 remains research-only; "
+    "formal signal generation and trading are blocked."
+)
+R64_SCORE = 0.0
+R64_WEIGHT_ADJUSTMENT = 0.0
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,41 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             raise ValueError(f"unexpected strategy_version_code: {strategy_version_code}")
         self.guardrails.assert_safe()
 
+    def build_reason_schema_payload(
+        self,
+        *,
+        source: str,
+        extra_evidence: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return the R64D minimum reason/evidence schema.
+
+        This schema is intentionally OBSERVE_ONLY while R64 is still research-only.
+        """
+        self.guardrails.assert_safe()
+        evidence: Dict[str, Any] = {
+            "source": source,
+            "schema_name": self.config.schema_name,
+            "strategy_code": self.config.strategy_code,
+            "strategy_version_code": self.config.strategy_version_code,
+            "full_decision_version": self.config.full_decision_version,
+            "plan_version": self.config.plan_version,
+            "backtest_version": self.config.backtest_version,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+        }
+        if extra_evidence:
+            evidence.update(dict(extra_evidence))
+        return {
+            "gate_status": R64_GATE_STATUS,
+            "score": R64_SCORE,
+            "weight_adjustment": R64_WEIGHT_ADJUSTMENT,
+            "reason_code": R64_REASON_CODE,
+            "reason_text": R64_REASON_TEXT,
+            "evidence_json": evidence,
+        }
+
     def build_candidate_preview(
         self,
         *,
@@ -74,7 +117,7 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
         decisions = list(decision_rows)
         candidates = list(candidate_rows)
         top = candidates[: max(0, int(self.config.top_n))]
-        return {
+        payload = {
             "strategy_code": self.config.strategy_code,
             "strategy_version_code": self.config.strategy_version_code,
             "full_decision_version": self.config.full_decision_version,
@@ -89,10 +132,22 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "prototype_action": "SIMULATION_CANDIDATE",
             "candidates": top,
         }
+        payload.update(
+            self.build_reason_schema_payload(
+                source="candidate_preview",
+                extra_evidence={
+                    "candidate_count": len(candidates),
+                    "preview_count": len(top),
+                    "decision_layer_count": len(decisions),
+                    "prototype_action": "SIMULATION_CANDIDATE",
+                },
+            )
+        )
+        return payload
 
     def build_signal_preview(self, *_args: Any, **_kwargs: Any) -> Dict[str, Any]:
         self.guardrails.assert_safe()
-        return {
+        payload = {
             "strategy_code": self.config.strategy_code,
             "strategy_version_code": self.config.strategy_version_code,
             "formal_signal_allowed": False,
@@ -100,5 +155,14 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "block_signal_generation": True,
             "block_trading": True,
             "signal_rows": [],
-            "reason_code": "R64_SIGNAL_BLOCKED_RESEARCH_ONLY",
         }
+        payload.update(
+            self.build_reason_schema_payload(
+                source="signal_preview",
+                extra_evidence={
+                    "signal_rows": 0,
+                    "prototype_action": "SIGNAL_PREVIEW_BLOCKED",
+                },
+            )
+        )
+        return payload

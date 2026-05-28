@@ -13,6 +13,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_research_adapter import (
     MultiLayerRegimeRotationV2ResearchAdapter,
     R64AdapterConfig,
+    R64_GATE_STATUS,
+    R64_REASON_CODE,
+    R64_REASON_TEXT,
+    R64_SCORE,
+    R64_WEIGHT_ADJUSTMENT,
 )
 
 
@@ -35,7 +40,20 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
         "trading_allowed": False,
         "block_signal_generation": True,
         "block_trading": True,
+        "gate_status": R64_GATE_STATUS,
+        "score": R64_SCORE,
+        "weight_adjustment": R64_WEIGHT_ADJUSTMENT,
         "reason_code": "R64_REGISTRY_DISPATCH_RESEARCH_ONLY",
+        "reason_text": R64_REASON_TEXT,
+        "evidence_json": {
+            "source": "registry_entry",
+            "strategy_code": R64_STRATEGY_CODE,
+            "strategy_version_code": R64_STRATEGY_VERSION_CODE,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+        },
     }
 
 
@@ -90,5 +108,21 @@ def dispatch_r64_research_preview(
     payload["trading_allowed"] = False
     payload["block_signal_generation"] = True
     payload["block_trading"] = True
-    payload.setdefault("reason_code", "R64_SIGNAL_BLOCKED_RESEARCH_ONLY")
+    payload.setdefault("gate_status", R64_GATE_STATUS)
+    payload.setdefault("score", R64_SCORE)
+    payload.setdefault("weight_adjustment", R64_WEIGHT_ADJUSTMENT)
+    payload.setdefault("reason_code", R64_REASON_CODE)
+    payload.setdefault("reason_text", R64_REASON_TEXT)
+    payload.setdefault(
+        "evidence_json",
+        {
+            "source": "registry_dispatch",
+            "strategy_code": R64_STRATEGY_CODE,
+            "strategy_version_code": R64_STRATEGY_VERSION_CODE,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+        },
+    )
     return payload

@@ -11,3 +11,10 @@ def test_r64_adapter_blocks_signal_and_trading():
     assert payload["block_signal_generation"] is True
     assert payload["block_trading"] is True
     assert payload["signal_rows"] == []
+    assert payload["gate_status"] == "OBSERVE_ONLY"
+    assert payload["score"] == 0.0
+    assert payload["weight_adjustment"] == 0.0
+    assert payload["reason_code"] == "R64_SIGNAL_BLOCKED_RESEARCH_ONLY"
+    assert payload["reason_text"]
+    assert payload["evidence_json"]["source"] == "signal_preview"
+    assert payload["evidence_json"]["block_signal_generation"] is True
