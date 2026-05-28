@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
@@ -22,6 +23,7 @@ R64_REASON_TEXT = (
 )
 R64_SCORE = 0.0
 R64_WEIGHT_ADJUSTMENT = 0.0
+R64_SHADOW_ARTIFACT_VERSION = "r64_shadow_signal_artifact_v1"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class R64AdapterConfig:
     full_decision_version: str = "r64_l0_l12_state_skeleton_v3"
     plan_version: str = "r64_prototype_candidate_plan_v1"
     backtest_version: str = "r64_research_prototype_backtest_dryrun_v1"
+    shadow_artifact_version: str = R64_SHADOW_ARTIFACT_VERSION
     top_n: int = 50
 
 
@@ -57,7 +60,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
     - research_strategy_candidate_plan_snapshot
     - research_strategy_backtest_result_snapshot
 
-    C2 only defines the adapter shell. DB readers are wired in the next stage.
+    R64E1 still emits shadow-only artifacts. It does not write formal signals,
+    create M5 backtest requests, trigger M7, or trade.
     """
 
     def __init__(self, config: Optional[R64AdapterConfig] = None, guardrails: Optional[R64GuardrailState] = None) -> None:
@@ -91,6 +95,7 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "full_decision_version": self.config.full_decision_version,
             "plan_version": self.config.plan_version,
             "backtest_version": self.config.backtest_version,
+            "shadow_artifact_version": self.config.shadow_artifact_version,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,
@@ -107,6 +112,117 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "evidence_json": evidence,
         }
 
+    def _json_safe(self, value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        if isinstance(value, Mapping):
+            return {str(key): self._json_safe(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._json_safe(item) for item in value]
+        return value
+
+    def _candidate_identity(self, row: Mapping[str, Any]) -> str:
+        for key in ("ts_code", "security_code", "stock_code", "symbol", "code"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return "UNKNOWN"
+
+    def _candidate_score(self, row: Mapping[str, Any]) -> float:
+        for key in ("score", "alpha_score", "candidate_score", "rank_score"):
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def build_shadow_candidate_rows(self, candidate_rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """Build R64E1 shadow candidate rows without DB writes or formal signals."""
+        self.guardrails.assert_safe()
+        rows = list(candidate_rows)
+        top = rows[: max(0, int(self.config.top_n))]
+        shadow_rows: List[Dict[str, Any]] = []
+        for rank, row in enumerate(top, start=1):
+            row_dict = self._json_safe(dict(row))
+            ts_code = self._candidate_identity(row)
+            shadow_rows.append(
+                {
+                    "rank": rank,
+                    "strategy_code": self.config.strategy_code,
+                    "strategy_version_code": self.config.strategy_version_code,
+                    "ts_code": ts_code,
+                    "score": self._candidate_score(row),
+                    "gate_status": R64_GATE_STATUS,
+                    "artifact_type": "shadow_candidate_row",
+                    "formal_signal_allowed": False,
+                    "trading_allowed": False,
+                    "block_signal_generation": True,
+                    "block_trading": True,
+                    "source_row": row_dict,
+                }
+            )
+        return shadow_rows
+
+    def build_shadow_signal_rows(self, candidate_rows: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """Build blocked shadow signal rows for research comparison only.
+
+        These rows are not formal strategy_signal rows. Target weights are zero
+        by design until a later release stage explicitly removes the guardrails.
+        """
+        self.guardrails.assert_safe()
+        shadow_candidates = self.build_shadow_candidate_rows(candidate_rows)
+        shadow_signals: List[Dict[str, Any]] = []
+        for row in shadow_candidates:
+            shadow_signals.append(
+                {
+                    "rank": row["rank"],
+                    "strategy_code": self.config.strategy_code,
+                    "strategy_version_code": self.config.strategy_version_code,
+                    "ts_code": row["ts_code"],
+                    "score": row["score"],
+                    "target_weight": 0.0,
+                    "shadow_weight": 0.0,
+                    "signal_action": "HOLD_SHADOW_ONLY",
+                    "signal_status": "BLOCKED_RESEARCH_ONLY",
+                    "gate_status": R64_GATE_STATUS,
+                    "artifact_type": "shadow_signal_row",
+                    "formal_signal_allowed": False,
+                    "trading_allowed": False,
+                    "block_signal_generation": True,
+                    "block_trading": True,
+                }
+            )
+        return shadow_signals
+
+    def build_backtest_request_candidate(self, *, shadow_signal_row_count: int = 0) -> Dict[str, Any]:
+        """Return a dry-run M5 backtest request candidate, not a DB write."""
+        self.guardrails.assert_safe()
+        return {
+            "request_status": "DRY_RUN_NOT_CREATED",
+            "db_write_allowed": False,
+            "backtest_request_created": False,
+            "strategy_code": self.config.strategy_code,
+            "version_code": self.config.strategy_version_code,
+            "backtest_version": self.config.backtest_version,
+            "source": self.config.shadow_artifact_version,
+            "source_signal_run_id": None,
+            "screen_request_id": None,
+            "engine_code": "backtrader",
+            "engine_payload": {
+                "r64_shadow_only": True,
+                "shadow_artifact_version": self.config.shadow_artifact_version,
+                "shadow_signal_row_count": int(shadow_signal_row_count),
+                "formal_signal_allowed": False,
+                "trading_allowed": False,
+                "db_write_allowed": False,
+            },
+        }
+
     def build_candidate_preview(
         self,
         *,
@@ -117,11 +233,15 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
         decisions = list(decision_rows)
         candidates = list(candidate_rows)
         top = candidates[: max(0, int(self.config.top_n))]
+        shadow_candidate_rows = self.build_shadow_candidate_rows(top)
+        shadow_signal_rows = self.build_shadow_signal_rows(top)
         payload = {
             "strategy_code": self.config.strategy_code,
             "strategy_version_code": self.config.strategy_version_code,
             "full_decision_version": self.config.full_decision_version,
             "plan_version": self.config.plan_version,
+            "backtest_version": self.config.backtest_version,
+            "shadow_artifact_version": self.config.shadow_artifact_version,
             "candidate_count": len(candidates),
             "preview_count": len(top),
             "decision_layer_count": len(decisions),
@@ -130,7 +250,13 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "block_signal_generation": True,
             "block_trading": True,
             "prototype_action": "SIMULATION_CANDIDATE",
-            "candidates": top,
+            "candidates": [self._json_safe(dict(row)) for row in top],
+            "shadow_candidate_rows": shadow_candidate_rows,
+            "shadow_signal_rows": shadow_signal_rows,
+            "signal_rows": [],
+            "backtest_request_candidate": self.build_backtest_request_candidate(
+                shadow_signal_row_count=len(shadow_signal_rows)
+            ),
         }
         payload.update(
             self.build_reason_schema_payload(
@@ -139,6 +265,10 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
                     "candidate_count": len(candidates),
                     "preview_count": len(top),
                     "decision_layer_count": len(decisions),
+                    "shadow_candidate_row_count": len(shadow_candidate_rows),
+                    "shadow_signal_row_count": len(shadow_signal_rows),
+                    "backtest_request_created": False,
+                    "db_write_allowed": False,
                     "prototype_action": "SIMULATION_CANDIDATE",
                 },
             )
@@ -155,12 +285,19 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "block_signal_generation": True,
             "block_trading": True,
             "signal_rows": [],
+            "shadow_candidate_rows": [],
+            "shadow_signal_rows": [],
+            "backtest_request_candidate": self.build_backtest_request_candidate(shadow_signal_row_count=0),
         }
         payload.update(
             self.build_reason_schema_payload(
                 source="signal_preview",
                 extra_evidence={
                     "signal_rows": 0,
+                    "shadow_candidate_row_count": 0,
+                    "shadow_signal_row_count": 0,
+                    "backtest_request_created": False,
+                    "db_write_allowed": False,
                     "prototype_action": "SIGNAL_PREVIEW_BLOCKED",
                 },
             )

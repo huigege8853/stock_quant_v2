@@ -11,6 +11,10 @@ def test_r64_adapter_blocks_signal_and_trading():
     assert payload["block_signal_generation"] is True
     assert payload["block_trading"] is True
     assert payload["signal_rows"] == []
+    assert payload["shadow_candidate_rows"] == []
+    assert payload["shadow_signal_rows"] == []
+    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_candidate"]["backtest_request_created"] is False
     assert payload["gate_status"] == "OBSERVE_ONLY"
     assert payload["score"] == 0.0
     assert payload["weight_adjustment"] == 0.0
@@ -18,3 +22,28 @@ def test_r64_adapter_blocks_signal_and_trading():
     assert payload["reason_text"]
     assert payload["evidence_json"]["source"] == "signal_preview"
     assert payload["evidence_json"]["block_signal_generation"] is True
+
+
+def test_r64_adapter_builds_shadow_artifact_without_formal_signal():
+    adapter = MultiLayerRegimeRotationV2ResearchAdapter()
+    payload = adapter.build_candidate_preview(
+        decision_rows=[{"layer": "L7", "status": "preview"}],
+        candidate_rows=[{"ts_code": "000001.SZ", "score": 1.23}],
+    )
+    assert payload["formal_signal_allowed"] is False
+    assert payload["trading_allowed"] is False
+    assert payload["block_signal_generation"] is True
+    assert payload["block_trading"] is True
+    assert payload["signal_rows"] == []
+    assert payload["shadow_artifact_version"] == "r64_shadow_signal_artifact_v1"
+    assert len(payload["shadow_candidate_rows"]) == 1
+    assert len(payload["shadow_signal_rows"]) == 1
+    assert payload["shadow_candidate_rows"][0]["ts_code"] == "000001.SZ"
+    assert payload["shadow_signal_rows"][0]["signal_status"] == "BLOCKED_RESEARCH_ONLY"
+    assert payload["shadow_signal_rows"][0]["target_weight"] == 0.0
+    assert payload["backtest_request_candidate"]["request_status"] == "DRY_RUN_NOT_CREATED"
+    assert payload["backtest_request_candidate"]["db_write_allowed"] is False
+    assert payload["backtest_request_candidate"]["backtest_request_created"] is False
+    assert payload["backtest_request_candidate"]["engine_payload"]["r64_shadow_only"] is True
+    assert payload["evidence_json"]["source"] == "candidate_preview"
+    assert payload["evidence_json"]["shadow_signal_row_count"] == 1

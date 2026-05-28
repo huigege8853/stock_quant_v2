@@ -17,6 +17,7 @@ from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_rese
     R64_REASON_CODE,
     R64_REASON_TEXT,
     R64_SCORE,
+    R64_SHADOW_ARTIFACT_VERSION,
     R64_WEIGHT_ADJUSTMENT,
 )
 
@@ -36,6 +37,7 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
         "dispatch_module": __name__,
         "adapter_class": "MultiLayerRegimeRotationV2ResearchAdapter",
         "dispatch_function": "dispatch_r64_research_preview",
+        "shadow_artifact_version": R64_SHADOW_ARTIFACT_VERSION,
         "formal_signal_allowed": False,
         "trading_allowed": False,
         "block_signal_generation": True,
@@ -49,10 +51,12 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
             "source": "registry_entry",
             "strategy_code": R64_STRATEGY_CODE,
             "strategy_version_code": R64_STRATEGY_VERSION_CODE,
+            "shadow_artifact_version": R64_SHADOW_ARTIFACT_VERSION,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,
             "block_trading": True,
+            "db_write_allowed": False,
         },
     }
 
@@ -63,6 +67,7 @@ def build_r64_research_adapter(
     full_decision_version: str = "r64_l0_l12_state_skeleton_v3",
     plan_version: str = "r64_prototype_candidate_plan_v1",
     backtest_version: str = "r64_research_prototype_backtest_dryrun_v1",
+    shadow_artifact_version: str = R64_SHADOW_ARTIFACT_VERSION,
     top_n: int = 50,
 ) -> MultiLayerRegimeRotationV2ResearchAdapter:
     cfg = R64AdapterConfig(
@@ -72,6 +77,7 @@ def build_r64_research_adapter(
         full_decision_version=full_decision_version,
         plan_version=plan_version,
         backtest_version=backtest_version,
+        shadow_artifact_version=shadow_artifact_version,
         top_n=top_n,
     )
     return MultiLayerRegimeRotationV2ResearchAdapter(cfg)
@@ -83,6 +89,7 @@ def dispatch_r64_research_preview(
     full_decision_version: str = "r64_l0_l12_state_skeleton_v3",
     plan_version: str = "r64_prototype_candidate_plan_v1",
     backtest_version: str = "r64_research_prototype_backtest_dryrun_v1",
+    shadow_artifact_version: str = R64_SHADOW_ARTIFACT_VERSION,
     top_n: int = 50,
     decision_rows: Optional[Iterable[Mapping[str, Any]]] = None,
     candidate_rows: Optional[Iterable[Mapping[str, Any]]] = None,
@@ -93,6 +100,7 @@ def dispatch_r64_research_preview(
         full_decision_version=full_decision_version,
         plan_version=plan_version,
         backtest_version=backtest_version,
+        shadow_artifact_version=shadow_artifact_version,
         top_n=top_n,
     )
     if decision_rows is None and candidate_rows is None:
@@ -113,16 +121,24 @@ def dispatch_r64_research_preview(
     payload.setdefault("weight_adjustment", R64_WEIGHT_ADJUSTMENT)
     payload.setdefault("reason_code", R64_REASON_CODE)
     payload.setdefault("reason_text", R64_REASON_TEXT)
+    payload.setdefault("shadow_candidate_rows", [])
+    payload.setdefault("shadow_signal_rows", [])
+    payload.setdefault(
+        "backtest_request_candidate",
+        adapter.build_backtest_request_candidate(shadow_signal_row_count=0),
+    )
     payload.setdefault(
         "evidence_json",
         {
             "source": "registry_dispatch",
             "strategy_code": R64_STRATEGY_CODE,
             "strategy_version_code": R64_STRATEGY_VERSION_CODE,
+            "shadow_artifact_version": shadow_artifact_version,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,
             "block_trading": True,
+            "db_write_allowed": False,
         },
     )
     return payload

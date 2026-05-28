@@ -12,6 +12,7 @@ import json
 from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_research_adapter import (
     MultiLayerRegimeRotationV2ResearchAdapter,
     R64AdapterConfig,
+    R64_SHADOW_ARTIFACT_VERSION,
 )
 
 
@@ -23,7 +24,13 @@ def main() -> int:
     parser.add_argument("--full-decision-version", default="r64_l0_l12_state_skeleton_v3")
     parser.add_argument("--plan-version", default="r64_prototype_candidate_plan_v1")
     parser.add_argument("--backtest-version", default="r64_research_prototype_backtest_dryrun_v1")
+    parser.add_argument("--shadow-artifact-version", default=R64_SHADOW_ARTIFACT_VERSION)
     parser.add_argument("--top-n", type=int, default=50)
+    parser.add_argument(
+        "--sample-shadow-candidate",
+        action="store_true",
+        help="Emit a deterministic in-memory shadow candidate artifact; no DB writes are performed.",
+    )
     args = parser.parse_args()
 
     adapter = MultiLayerRegimeRotationV2ResearchAdapter(
@@ -34,10 +41,17 @@ def main() -> int:
             full_decision_version=args.full_decision_version,
             plan_version=args.plan_version,
             backtest_version=args.backtest_version,
+            shadow_artifact_version=args.shadow_artifact_version,
             top_n=args.top_n,
         )
     )
-    payload = adapter.build_signal_preview()
+    if args.sample_shadow_candidate:
+        payload = adapter.build_candidate_preview(
+            decision_rows=[{"layer": "L7", "status": "preview"}],
+            candidate_rows=[{"ts_code": "000001.SZ", "score": 0.0}],
+        )
+    else:
+        payload = adapter.build_signal_preview()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
