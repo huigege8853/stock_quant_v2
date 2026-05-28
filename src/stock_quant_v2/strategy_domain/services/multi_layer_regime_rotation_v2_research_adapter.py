@@ -25,6 +25,7 @@ R64_SCORE = 0.0
 R64_WEIGHT_ADJUSTMENT = 0.0
 R64_SHADOW_ARTIFACT_VERSION = "r64_shadow_signal_artifact_v1"
 R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION = "r64_m5_backtest_request_dryrun_candidate_v1"
+R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION = "r64_strategy_compare_input_dryrun_candidate_v1"
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
     - research_strategy_candidate_plan_snapshot
     - research_strategy_backtest_result_snapshot
 
-    R64E2 still emits dry-run shadow/backtest artifacts. It does not write formal signals,
-    create M5 backtest requests, trigger M7, or trade.
+    R64E3 still emits dry-run shadow/backtest/compare-input artifacts. It does not write formal signals,
+    create M5 backtest requests, execute backtests, create compare reports, trigger M7, or trade.
     """
 
     def __init__(self, config: Optional[R64AdapterConfig] = None, guardrails: Optional[R64GuardrailState] = None) -> None:
@@ -268,6 +269,88 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             shadow_signal_row_count=shadow_signal_row_count
         )
 
+    def build_strategy_compare_input_dryrun_candidate(self, *, shadow_signal_row_count: int = 0) -> Dict[str, Any]:
+        """Return a dry-run-only strategy compare input candidate.
+
+        This payload is a bridge artifact for a later R64E compare/backtest stage.
+        It must not execute a backtest, create a formal compare report, write DB
+        rows, generate formal signals, trigger M7, or trade.
+        """
+        self.guardrails.assert_safe()
+        backtest_candidate = self.build_backtest_request_dryrun_candidate(
+            shadow_signal_row_count=shadow_signal_row_count
+        )
+        evidence = {
+            "source": "strategy_compare_input_dryrun_candidate",
+            "schema_name": self.config.schema_name,
+            "strategy_code": self.config.strategy_code,
+            "strategy_version_code": self.config.strategy_version_code,
+            "backtest_version": self.config.backtest_version,
+            "shadow_artifact_version": self.config.shadow_artifact_version,
+            "backtest_request_dryrun_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
+            "strategy_compare_input_dryrun_artifact_version": R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
+            "shadow_signal_row_count": int(shadow_signal_row_count),
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+            "db_write_allowed": False,
+            "backtest_request_created": False,
+            "backtest_executed": False,
+            "strategy_compare_report_created": False,
+            "create_mode": "DRY_RUN_ONLY",
+        }
+        return {
+            "artifact_type": "strategy_compare_input_dryrun_candidate",
+            "artifact_version": R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
+            "compare_status": "DRY_RUN_NOT_EXECUTED",
+            "compare_mode": "DRY_RUN_ONLY",
+            "db_write_allowed": False,
+            "backtest_request_created": False,
+            "backtest_executed": False,
+            "strategy_compare_report_created": False,
+            "formal_signal_allowed": False,
+            "trading_allowed": False,
+            "block_signal_generation": True,
+            "block_trading": True,
+            "gate_status": R64_GATE_STATUS,
+            "score": R64_SCORE,
+            "weight_adjustment": R64_WEIGHT_ADJUSTMENT,
+            "reason_code": R64_REASON_CODE,
+            "reason_text": R64_REASON_TEXT,
+            "strategy_code": self.config.strategy_code,
+            "strategy_version_code": self.config.strategy_version_code,
+            "version_code": self.config.strategy_version_code,
+            "source_artifact_type": "backtest_request_dryrun_candidate",
+            "source_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
+            "backtest_request_dryrun_candidate": backtest_candidate,
+            "baseline_strategy_code": "regime_sector_industry_selection_v1",
+            "baseline_label": "current_production_baseline",
+            "benchmark_index_code": "000300.SH",
+            "compare_dimensions": [
+                "return",
+                "drawdown",
+                "turnover",
+                "regime_performance",
+                "coverage",
+            ],
+            "expected_reports": [
+                "backtest_report",
+                "walk_forward_report",
+                "strategy_compare_report",
+            ],
+            "metrics_required": [
+                "total_return",
+                "annualized_return",
+                "max_drawdown",
+                "turnover",
+                "win_rate",
+                "exposure_ratio",
+            ],
+            "walk_forward_required": True,
+            "evidence_json": evidence,
+        }
+
     def build_candidate_preview(
         self,
         *,
@@ -305,6 +388,12 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "backtest_request_candidate": self.build_backtest_request_dryrun_candidate(
                 shadow_signal_row_count=len(shadow_signal_rows)
             ),
+            "strategy_compare_input_dryrun_candidate": self.build_strategy_compare_input_dryrun_candidate(
+                shadow_signal_row_count=len(shadow_signal_rows)
+            ),
+            "strategy_compare_input": self.build_strategy_compare_input_dryrun_candidate(
+                shadow_signal_row_count=len(shadow_signal_rows)
+            ),
         }
         payload.update(
             self.build_reason_schema_payload(
@@ -316,6 +405,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
                     "shadow_candidate_row_count": len(shadow_candidate_rows),
                     "shadow_signal_row_count": len(shadow_signal_rows),
                     "backtest_request_created": False,
+                    "backtest_executed": False,
+                    "strategy_compare_report_created": False,
                     "db_write_allowed": False,
                     "prototype_action": "SIMULATION_CANDIDATE",
                 },
@@ -337,6 +428,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
             "shadow_signal_rows": [],
             "backtest_request_dryrun_candidate": self.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0),
             "backtest_request_candidate": self.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0),
+            "strategy_compare_input_dryrun_candidate": self.build_strategy_compare_input_dryrun_candidate(shadow_signal_row_count=0),
+            "strategy_compare_input": self.build_strategy_compare_input_dryrun_candidate(shadow_signal_row_count=0),
         }
         payload.update(
             self.build_reason_schema_payload(
@@ -346,6 +439,8 @@ class MultiLayerRegimeRotationV2ResearchAdapter:
                     "shadow_candidate_row_count": 0,
                     "shadow_signal_row_count": 0,
                     "backtest_request_created": False,
+                    "backtest_executed": False,
+                    "strategy_compare_report_created": False,
                     "db_write_allowed": False,
                     "prototype_action": "SIGNAL_PREVIEW_BLOCKED",
                 },

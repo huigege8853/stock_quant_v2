@@ -19,6 +19,7 @@ def test_r64_registry_entry_is_research_only():
     assert entry["reason_text"]
     assert entry["shadow_artifact_version"] == "r64_shadow_signal_artifact_v1"
     assert entry["backtest_request_dryrun_artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
+    assert entry["strategy_compare_input_dryrun_artifact_version"] == "r64_strategy_compare_input_dryrun_candidate_v1"
     assert entry["evidence_json"]["source"] == "registry_entry"
     assert entry["evidence_json"]["db_write_allowed"] is False
 
@@ -36,6 +37,10 @@ def test_r64_dispatch_preview_blocks_signal_and_trade():
     assert payload["backtest_request_dryrun_candidate"]["artifact_version"] == "r64_m5_backtest_request_dryrun_candidate_v1"
     assert payload["backtest_request_dryrun_candidate"]["db_write_allowed"] is False
     assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
+    assert payload["strategy_compare_input_dryrun_candidate"]["artifact_type"] == "strategy_compare_input_dryrun_candidate"
+    assert payload["strategy_compare_input_dryrun_candidate"]["db_write_allowed"] is False
+    assert payload["strategy_compare_input_dryrun_candidate"]["backtest_executed"] is False
+    assert payload["strategy_compare_input"] == payload["strategy_compare_input_dryrun_candidate"]
     assert payload["gate_status"] == "OBSERVE_ONLY"
     assert payload["score"] == 0.0
     assert payload["weight_adjustment"] == 0.0
@@ -61,4 +66,8 @@ def test_r64_dispatch_preview_can_emit_shadow_artifact_only():
     assert payload["backtest_request_dryrun_candidate"]["backtest_request_created"] is False
     assert payload["backtest_request_dryrun_candidate"]["engine_payload"]["shadow_signal_row_count"] == 1
     assert payload["backtest_request_candidate"] == payload["backtest_request_dryrun_candidate"]
+    assert payload["strategy_compare_input_dryrun_candidate"]["compare_status"] == "DRY_RUN_NOT_EXECUTED"
+    assert payload["strategy_compare_input_dryrun_candidate"]["backtest_request_dryrun_candidate"] == payload["backtest_request_dryrun_candidate"]
+    assert payload["strategy_compare_input_dryrun_candidate"]["strategy_compare_report_created"] is False
+    assert payload["strategy_compare_input"] == payload["strategy_compare_input_dryrun_candidate"]
     assert payload["registry_entry"]["formal_signal_allowed"] is False

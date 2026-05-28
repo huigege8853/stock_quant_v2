@@ -19,6 +19,7 @@ from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_rese
     R64_REASON_TEXT,
     R64_SCORE,
     R64_SHADOW_ARTIFACT_VERSION,
+    R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
     R64_WEIGHT_ADJUSTMENT,
 )
 
@@ -40,6 +41,7 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
         "dispatch_function": "dispatch_r64_research_preview",
         "shadow_artifact_version": R64_SHADOW_ARTIFACT_VERSION,
         "backtest_request_dryrun_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
+        "strategy_compare_input_dryrun_artifact_version": R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
         "formal_signal_allowed": False,
         "trading_allowed": False,
         "block_signal_generation": True,
@@ -54,6 +56,7 @@ def get_r64_research_strategy_registry_entry() -> Dict[str, Any]:
             "strategy_code": R64_STRATEGY_CODE,
             "strategy_version_code": R64_STRATEGY_VERSION_CODE,
             "shadow_artifact_version": R64_SHADOW_ARTIFACT_VERSION,
+            "strategy_compare_input_dryrun_artifact_version": R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,
@@ -131,6 +134,13 @@ def dispatch_r64_research_preview(
     )
     payload.setdefault("backtest_request_candidate", payload["backtest_request_dryrun_candidate"])
     payload.setdefault(
+        "strategy_compare_input_dryrun_candidate",
+        adapter.build_strategy_compare_input_dryrun_candidate(
+            shadow_signal_row_count=len(payload.get("shadow_signal_rows", []))
+        ),
+    )
+    payload.setdefault("strategy_compare_input", payload["strategy_compare_input_dryrun_candidate"])
+    payload.setdefault(
         "evidence_json",
         {
             "source": "registry_dispatch",
@@ -138,6 +148,7 @@ def dispatch_r64_research_preview(
             "strategy_version_code": R64_STRATEGY_VERSION_CODE,
             "shadow_artifact_version": shadow_artifact_version,
             "backtest_request_dryrun_artifact_version": R64_BACKTEST_REQUEST_DRYRUN_ARTIFACT_VERSION,
+            "strategy_compare_input_dryrun_artifact_version": R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
             "formal_signal_allowed": False,
             "trading_allowed": False,
             "block_signal_generation": True,

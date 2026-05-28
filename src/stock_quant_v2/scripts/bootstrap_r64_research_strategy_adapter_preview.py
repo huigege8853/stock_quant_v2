@@ -13,6 +13,7 @@ from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_rese
     MultiLayerRegimeRotationV2ResearchAdapter,
     R64AdapterConfig,
     R64_SHADOW_ARTIFACT_VERSION,
+    R64_STRATEGY_COMPARE_INPUT_DRYRUN_ARTIFACT_VERSION,
 )
 
 
@@ -36,6 +37,11 @@ def main() -> int:
         action="store_true",
         help="Emit only the M5-compatible R64 backtest request dry-run candidate artifact.",
     )
+    parser.add_argument(
+        "--emit-strategy-compare-input-dryrun-candidate",
+        action="store_true",
+        help="Emit only the R64 strategy compare input dry-run candidate artifact.",
+    )
     args = parser.parse_args()
 
     adapter = MultiLayerRegimeRotationV2ResearchAdapter(
@@ -50,7 +56,9 @@ def main() -> int:
             top_n=args.top_n,
         )
     )
-    if args.emit_backtest_request_dryrun_candidate:
+    if args.emit_strategy_compare_input_dryrun_candidate:
+        payload = adapter.build_strategy_compare_input_dryrun_candidate(shadow_signal_row_count=0)
+    elif args.emit_backtest_request_dryrun_candidate:
         payload = adapter.build_backtest_request_dryrun_candidate(shadow_signal_row_count=0)
     elif args.sample_shadow_candidate:
         payload = adapter.build_candidate_preview(
