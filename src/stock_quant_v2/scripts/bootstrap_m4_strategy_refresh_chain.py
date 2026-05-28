@@ -418,3 +418,20 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# R64_RESEARCH_REGISTRY_DISPATCH_BEGIN
+# Research-only bridge for strategy_code=multi_layer_regime_rotation_v2.
+# This block is intentionally inert unless explicitly imported/called.
+def get_r64_research_strategy_dispatch_entry():
+    """Return the R64 research-only dispatch entry without touching production signal paths."""
+    from stock_quant_v2.strategy_domain.services.multi_layer_regime_rotation_v2_registry_dispatch import (
+        get_r64_research_strategy_registry_entry,
+    )
+
+    entry = get_r64_research_strategy_registry_entry()
+    if entry.get("formal_signal_allowed") or entry.get("trading_allowed"):
+        raise RuntimeError("R64 research dispatch entry must not enable formal signals or trading.")
+    if not entry.get("block_signal_generation") or not entry.get("block_trading"):
+        raise RuntimeError("R64 research dispatch entry guardrails must stay blocked.")
+    return entry
+# R64_RESEARCH_REGISTRY_DISPATCH_END
